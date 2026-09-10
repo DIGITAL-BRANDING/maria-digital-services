@@ -1,0 +1,235 @@
+@import "tailwindcss";
+
+@theme {
+  /* Brand: Gold / Bronze / Ember - matches the Flutter app's identity */
+  --color-ink: #071a3d;
+  --color-ink-soft: #0d2a63;
+  --color-ink-line: #1d4287;
+
+  --color-cream: #fffaf0;
+  --color-parchment: #fbf0d9;
+  --color-parchment-line: #eaddb8;
+
+  --color-gold-50: #fffbeb;
+  --color-gold-200: #fce588;
+  --color-gold-400: #f7c948;
+  --color-gold-500: #d7ad38;
+  --color-gold-600: #b8941f;
+  --color-gold-700: #9c7a17;
+
+  --color-bronze-500: #c9a227;
+  --color-bronze-700: #855f16;
+
+  --color-ember-400: #ff7b33;
+  --color-ember-500: #ff6b35;
+  --color-ember-600: #e55520;
+
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+
+  /* Assistant blue palette. Keep these explicit so Tailwind utilities such
+     as bg-brand-600/text-brand-800 always have a real, high-contrast color. */
+  --color-brand-50: #eff6ff;
+  --color-brand-200: #bfdbfe;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4ed8;
+  --color-brand-800: #1e3a8a;
+  --color-brand-900: #172554;
+
+  --color-ink-900: #1c140b;
+  --color-ink-600: #5c4d38;
+
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  background: #f4f7fc;
+  color: var(--color-ink-900);
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--color-gold-500); color: var(--color-ink); }
+
+a:focus-visible, button:focus-visible, input:focus-visible,
+select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--color-ember-500);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes ticker-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.ticker-track { animation: ticker-scroll 32s linear infinite; }
+.ticker-row:hover .ticker-track { animation-play-state: paused; }
+.dashboard-overview { animation: dashboard-float 5s ease-in-out infinite; }
+@keyframes dashboard-float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+.service-tile {
+  isolation: isolate;
+  border: 1px solid rgba(96, 165, 250, .35);
+  background:
+    linear-gradient(145deg, #0b2f73 0%, #0e438f 55%, #071d4d 100%);
+  box-shadow: inset 0 1px 0 rgba(255, 237, 169, .18), 0 8px 20px rgba(54, 31, 0, .22);
+}
+
+/* ── Royal-blue premium recolor for legacy pages ─────────────────────
+   Several older pages (Dashboard, Buy Airtime/Data, Fund Wallet, Receipts,
+   Referral, Result Checkers, the original all-in-one VerificationPage,
+   NinModificationPage, etc.) still use the original cream/parchment/gold
+   utility classes from before the "royal blue premium" redesign. Rather
+   than rewriting every one of those pages, their cream/parchment surfaces
+   are recolored here to match the rest of the app.
+
+   SCOPING IS DELIBERATE: every selector below requires the legacy
+   `bg-cream` / `bg-parchment` / `border-parchment-line` classes - never
+   plain `bg-white`. Pages built with the newer, explicit component system
+   (web/src/pages/verification/*, via components/verification/shared.tsx)
+   intentionally use `bg-white` for their form sections with royal-blue
+   TEXT - the opposite treatment from a legacy cream card. If a `bg-white`
+   selector is ever added back here, every new-system page's forms and
+   buttons silently invert to unreadable dark-on-dark (this happened once
+   already - see git history "Fix color contrast" era). New legacy-style
+   pages should opt in with `bg-cream`/`bg-parchment`, never `bg-white`. */
+main .bg-cream,
+main .bg-parchment,
+main .border-parchment-line,
+main [class~="bg-cream"],
+main [class~="bg-parchment"] {
+  background-color: #0b2f73 !important;
+  background-image: linear-gradient(145deg, #0b2f73 0%, #0d438d 58%, #071d4d 100%) !important;
+  border-color: rgba(96, 165, 250, .5) !important;
+  color: #f8fbff !important;
+}
+main .bg-cream *, main .bg-parchment * { color: #f8fbff; }
+main .bg-cream h1, main .bg-cream h2, main .bg-cream h3,
+main .bg-parchment h1, main .bg-parchment h2, main .bg-parchment h3 { color: #ffffff !important; }
+main .bg-cream .text-ink, main .bg-cream .text-ink-600, main .bg-cream .text-ink-400,
+main .bg-parchment .text-ink, main .bg-parchment .text-ink-600, main .bg-parchment .text-ink-400,
+main [class*="bg-parchment"] .text-ink, main [class*="bg-parchment"] .text-ink-600,
+main [class*="bg-cream"] .text-ink, main [class*="bg-cream"] .text-ink-600 { color: #ffffff !important; }
+
+/* Form fields inside a legacy cream/parchment card - same scoping as
+   above. A new-system page's inputs (inside a `bg-white` card) are
+   deliberately untouched and keep their white/royal-blue styling from
+   components/verification/shared.tsx (FORM_INPUT_CLASSES). */
+main .bg-cream input, main .bg-cream select, main .bg-cream textarea,
+main .bg-parchment input, main .bg-parchment select, main .bg-parchment textarea,
+main [class*="bg-cream"] input, main [class*="bg-cream"] select, main [class*="bg-cream"] textarea,
+main [class*="bg-parchment"] input, main [class*="bg-parchment"] select, main [class*="bg-parchment"] textarea {
+  background: #071d4d !important;
+  color: #ffffff !important;
+  border-color: #5b8ed8 !important;
+}
+
+main .bg-gold-500 { background-color: #2563eb !important; color: #fff !important; }
+main button[class*="bg-cream"], main button[class*="bg-parchment"] { background: #1452a0 !important; color: #ffffff !important; border-color: #5b8ed8 !important; }
+main [class*="bg-\\[\\#6b4f0b\\]"] { background: #1452a0 !important; }
+main [class*="bg-\\#0A192F"] h1, main [class*="bg-\\#0A192F"] h2, main [class*="bg-\\#0A192F"] h3,
+main [class*="bg-\\#0b2f73"] h1, main [class*="bg-\\#0b2f73"] h2, main [class*="bg-\\#0b2f73"] h3 { color: #ffffff !important; }
+
+.service-tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  opacity: .34;
+  background-image: radial-gradient(circle, #60a5fa 1.3px, transparent 1.8px);
+  background-size: 15px 15px;
+  background-position: -5px -5px;
+  mask-image: linear-gradient(120deg, #000 0%, transparent 54%);
+}
+.service-tile::after {
+  content: "";
+  position: absolute;
+  inset: auto -24% 7px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #60a5fa, transparent);
+  opacity: .78;
+}
+.service-tile:hover {
+  border-color: #60a5fa;
+  box-shadow: inset 0 1px 0 rgba(255, 247, 205, .4), 0 12px 27px rgba(131, 78, 0, .42), 0 0 22px rgba(235, 175, 34, .20);
+}
+.service-tile-icon {
+  border: 6px solid #dbeafe;
+  border-radius: 9999px !important;
+  background-color: #61c39a !important;
+  color: #ffffff !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .35), inset 0 1px 0 #fffdf4;
+}
+.premium-sidebar {
+  border-right: 1px solid rgba(96, 165, 250, .35);
+  background:
+    radial-gradient(circle at 85% 8%, rgba(244, 187, 36, .18), transparent 25%),
+    linear-gradient(155deg, #061637 0%, #0b2b68 50%, #061331 100%);
+  box-shadow: inset -1px 0 rgba(255, 231, 145, .08), 8px 0 24px rgba(28, 16, 0, .18);
+}
+.premium-sidebar .logo-mark { filter: drop-shadow(0 0 7px rgba(255, 199, 52, .28)); }
+.premium-nav-link { color: #f7e7b2; transition: background .2s, color .2s, box-shadow .2s; }
+.premium-nav-link:hover { color: #fff8df; background: rgba(212, 175, 55, .16); }
+.premium-nav-link.is-active {
+  color: #160d02;
+  background: linear-gradient(135deg, #f7d76b, #b78316);
+  box-shadow: 0 5px 16px rgba(221, 164, 35, .28), inset 0 1px rgba(255, 247, 196, .65);
+}
+.premium-subnav { border-color: rgba(244, 194, 58, .45); }
+.premium-subnav button { color: #d7c28d; }
+.premium-subnav button:hover { color: #fff5cf; background: rgba(212, 175, 55, .14); }
+.premium-logout { border-top: 1px solid rgba(244, 194, 58, .2); color: #ffb09a; }
+.premium-logout:hover { background: rgba(220, 75, 45, .13); color: #ffd0c4; }
+
+.premium-activity {
+  overflow: hidden;
+  border-color: rgba(242, 194, 61, .7);
+  background: linear-gradient(135deg, #130d03 0%, #2e1d03 55%, #4a3107 100%);
+  box-shadow: 0 15px 32px rgba(25, 14, 0, .28), inset 0 1px rgba(255, 223, 126, .14);
+}
+.premium-activity-row { border-color: rgba(245, 208, 101, .55); }
+.premium-activity-title { color: #fff4c9; text-shadow: 0 1px 2px #000; }
+.premium-activity-date { color: #ffd86a; }
+.premium-activity-amount { color: #ffe69a; }
+
+/* Legacy page cards which still use the original light utility classes are
+   already covered by the consolidated ".bg-cream / .bg-parchment" rules
+   above - nothing further needed here. */
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker-track { animation: none; }
+}
+
+/* Royal-blue surfaces and high-contrast controls for the two remaining
+   pages not yet migrated to the shared component system:
+   VerificationPage.tsx (the all-in-one NIN/BVN catalog) and
+   NinModificationPage.tsx. Scoped to the `.verification-blue-page`
+   wrapper class those two files apply to their own root element - do NOT
+   add this class to pages built with components/verification/shared.tsx
+   (NinPhoneVerificationPage, BvnVerificationPage, ValidationPage,
+   IpeClearancePage, CacServicesPage, PhoneMultiplePage,
+   PersonalizationPage, BvnRetrievalPage), since its bare
+   `input, select, textarea` rule would force their intentionally-white
+   form fields back to dark navy. */
+.verification-blue-page .bg-parchment,
+.verification-blue-page section.bg-parchment,
+.verification-blue-page header.bg-parchment { background: #0b2f73 !important; color: #fff !important; border-color: #3d6fb9 !important; }
+.verification-blue-page .text-ink, .verification-blue-page .text-ink-600,
+.verification-blue-page .text-ink-400, .verification-blue-page label { color: #fff !important; }
+.verification-blue-page input, .verification-blue-page select, .verification-blue-page textarea { background: #08245b !important; color: #fff !important; border-color: #6f9bd8 !important; }
+.verification-blue-page input::placeholder { color: #c9d8f2 !important; }
+.verification-blue-page .bg-cream { background: #08245b !important; color: #fff !important; }
+.verification-blue-page .bg-gold-500 { background: #d9ad2b !important; color: #071a40 !important; }
+.verification-blue-page .text-gold-700 { color: #f6d568 !important; }
+.verification-blue-page .border-parchment-line { border-color: #6f9bd8 !important; }

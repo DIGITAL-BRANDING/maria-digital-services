@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "cd maria_backend && NPM_CONFIG_PRODUCTION=false npm install --cache /tmp/.npm --no-audit --no-fund && npm run prisma:generate && npm run build && cd ../web && NPM_CONFIG_PRODUCTION=false npm install --cache /tmp/.npm --no-audit --no-fund && npm run build && rm -rf ../maria_backend/public/app && mkdir -p ../maria_backend/public/app && cp -r dist/. ../maria_backend/public/app/"
+  },
+  "deploy": {
+    "startCommand": "cd maria_backend && npm run start:prod",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}

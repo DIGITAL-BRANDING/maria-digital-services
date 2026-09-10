@@ -1,0 +1,31 @@
+# Secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Node
+**/node_modules/
+**/dist/
+
+# Flutter / Dart
+**/.dart_tool/
+**/build/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/.pub-cache/
+**/.pub/
+
+# Generated / local artifacts
+**/*.log
+**/*.zip
+**/*.apk
+**/*.aab
+**/*.jks
+**/*.keystore
+
+# IDE / OS
+**/.idea/
+**/.vscode/
+**/*.iml
+**/.DS_Store

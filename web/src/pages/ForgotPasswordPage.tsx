@@ -1,0 +1,21 @@
+import { useState, type FormEvent } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import Logo from '../components/Logo';
+import { api, ApiError } from '../lib/api';
+import { Spinner } from './LoginPage';
+
+export default function ForgotPasswordPage() {
+  const navigate = useNavigate();
+  const [email, setEmail] = useState(''); const [code, setCode] = useState(''); const [password, setPassword] = useState(''); const [confirmPassword, setConfirmPassword] = useState('');
+  const [codeSent, setCodeSent] = useState(false); const [message, setMessage] = useState<string | null>(null); const [error, setError] = useState<string | null>(null); const [isLoading, setIsLoading] = useState(false);
+  const fail = (err: unknown, fallback: string) => setError(err instanceof ApiError ? err.message : fallback);
+  async function submit(e: FormEvent) {
+    e.preventDefault(); setError(null); setMessage(null); if (codeSent && password !== confirmPassword) { setError('Passwords do not match.'); return; } setIsLoading(true);
+    try {
+      const res = codeSent ? await api.post<{ message: string }>('/password/reset', { email, token: code, new_password: password }, false) : await api.post<{ message: string }>('/password/forgot', { email }, false);
+      setMessage(res.message); if (codeSent) window.setTimeout(() => navigate('/login'), 1200); else setCodeSent(true);
+    } catch (err) { fail(err, codeSent ? 'Unable to reset your password. Please try again.' : 'Unable to send the reset code. Please try again.'); } finally { setIsLoading(false); }
+  }
+  return <div className="flex min-h-screen items-center justify-center bg-cream px-5 py-12"><div className="w-full max-w-sm"><Link to="/" className="mb-8 flex justify-center"><Logo /></Link><div className="rounded-2xl border border-parchment-line bg-parchment p-7"><h1 className="font-display text-xl font-bold text-ink">Reset your password</h1><p className="mt-1 font-body text-sm text-ink-600">{codeSent ? 'Enter the 6-digit code sent to your email, then choose a new password.' : 'Enter your email and we will send a 6-digit reset code.'}</p><form onSubmit={submit} className="mt-6 space-y-4"><Field label="Email address" value={email} onChange={setEmail} type="email" disabled={codeSent} autoFocus />{codeSent && <><Field label="6-digit reset code" value={code} onChange={(v) => setCode(v.replace(/\D/g, '').slice(0, 6))} inputMode="numeric" /><Field label="New password" value={password} onChange={setPassword} type="password" /><Field label="Confirm new password" value={confirmPassword} onChange={setConfirmPassword} type="password" /></>}{message && <p className="rounded-lg bg-success-500/10 px-3 py-2 font-body text-sm text-success-600">{message}</p>}{error && <p className="rounded-lg bg-ember-500/10 px-3 py-2 font-body text-sm text-ember-600">{error}</p>}<button type="submit" disabled={isLoading || !email || (codeSent && (code.length !== 6 || password.length < 8 || !confirmPassword))} className="flex w-full items-center justify-center rounded-lg bg-gold-500 py-3 font-display text-sm font-semibold text-ink transition hover:bg-gold-400 disabled:opacity-50">{isLoading ? <Spinner /> : codeSent ? 'Reset password' : 'Send reset code'}</button></form>{codeSent && <button type="button" onClick={() => { setCodeSent(false); setCode(''); setMessage(null); setError(null); }} className="mt-4 w-full font-body text-sm font-medium text-gold-600 hover:text-gold-700">Use a different email</button>}</div><p className="mt-6 text-center font-body text-sm text-ink-600"><Link to="/login" className="font-semibold text-gold-600 hover:text-gold-700">Back to sign in</Link></p></div></div>;
+}
+function Field({ label, value, onChange, type = 'text', inputMode, disabled, autoFocus }: { label: string; value: string; onChange: (value: string) => void; type?: string; inputMode?: 'numeric'; disabled?: boolean; autoFocus?: boolean }) { return <label className="block"><span className="mb-1.5 block font-body text-xs font-medium text-ink-600">{label}</span><input type={type} value={value} onChange={(e) => onChange(e.target.value)} inputMode={inputMode} disabled={disabled} autoFocus={autoFocus} required className="w-full rounded-lg border border-parchment-line bg-cream px-3.5 py-2.5 font-body text-sm text-ink outline-none focus:border-gold-500 disabled:opacity-60" /></label>; }

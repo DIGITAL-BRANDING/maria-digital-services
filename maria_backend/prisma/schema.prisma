@@ -1,0 +1,673 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  // Use one direct MySQL URL for both runtime queries and Prisma migrations.
+  // Do not point this at the retired PostgreSQL/Supabase database.
+  url      = env("DATABASE_URL")
+}
+
+enum AccountStatus {
+  ACTIVE
+  DEACTIVATED
+  DELETED
+}
+
+enum KycStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REVERSED
+}
+
+enum TransactionType {
+  WALLET_FUNDING
+  WALLET_TRANSFER
+  DATA_PURCHASE
+  AIRTIME_PURCHASE
+  ELECTRICITY_PURCHASE
+  CABLE_PURCHASE
+  RESULT_PIN
+  SMS
+  WITHDRAWAL
+  REFERRAL_COMMISSION
+  MANUAL_ADJUSTMENT
+  COUPON_REDEMPTION
+  NIN_VERIFICATION
+  BVN_VERIFICATION
+  IDENTITY_SERVICE_REQUEST
+  /// A submitted NIN Modification request (Update Name, Phone, DOB, Address,
+  /// Name & DOB, or Name & Phone). Techhub has no API for this yet, so unlike
+  /// every other identity service above, nothing is called automatically at
+  /// submit time - the transaction is debited and stays PENDING until an
+  /// admin manually re-keys the same data on techhubltd.co and marks it
+  /// SUCCESS (via the "Complete modification" admin action) or FAILED (via
+  /// the existing "reverse", which refunds). See nin-modification.service.ts.
+  NIN_MODIFICATION
+  /// Manual BVN License Onboarding request. The customer is debited from
+  /// wallet at submission; the encrypted PDF is completed manually in
+  /// Techhub by an authorised admin, or reversed to refund the wallet.
+  BVN_LICENSE_ONBOARDING
+  /// A submitted CAC business registration request (Sole Proprietorship,
+  /// Partnership, Limited Liability, etc). There is no provider API for
+  /// this at all — the customer is debited at submission, an admin
+  /// registers the business by hand with CAC, optionally leaves progress
+  /// notes visible to the customer while it's in flight, and finally
+  /// uploads the completed certificate PDF, which marks the transaction
+  /// SUCCESS. See cac.service.ts.
+  CAC_SERVICE_REQUEST
+  /// A submitted BVN Modification request (update name/phone/DOB/address/
+  /// email tied to a BVN). No provider API for this either - same manual
+  /// pattern as NIN_MODIFICATION: debit now, admin re-keys the change by
+  /// hand wherever BVN modifications are actually filed, then marks it
+  /// complete. See bvn-modification.service.ts.
+  BVN_MODIFICATION
+  /// A submitted Birth Attestation request (NPC Birth Attestation & Instant
+  /// approval). No provider API - same manual pattern as the other
+  /// identity-service requests above: debit now, admin processes it by hand
+  /// with NPC and marks it complete, or reverses it to refund. See
+  /// birth-attestation.service.ts.
+  BIRTH_ATTESTATION
+  /// A submitted Newspaper Publication (name change) request. No provider
+  /// API - same manual pattern: debit now, admin places the actual
+  /// newspaper publication and affidavit by hand, then marks it complete or
+  /// reverses it. See newspaper-publication.service.ts.
+  NEWSPAPER_PUBLICATION
+  /// A submitted BVN CRM ticket (customer supplies the 8-digit TicketID
+  /// already raised on the bank/NIBSS CRM portal, e.g. 88248XXX). No
+  /// provider API for this either - same manual pattern as the other
+  /// identity-service requests above: debit now, admin follows up on the
+  /// ticket by hand and marks it complete, or reverses it to refund. See
+  /// bvn-crm.service.ts.
+  BVN_CRM
+  /// The credit-back entry refundWallet() creates - distinct from the
+  /// original debit's own type (e.g. a reversed DATA_PURCHASE gets a REFUND
+  /// entry, not a second DATA_PURCHASE). See relatedTransactionId above.
+  REFUND
+  /// The percentage-based WALLET_FUNDING_FEE_PERCENT charge debited right after every
+  /// successful WALLET_FUNDING credit - see applyFundingFee() in
+  /// wallet.service.ts. Pure revenue in Company Wallet's profit reporting:
+  /// costKobo is always 0 here, since there's no upstream cost for it.
+  WALLET_FUNDING_FEE
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  FINANCE
+  SUPPORT
+}
+
+enum NotificationType {
+  TRANSACTION
+  WALLET
+  KYC
+  PROMO
+  ADMIN_BROADCAST
+  SYSTEM
+}
+
+enum NotificationAudience {
+  ALL_USERS
+  SPECIFIC_USERS
+  KYC_VERIFIED_ONLY
+}
+
+model User {
+  id                   String         @id
+  fullName             String
+  email                String         @unique
+  phone                String         @unique
+  passwordHash         String?
+  photoUrl             String?
+  walletBalanceKobo    BigInt         @default(0)
+  referralCode         String         @unique
+  referredByCode       String?
+  referralEarningsKobo BigInt         @default(0) // current unwithdrawn ("pending") commission balance
+  referralWithdrawnKobo BigInt        @default(0) // lifetime total moved into the wallet via /referral/withdraw
+  kycStatus            KycStatus      @default(UNVERIFIED)
+  emailVerified        Boolean        @default(false)
+  phoneVerified        Boolean        @default(false)
+  pinHash              String?
+  pinFailures          Int            @default(0)
+  pinLockedUntil       DateTime?
+  /// When pinFailures was last incremented - lets verifyPin() treat a stale
+  /// failure streak (older than the reset window) as expired instead of
+  /// letting failures accumulate forever across unrelated days/sessions.
+  /// See src/lib/lockout.ts.
+  pinFailureAt         DateTime?
+  loginPinHash         String?
+  loginPinFailures     Int            @default(0)
+  loginPinLockedUntil  DateTime?
+  /// Same rolling-window purpose as pinFailureAt above, for the login PIN.
+  loginPinFailureAt    DateTime?
+  passwordFailures     Int            @default(0)
+  passwordLockedUntil  DateTime?
+  /// Same rolling-window purpose as pinFailureAt above, for the account
+  /// password. Without this, a handful of very old failed attempts (e.g.
+  /// from weeks ago, never followed by a successful login to clear them)
+  /// could combine with a couple of fresh typos today to trigger a lockout
+  /// that feels completely unearned from the user's perspective.
+  passwordFailureAt    DateTime?
+  // Set by the admin panel's "Reset Password" action (see
+  // src/admin/resources/user.resource.ts) when an admin issues a temporary
+  // password by hand - Resend needs a verified sending domain we don't have
+  // yet, so this is the fallback for "I forgot my password" until that's
+  // sorted out. /auth/login reports this back as requires_password_change
+  // so the app can force a "set a new password" screen before anything
+  // else; POST /user/password/change clears it once they do.
+  mustChangePassword   Boolean        @default(false)
+  virtualAccountNumber String?
+  virtualAccountBank   String?
+  // Which gateway ('paystack' | 'katpay') issued the virtualAccountNumber above -
+  // set by payment-provider.service.ts whenever an account is provisioned. Used to
+  // route direct-deposit webhooks (see creditDirectDeposit vs
+  // creditDirectDepositByAccountNumber in wallet.service.ts) to the right matcher.
+  virtualAccountProvider String?
+  paystackCustomerCode String?
+  bvnLast4             String?
+  bvnVerifiedAt        DateTime?
+  kycFailureReason     String?
+
+  // Account lifecycle - checked immediately in auth middleware so
+  // deactivation/deletion takes effect right away, rather than waiting for
+  // the current access token to naturally expire.
+  accountStatus        AccountStatus @default(ACTIVE)
+  deactivatedAt        DateTime?
+  deletionReason       String?
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+  transactions         Transaction[]
+  refreshTokens        RefreshToken[]
+  passwordResetCodes   PasswordResetCode[]
+  redeemedCoupons      Coupon[]
+  deviceTokens         DeviceToken[]
+  notifications        Notification[]
+  assistantAuditEvents  AssistantAuditEvent[]
+  deliveries            UserDelivery[]
+}
+
+model UserDelivery {
+  id          String   @id @default(uuid())
+  userId      String
+  title       String
+  description String? @db.Text
+  fileName    String
+  mimeType    String
+  filePath    String   @unique
+  /// Encrypted base64 document for database-backed deliveries. Keeping this
+  /// optional preserves access to older files already stored in Supabase.
+  inlineData  Json?
+  fileSize    Int
+  reference   String?
+  createdByAdminId String
+  createdAt   DateTime @default(now())
+  user        User @relation(fields: [userId], references: [id])
+  createdByAdmin AdminUser @relation(fields: [createdByAdminId], references: [id])
+  @@index([userId, createdAt])
+}
+
+model AssistantAuditEvent {
+  id             String   @id @default(uuid())
+  userId         String
+  intent         String?
+  stage          String
+  outcome        String
+  errorCode      String?
+  transactionRef String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+  user           User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([stage, outcome, createdAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+// A 6-digit code emailed via Resend for the "forgot password" flow (see
+// src/routes/password.routes.ts). Deliberately NOT a clickable link/token -
+// the mobile app has no deep-link handling set up, so the user types this
+// code into ResetPasswordScreen instead. codeHash only (never the plain
+// code) so a DB read alone can't be used to reset someone's password.
+// attempts caps brute-forcing a 6-digit space (1,000,000 possibilities) the
+// same way loginPinFailures/passwordFailures already do elsewhere on User.
+model PasswordResetCode {
+  id         String    @id @default(uuid())
+  userId     String
+  codeHash   String
+  attempts   Int       @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model Transaction {
+  id                String            @id
+  userId            String
+  type              TransactionType
+  status            TransactionStatus @default(PENDING)
+  amountKobo        BigInt
+  balanceBeforeKobo BigInt
+  balanceAfterKobo  BigInt
+  /// What THIS purchase actually cost us at our upstream provider (Alrahuz/
+  /// Techhub), captured AT THE TIME of the transaction - never derived from
+  /// current pricing config later, since selling prices and provider costs
+  /// both drift over time and a historical margin report must reflect what
+  /// was true when the sale happened, not today's numbers. Null for
+  /// transaction types with no cost basis at all (WALLET_FUNDING,
+  /// WALLET_TRANSFER, REFERRAL_COMMISSION, MANUAL_ADJUSTMENT,
+  /// COUPON_REDEMPTION, WITHDRAWAL) and, occasionally, for a purchase type
+  /// that normally has one but where neither the configured cost nor an
+  /// observed provider balance-delta was available (e.g. AIRTIME_PURCHASE in
+  /// MOCK_PROVIDER mode) - see costBasis() in company-wallet.service.ts,
+  /// which treats null as "unknown", never as zero. Populated by
+  /// debitWallet()'s `costKobo` param and (for Alrahuz data/airtime, where
+  /// it's more accurate than any static config) overwritten with the real
+  /// balance_before-minus-balance_after delta once the provider responds -
+  /// see normalize() in provider.service.ts.
+  costKobo          BigInt?
+  provider          String?
+  providerRef       String?
+  reference         String            @unique
+  idempotencyKey    String?
+  description       String            @db.Text
+  metadata          Json?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  user              User              @relation(fields: [userId], references: [id])
+
+  /// Links a REFUND entry back to the original debit it reverses. The
+  /// original transaction's own balanceBeforeKobo/balanceAfterKobo are never
+  /// rewritten after the fact (see refundWallet() in wallet.service.ts) - a
+  /// refund is always a NEW row with its own accurate before/after balance at
+  /// the moment it happened, so the ledger stays append-only and a full
+  /// history can always be replayed in order. Only `status` on the original
+  /// moves to REVERSED, which is a normal state transition, not a rewrite of
+  /// historical fact.
+  relatedTransactionId String?
+  relatedTransaction    Transaction?  @relation("TransactionReversal", fields: [relatedTransactionId], references: [id])
+  reversals             Transaction[] @relation("TransactionReversal")
+
+  @@index([userId, createdAt])
+  @@unique([userId, idempotencyKey])
+  // Provider event IDs are idempotency keys. Together these prevent two
+  // concurrent deliveries of the same KatPay bank-transfer event from
+  // crediting a wallet twice, while allowing app-owned `reference` values.
+  @@unique([provider, providerRef])
+  // Powers company-wallet.service.ts's profit-by-type breakdown and the
+  // per-user wallet summary on the admin User page - both filter by
+  // status/type and aggregate over a date range.
+  @@index([type, status, createdAt])
+  @@index([relatedTransactionId])
+}
+
+model DataPlanPricing {
+  id               String   @id @default(uuid())
+  provider         String   @default("alrahuz")
+  providerPlanId   String
+  network          String
+  networkId        Int
+  planType         String?
+  name             String
+  validity         String?
+  providerCostKobo BigInt
+  sellingPriceKobo BigInt?
+  isActive         Boolean  @default(true)
+  lastSeenAt       DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([provider, providerPlanId])
+  @@index([network, isActive])
+  @@index([networkId, isActive])
+}
+
+/// Prepaid funding codes ("Fund with Coupon" in the app) â€” generated by an admin
+/// (see CouponResource in AdminJS), sold/shared out-of-band (e.g. via WhatsApp),
+/// and redeemed once by a user to credit their wallet.
+
+model ServicePricing {
+  id               String   @id @default(uuid())
+  service          String   @unique
+  provider         String   @default("alrahuz")
+  label            String
+  providerCostKobo BigInt
+  sellingPriceKobo BigInt?
+  isActive         Boolean  @default(true)
+  metadata         Json?
+  lastSyncedAt     DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([isActive])
+}
+enum TicketStatus {
+  OPEN
+  PENDING
+  CLOSED
+}
+
+enum TicketSender {
+  USER
+  ADMIN
+}
+
+model SupportTicket {
+  id        String              @id @default(uuid())
+  userId    String
+  subject   String              @db.Text
+  status    TicketStatus        @default(OPEN)
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+  messages  SupportTicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model SupportTicketMessage {
+  id         String        @id @default(uuid())
+  ticketId   String
+  ticket     SupportTicket @relation(fields: [ticketId], references: [id])
+  senderType TicketSender
+  // senderId is the User.id or AdminUser.id depending on senderType - not a
+  // Prisma relation since it points at two different tables.
+  senderId   String
+  senderName String
+  message    String        @db.Text
+  createdAt  DateTime      @default(now())
+
+  @@index([ticketId])
+}
+// Singleton row (id is always "default") holding admin-editable referral
+// program settings. Read fresh by referral.service.ts on every relevant
+// call - traffic here is low enough (one read per purchase/withdrawal/stats
+// view) that caching isn't worth the staleness risk of an admin changing
+// the rate and it not taking effect immediately.
+model ReferralSettings {
+  id                String   @id @default("default")
+  isEnabled         Boolean  @default(true)
+  commissionRate    Float    @default(0.01) // 0.01 = 1%
+  minWithdrawalKobo BigInt   @default(50000) // 50000 kobo = NGN 500
+  updatedAt         DateTime @updatedAt
+}
+
+// Singleton (id="default", self-seeded by getAppConfig() on first read,
+// same pattern as ReferralSettings/PricingSettings above) read by every
+// client on startup via GET /api/public/app-config. Exists because of a
+// concrete incident: commit a089b84 ("Fix security pin verification")
+// added a REQUIRED `pin` field to every purchase endpoint's Zod schema on
+// the backend and to the Flutter app in the same commit - but nothing
+// stops an already-installed older APK (built before that commit, which
+// never learned to collect/send a pin at all) from continuing to call the
+// new backend indefinitely. That produced a confusing raw ZodError
+// ("path: pin, Required") with zero indication to the user that they
+// simply needed to update. minAndroidVersion lets the app refuse to
+// proceed past its splash screen when running below that version, with a
+// clear "please update" screen instead of a cryptic validation error deep
+// inside a purchase flow.
+model AppConfig {
+  id                  String   @id @default("default")
+  minAndroidVersion   String   @default("1.0.0")
+  latestAndroidVersion String  @default("1.0.0")
+  androidDownloadUrl  String   @default("https://github.com/DIGITAL-BRANDING/MAJOR-DATA-LINK/releases/latest/download/MajorDataLink.apk")
+  updateMessage       String?  @db.Text
+  updatedAt           DateTime @updatedAt
+}
+// Singleton (same "default"-id pattern as ReferralSettings above) holding the
+// GLOBAL default markup applied to any DataPlanPricing row that has no
+// explicit sellingPriceKobo override - see defaultSellingPrice() in
+// data-plan-pricing.service.ts. This used to live only in the
+// DATA_PLAN_MARKUP_PERCENT/DATA_PLAN_MARKUP_NAIRA env vars, which meant an
+// admin needed a developer + a Railway redeploy just to change the default
+// markup. Now it's editable directly from /admin/bulk-pricing (or the
+// PricingSettings AdminJS resource) and takes effect immediately - the env
+// vars still exist as the one-time seed value for a fresh database, read in
+// getPricingSettings()'s getOrCreate.
+model PricingSettings {
+  id                       String   @id @default("default")
+  dataPlanMarkupPercent    Float    @default(0)
+  dataPlanMarkupNaira      Float    @default(0)
+  // Which upstream provider handles data/airtime/result-pin purchases right
+  // now - 'alrahuz' or 'bilalsadasub'. Admin-editable at /admin/bulk-pricing
+  // (no redeploy needed), read fresh on every purchase/list call so a
+  // switch takes effect immediately. Cable/electricity have no Alrahuz
+  // equivalent in this codebase at all, so they always go through
+  // bilalsadasub.service.ts regardless of these two settings.
+  dataAirtimeProvider      String   @default("alrahuz")
+  resultPinProvider        String   @default("alrahuz")
+  cableMarkupPercent       Float    @default(0)
+  electricityMarkupPercent Float    @default(0)
+  updatedAt                DateTime @updatedAt
+}
+// Conversation state for the WhatsApp data-purchase bot (see
+// src/services/whatsapp-session.service.ts). One row per WhatsApp phone
+// number - `state` drives which step of the menu flow the user is on,
+// `context` holds what they've selected so far (network/plan/recipient)
+// until the purchase is confirmed and the row resets to START.
+model WhatsAppSession {
+  id        String   @id @default(cuid())
+  phone     String   @unique // E.164 as sent by WhatsApp Cloud API, e.g. "2348012345678"
+  userId    String? // resolved once the phone number is matched to an existing User
+  state     String   @default("START")
+  context   Json?
+  updatedAt DateTime @updatedAt
+}
+
+model Coupon {
+  id               String    @id @default(uuid())
+  code             String    @unique
+  valueKobo        BigInt
+  isRedeemed       Boolean   @default(false)
+  redeemedByUserId String?
+  redeemedAt       DateTime?
+  createdByAdminId String?
+  note             String?   @db.Text
+  expiresAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  redeemedBy       User?     @relation(fields: [redeemedByUserId], references: [id])
+
+  @@index([isRedeemed])
+}
+
+/// Tracks the reseller's own balance AT Alrahuz (the upstream VTU provider) â€”
+/// a completely separate ledger from any customer's in-app wallet. Alrahuz
+/// requires this to be pre-funded before it will fulfill any purchase; if it
+/// runs dry, purchases fail regardless of the customer's own balance. Updated
+/// opportunistically from the `balance_after` field Alrahuz returns on every
+/// purchase response â€” this is a read-only mirror of Alrahuz's own number,
+/// not a balance this app manages.
+model ProviderBalanceStatus {
+  provider              String    @id
+  lastKnownBalance      Float
+  lastCheckedAt         DateTime  @updatedAt
+  lowBalanceAlertSentAt DateTime?
+}
+
+enum ProviderLedgerEntryType {
+  /// Automatic - recorded whenever a customer purchase actually consumes our
+  /// balance at this provider (Transaction.costKobo becomes known).
+  PURCHASE_DEBIT
+  /// Manual - an admin recording that we paid the provider to top up our
+  /// balance with them ("Settlement" in the admin UI - see provider-ledger.ts).
+  TOPUP_CREDIT
+  /// Manual - any other correction (e.g. reconciling against the provider's
+  /// own dashboard figure) that isn't a purchase or a top-up.
+  ADJUSTMENT
+}
+
+/// The company's OWN computed running ledger of its balance at each upstream
+/// provider (Alrahuz, Techhub, ...) - built entirely from ProviderLedgerEntry
+/// rows below, the same way User.walletBalanceKobo is the running total of
+/// that user's own Transaction rows. This is intentionally a SEPARATE number
+/// from ProviderBalanceStatus.lastKnownBalance above, which is just a
+/// read-only mirror of whatever Alrahuz itself reports - the two SHOULD
+/// usually agree, but won't always (e.g. a provider-side fee we don't see
+/// itemized, or a manual top-up not yet reflected in their dashboard). Admins
+/// see both side by side on the Provider Ledger page specifically so a
+/// mismatch is visible rather than hidden.
+model ProviderLedgerBalance {
+  provider    String   @id
+  balanceKobo BigInt   @default(0)
+  updatedAt   DateTime @updatedAt
+}
+
+model ProviderLedgerEntry {
+  id                    String                  @id
+  provider              String
+  type                  ProviderLedgerEntryType
+  /// Signed: negative for PURCHASE_DEBIT (balance went down), positive for
+  /// TOPUP_CREDIT (balance went up). ADJUSTMENT can be either sign.
+  amountKobo            BigInt
+  balanceBeforeKobo     BigInt
+  balanceAfterKobo      BigInt
+  /// Set on PURCHASE_DEBIT entries - the customer Transaction that caused
+  /// this provider-side debit (loose reference, no FK - Transaction rows are
+  /// never deleted, but keeping this a plain string avoids a cross-model
+  /// migration dependency).
+  relatedTransactionId  String?
+  /// Receipt/reference for a TOPUP_CREDIT (e.g. the bank transfer reference
+  /// used to fund the Alrahuz account).
+  reference             String?
+  description           String                  @db.Text
+  /// Set on manual entries (TOPUP_CREDIT/ADJUSTMENT) - which admin recorded it.
+  createdByAdminId      String?
+  metadata              Json?
+  createdAt             DateTime                @default(now())
+
+  @@index([provider, createdAt])
+  @@index([relatedTransactionId])
+}
+
+/// A single push-notification-capable device/browser registered to a user (FCM token).
+/// Scoping this to userId is what makes it possible to push a notification to ONE
+/// specific person instead of every device that has ever registered a token â€” the
+/// FCM `token` itself is only unique per install, so it (not the userId) is the
+/// unique key: if the same physical device later logs in as a different user (e.g.
+/// shared/demo device), the token is re-owned to that new user rather than kept
+/// duplicated under the old one.
+model DeviceToken {
+  id         String    @id @default(uuid())
+  userId     String
+  token      String    @unique
+  platform   String? // 'android' | 'ios' | 'web'
+  lastSeenAt DateTime  @default(now())
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+/// One row per (recipient, message). Personal alerts (funding, purchases, KYC
+/// updates, etc.) are created with a single row for the one affected userId.
+/// Admin broadcasts fan out into one row per targeted recipient at send time
+/// (see NotificationBroadcast) so every user has their own independent isRead
+/// state and no query ever has to join against "who else has read this" â€”
+/// this is what guarantees one user's notification feed and unread badge can
+/// never be affected by another user's activity.
+model Notification {
+  id          String            @id @default(uuid())
+  userId      String
+  type        NotificationType  @default(SYSTEM)
+  title       String
+  body        String            @db.Text
+  data        Json?
+  isRead      Boolean           @default(false)
+  readAt      DateTime?
+  broadcastId String?
+  /// Which preset illustration (see PROMO_ILLUSTRATIONS in
+  /// notification.service.ts and the matching Dart enum in
+  /// promo_illustration.dart) to show alongside this notification. Null =
+  /// no illustration, renders as a plain text notification.
+  imageKey    String?
+  /// If true, the app shows this as a full-screen promotional dialog the
+  /// next time it launches (once, until dismissed) rather than only
+  /// appearing in the notification list - see PromoPopupDialog on the
+  /// Flutter side. Copied from NotificationBroadcast.showAsPopup at
+  /// fan-out time so it's independently controllable per recipient later
+  /// if that's ever needed (e.g. re-showing to just one user).
+  showAsPopup Boolean           @default(false)
+  createdAt   DateTime          @default(now())
+  user        User              @relation(fields: [userId], references: [id])
+  broadcast   NotificationBroadcast? @relation(fields: [broadcastId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([userId, isRead])
+}
+
+/// Audit record of one admin "send a message to users" action (e.g. a price-change
+/// announcement or maintenance notice). This is the send event itself â€” the actual
+/// per-user Notification rows it fans out to are linked back via broadcastId, so an
+/// admin can see exactly who a given broadcast reached and how many have read it,
+/// without that fan-out affecting any individual user's own notification query.
+model NotificationBroadcast {
+  id               String                @id @default(uuid())
+  createdByAdminId String
+  createdByAdmin   AdminUser             @relation(fields: [createdByAdminId], references: [id])
+  type             NotificationType      @default(ADMIN_BROADCAST)
+  title            String
+  body             String                @db.Text
+  audience         NotificationAudience  @default(ALL_USERS)
+  targetUserIds    Json?
+  /// See the matching field on Notification above - carried through to
+  /// every fanned-out per-user row by fanOutBroadcast().
+  imageKey         String?
+  showAsPopup      Boolean               @default(false)
+  recipientCount   Int                   @default(0)
+  createdAt        DateTime              @default(now())
+  notifications    Notification[]
+
+  @@index([createdByAdminId, createdAt])
+}
+
+model AdminUser {
+  id           String          @id @default(uuid())
+  email        String          @unique
+  passwordHash String
+  fullName     String
+  role         AdminRole       @default(SUPPORT)
+  isActive     Boolean         @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  auditLogs    AdminAuditLog[]
+  sentBroadcasts NotificationBroadcast[]
+  deliveries UserDelivery[]
+}
+
+model AdminAuditLog {
+  id         String    @id @default(uuid())
+  adminId    String
+  admin      AdminUser @relation(fields: [adminId], references: [id])
+  action     String
+  targetType String
+  targetId   String?
+  metadata   Json?
+  createdAt  DateTime  @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([targetType, targetId])
+}

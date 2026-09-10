@@ -1,0 +1,11 @@
+[phases.setup]
+nixpkgsArchive = "51ad838b03a05b1de6f9f2a0fffecee64a9788ee"
+nixPkgs = ["nodejs_22"]
+
+[phases.install]
+cmds = [
+  "NPM_CONFIG_PRODUCTION=false npm install --cache /tmp/.npm --no-audit --no-fund"
+]
+
+[phases.build]
+cmds = ["npm run prisma:generate", "npm run build"]
