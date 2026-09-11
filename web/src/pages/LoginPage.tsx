@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Eye, EyeOff, Lock, Mail } from 'lucide-react';
+import { Eye, EyeOff, Fingerprint, Lock, Mail, Smartphone, Wifi } from 'lucide-react';
 import Logo from '../components/Logo';
 import { useAuth } from '../lib/auth';
 import { ApiError } from '../lib/api';
@@ -57,8 +57,32 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen bg-cream px-5 py-10">
-      <div className="mx-auto max-w-md">
+    <div className="relative min-h-screen overflow-hidden bg-cream px-5 py-10">
+      {/* Decorative only - hidden below md so they never crowd the form on a
+          phone screen. NIN is deliberately left out here on purpose. */}
+      <ServiceBadge
+        icon={<Wifi size={20} />}
+        label="Data Purchase"
+        className="left-[6%] top-[14%] hidden md:flex"
+        tilt="-6deg"
+        delay="0s"
+      />
+      <ServiceBadge
+        icon={<Smartphone size={20} />}
+        label="Airtime Topup"
+        className="right-[8%] top-[20%] hidden lg:flex"
+        tilt="5deg"
+        delay="1.1s"
+      />
+      <ServiceBadge
+        icon={<Fingerprint size={20} />}
+        label="BVN Verification"
+        className="bottom-[10%] left-[10%] hidden lg:flex"
+        tilt="-4deg"
+        delay="2.2s"
+      />
+
+      <div className="relative z-10 mx-auto max-w-md">
         <Link to="/" className="mb-8 flex justify-center">
           <Logo />
         </Link>
@@ -151,6 +175,33 @@ export default function LoginPage() {
           Back to home
         </Link>
       </div>
+    </div>
+  );
+}
+
+function ServiceBadge({
+  icon,
+  label,
+  className = '',
+  tilt = '0deg',
+  delay = '0s',
+}: {
+  icon: React.ReactNode;
+  label: string;
+  className?: string;
+  tilt?: string;
+  delay?: string;
+}) {
+  return (
+    <div
+      aria-hidden="true"
+      className={`auth-badge absolute items-center gap-2 rounded-2xl border border-parchment-line bg-white px-4 py-3 shadow-lg shadow-ink/10 ${className}`}
+      style={{ ['--badge-tilt' as string]: tilt, animationDelay: delay }}
+    >
+      <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gold-500/15 text-gold-600">
+        {icon}
+      </span>
+      <span className="font-body text-xs font-semibold text-ink">{label}</span>
     </div>
   );
 }

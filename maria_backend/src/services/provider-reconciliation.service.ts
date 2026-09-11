@@ -96,7 +96,10 @@ export async function listPendingReconciliations(): Promise<PendingReconciliatio
   return prisma.transaction.findMany({
     where: {
       status: TransactionStatus.PENDING,
-      metadata: { path: ['reconciliation'], not: Prisma.JsonNull }
+      // MySQL JSON paths are strings (unlike PostgreSQL, which accepts a
+      // string-array path).  Using the MySQL form also keeps Prisma's
+      // `include: { user: ... }` overload selected correctly.
+      metadata: { path: '$.reconciliation', not: Prisma.JsonNull }
     },
     orderBy: { createdAt: 'asc' },
     include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }

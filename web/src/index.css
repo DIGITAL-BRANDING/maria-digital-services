@@ -78,6 +78,15 @@ select:focus-visible, textarea:focus-visible {
 .ticker-row:hover .ticker-track { animation-play-state: paused; }
 .dashboard-overview { animation: dashboard-float 5s ease-in-out infinite; }
 @keyframes dashboard-float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+
+/* Gentle bob + gentle rotate for the decorative service badges on the
+   auth pages (LoginPage, RegisterPage) - each badge gets its own
+   animation-delay inline so the three don't move in lockstep. */
+@keyframes auth-badge-float {
+  0%, 100% { transform: translateY(0) rotate(var(--badge-tilt, -3deg)); }
+  50%      { transform: translateY(-10px) rotate(var(--badge-tilt, -3deg)); }
+}
+.auth-badge { animation: auth-badge-float 4.5s ease-in-out infinite; }
 .service-tile {
   isolation: isolate;
   border: 1px solid rgba(96, 165, 250, .35);
