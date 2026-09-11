@@ -46,12 +46,30 @@ export const ADMIN_ROOT_PATH = '/admin';
 // table on first boot and periodically removes expired sessions.
 const sessionPool = mysql.createPool(env.DATABASE_URL);
 const MySqlSessionStore = expressMySqlSession(session);
-const adminSessionStore = new MySqlSessionStore({
-  tableName: 'admin_session',
-  createDatabaseTable: true,
-  clearExpired: true,
-  checkExpirationInterval: 60 * 15 * 1000
-}, sessionPool);
+const adminSessionStore = new MySqlSessionStore(
+  {
+    createDatabaseTable: true,
+    clearExpired: true,
+    checkExpirationInterval: 60 * 15 * 1000,
+    // `tableName` only takes effect nested under `schema` - a top-level
+    // `tableName` property is silently ignored by this library (confirmed
+    // against its source), which would otherwise leave the session table
+    // named 'sessions' (the library's own default) instead of the
+    // intended 'admin_session'.
+    schema: {
+      tableName: 'admin_session'
+    }
+  },
+  // express-mysql-session and its @types package each pin a different
+  // exact mysql2 patch version than the one in this app's own
+  // package.json, so npm can't dedupe them into one copy - three separate
+  // mysql2 installations end up nested in node_modules (`npm ls mysql2`
+  // confirms this). TypeScript treats their `Pool` classes as nominally
+  // distinct even though they're structurally identical at runtime (this
+  // is a real mysql2 Pool). Safe to assert past - this isn't hiding a
+  // real type error.
+  sessionPool as unknown as ConstructorParameters<typeof MySqlSessionStore>[1]
+);
 
 export async function buildAdminRouter() {
   const admin = new AdminJS({

@@ -51,6 +51,7 @@
         "@types/bcryptjs": "^2.4.6",
         "@types/cors": "^2.8.17",
         "@types/express": "^5.0.0",
+        "@types/express-mysql-session": "^3.0.8",
         "@types/express-session": "^1.18.0",
         "@types/node": "^22.10.2",
         "@types/pdfkit": "^0.17.6",
