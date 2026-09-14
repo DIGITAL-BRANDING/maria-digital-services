@@ -127,6 +127,55 @@ verificationRoutes.get('/bvn/license-onboarding/history', async (req, res) => {
   }) });
 });
 
+// Whitelisted identity preview for the transaction's own owner. Every
+// caller of toSlipHistoryEntry below is already scoped to
+// `where: { userId: req.user!.id }`, the exact same boundary that already
+// gates pdf_base64/pdf_url access - so surfacing these few named fields for
+// an in-app preview does not open any access this owner didn't already
+// have via the downloadable slip PDF itself; it just saves them from
+// opening that PDF to see who/what they verified. Deliberately a fixed,
+// named whitelist (never the raw provider payload) so a provider field we
+// don't recognise can't leak through unreviewed.
+function identityPreviewFor(pii: Record<string, unknown> | null) {
+  if (!pii) return null;
+  const userData =
+    pii.user_data && typeof pii.user_data === 'object' && !Array.isArray(pii.user_data)
+      ? (pii.user_data as Record<string, unknown>)
+      : null;
+  const pick = (...keys: string[]) => {
+    for (const source of [userData, pii]) {
+      if (!source) continue;
+      for (const key of keys) {
+        const value = source[key];
+        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+      }
+    }
+    return null;
+  };
+  const firstName = pick('first_name', 'firstname', 'firstName');
+  const lastName = pick('last_name', 'lastname', 'surname', 'lastName');
+  const middleName = pick('middle_name', 'middlename', 'middleName');
+  const fullName = pick('full_name', 'fullname', 'name') ?? ([firstName, middleName, lastName].filter(Boolean).join(' ') || null);
+  const nin = pick('nin', 'nin_number', 'NIN');
+  const bvn = pick('bvn', 'bvn_number', 'BVN');
+  const phone = pick('phone_number', 'phone');
+  const gender = pick('gender');
+  const dob = pick('date_of_birth', 'dob');
+  const photo = pick('photo', 'photo_base64', 'image', 'image_base64', 'passport', 'passport_photo');
+  if (!fullName && !nin && !bvn && !phone && !dob && !photo) return null;
+  return { full_name: fullName, nin, bvn, phone, gender, dob, photo };
+}
+
+// A short, non-technical explanation for a failed/reversed request - the
+// actual provider error text isn't persisted (see purchaseSlip() in
+// verification.service.ts), so this is deliberately generic rather than
+// guessed from data we don't have.
+function friendlyOutcomeMessage(status: string): string | null {
+  if (status === 'failed') return 'This request could not be completed by the verification provider. Your payment has been refunded to your wallet.';
+  if (status === 'reversed') return 'This request was reversed. Your payment has been refunded to your wallet.';
+  return null;
+}
+
 // Shared by both /history (one service, used inline on each verification
 // page) and /history/all (every service, used by the standalone "Slips
 // History" dashboard page) - keeps the pdf_base64/pdf_url extraction logic
@@ -162,16 +211,21 @@ function toSlipHistoryEntry(transaction: {
         : typeof userData?.slip_url === 'string' && userData.slip_url.trim().length > 0
           ? userData.slip_url
           : null;
+  const status = transaction.status.toLowerCase();
   return {
     reference: transaction.reference,
-    status: transaction.status.toLowerCase(),
+    status,
     created_at: transaction.updatedAt.toISOString(),
     service: typeof metadata?.service === 'string' ? metadata.service : null,
-    // Do not return identity details here. The PDF itself is the
-    // retrievable document and the rest remains sealed in storage.
     pdf_base64: pdfBase64,
     pdf_url: pdfUrl,
-    ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null
+    ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
+    // Named, whitelisted identity preview (full name / NIN / BVN / phone /
+    // gender / DOB / photo) for the owner's own in-app preview - null when
+    // nothing recognisable is present (e.g. a still-pending request).
+    identity: identityPreviewFor(pii),
+    // Short human-readable explanation, only set for failed/reversed rows.
+    failure_message: friendlyOutcomeMessage(status)
   };
 }
 
@@ -275,7 +329,11 @@ verificationRoutes.get('/service-history', async (req, res) => {
       progress_notes: typeof metadata?.progress_notes === 'string' ? metadata.progress_notes : null,
       ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
       pdf_base64: slip.pdf_base64,
-      pdf_url: slip.pdf_url
+      pdf_url: slip.pdf_url,
+      // Owner-only identity preview + friendly outcome text - see
+      // identityPreviewFor()/friendlyOutcomeMessage() above toSlipHistoryEntry.
+      identity: slip.identity,
+      failure_message: slip.failure_message
     };
   });
   res.set('Cache-Control', 'no-store');

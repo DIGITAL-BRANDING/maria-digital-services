@@ -243,7 +243,7 @@ function extractPdfFields(source: Record<string, unknown> | null | undefined) {
   return { pdfBase64, pdfUrl };
 }
 
-function DetailsOverviewGrid({ entries }: { entries: [string, unknown][] }) {
+export function DetailsOverviewGrid({ entries }: { entries: [string, unknown][] }) {
   if (!entries.length) return null;
   return (
     <div className="mt-4 grid gap-x-6 gap-y-2 rounded-xl bg-blue-50 p-4 sm:grid-cols-2">
@@ -279,24 +279,28 @@ function valueFor(data: Record<string, unknown>, ...keys: string[]) {
   return '';
 }
 
-function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) {
+export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) {
   const source = data.user_data && typeof data.user_data === 'object' && !Array.isArray(data.user_data) ? data.user_data as Record<string, unknown> : data;
   const firstName = valueFor(source, 'first_name', 'firstname', 'firstName');
   const lastName = valueFor(source, 'last_name', 'lastname', 'surname', 'lastName');
   const middleName = valueFor(source, 'middle_name', 'middlename', 'middleName');
-  const name = [firstName, middleName, lastName].filter(Boolean).join(' ') || 'Verified Identity';
+  const fullNameField = valueFor(source, 'full_name', 'fullname', 'name');
+  const name = fullNameField || [firstName, middleName, lastName].filter(Boolean).join(' ') || 'Verified Identity';
   const nin = valueFor(source, 'nin', 'nin_number', 'NIN');
+  const bvn = valueFor(source, 'bvn', 'bvn_number', 'BVN');
+  const idLabel = nin ? 'NIN' : bvn ? 'BVN' : 'ID';
+  const idValue = nin || bvn;
   const photo = valueFor(source, 'photo', 'photo_base64', 'image', 'image_base64', 'passport', 'passport_photo');
   const photoSrc = photo ? (photo.startsWith('data:') ? photo : `data:image/jpeg;base64,${photo}`) : '';
   const initials = name.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase();
 
-  if (!nin && !firstName && !lastName) return null;
+  if (!idValue && !firstName && !lastName && !fullNameField) return null;
   return (
     <article className="mt-4 overflow-hidden rounded-2xl border border-blue-200 bg-white shadow-sm">
-      <div className="flex items-center justify-between bg-[#0b2f73] px-5 py-3 text-white"><span className="font-display font-bold">NIN Verification Slip</span><span className="rounded bg-gold-500 px-2 py-1 text-xs font-bold text-ink">VERIFIED</span></div>
+      <div className="flex items-center justify-between bg-[#0b2f73] px-5 py-3 text-white"><span className="font-display font-bold">{idLabel} Verification Slip</span><span className="rounded bg-gold-500 px-2 py-1 text-xs font-bold text-ink">VERIFIED</span></div>
       <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center">
         {photoSrc ? <img src={photoSrc} alt={name} className="h-24 w-24 rounded-xl border-2 border-gold-400 object-cover" /> : <div className="flex h-24 w-24 items-center justify-center rounded-xl bg-blue-100 font-display text-2xl font-bold text-[#0b2f73]">{initials}</div>}
-        <div className="min-w-0 flex-1"><h3 className="font-display text-xl font-bold text-[#0b2f73]">{name}</h3><p className="mt-1 font-mono text-sm font-semibold text-[#0b2f73]">NIN: {nin || '—'}</p><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-[#0b2f73]/80"><span>Gender: <b>{valueFor(source, 'gender') || '—'}</b></span><span>DOB: <b>{valueFor(source, 'date_of_birth', 'dob') || '—'}</b></span><span>Phone: <b>{valueFor(source, 'phone_number', 'phone') || '—'}</b></span><span className="truncate">Address: <b>{valueFor(source, 'address') || '—'}</b></span></div></div>
+        <div className="min-w-0 flex-1"><h3 className="font-display text-xl font-bold text-[#0b2f73]">{name}</h3><p className="mt-1 font-mono text-sm font-semibold text-[#0b2f73]">{idLabel}: {idValue || '—'}</p><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-[#0b2f73]/80"><span>Gender: <b>{valueFor(source, 'gender') || '—'}</b></span><span>DOB: <b>{valueFor(source, 'date_of_birth', 'dob') || '—'}</b></span><span>Phone: <b>{valueFor(source, 'phone_number', 'phone') || '—'}</b></span><span className="truncate">Address: <b>{valueFor(source, 'address') || '—'}</b></span></div></div>
       </div>
     </article>
   );
