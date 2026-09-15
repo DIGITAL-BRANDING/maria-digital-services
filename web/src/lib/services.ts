@@ -40,9 +40,30 @@ export type ServiceItem = {
 
 // Mirrors the service list in
 // major_data_link/lib/features/home/presentation/screens/services_screen.dart
-// — same order, same set — so a customer moving between the app and the
-// website sees one consistent menu.
+// — same set, mostly the same order — so a customer moving between the app
+// and the website sees one consistent menu. One deliberate exception: Buy
+// Data and Buy Airtime are pinned first here (business requirement — these
+// two are the highest-traffic, most-requested services, and the dashboard
+// only shows the first N tiles, see SERVICES.slice(...) in
+// DashboardPage.tsx). They already existed further down this list; moving
+// them, not duplicating them, so each still has exactly one entry/route.
 export const SERVICES: ServiceItem[] = [
+  {
+    label: 'Buy Data',
+    description: 'Get data bundles for MTN, Glo, Airtel or 9mobile, delivered instantly.',
+    icon: Wifi,
+    route: '/buy-data',
+    tint: 'gold',
+    implemented: true,
+  },
+  {
+    label: 'Buy Airtime',
+    description: 'Top up any Nigerian network in seconds.',
+    icon: Smartphone,
+    route: '/buy-airtime',
+    tint: 'bronze',
+    implemented: true,
+  },
   { label: 'NIN_Phone Verification', description: 'Verify NIN and phone details.', icon: IdCard, route: '/nin', tint: 'gold', implemented: true },
   { label: 'Phone Multiple', description: 'Check multiple phone numbers.', icon: Smartphone, route: '/phone', tint: 'bronze', implemented: true },
   { label: 'CAC Services', description: 'Business registration and lookup.', icon: Briefcase, route: '/cac', tint: 'success', implemented: true },
@@ -81,22 +102,6 @@ export const SERVICES: ServiceItem[] = [
   // silently redirected to "/" with zero explanation.
   { label: 'Slips History', description: 'Review your past verification slips.', icon: History, route: '/verifications', tint: 'bronze', implemented: true },
   { label: 'Wallet Summary', description: 'See a summary of your wallet activity.', icon: WalletCards, route: '/history', tint: 'success', implemented: true },
-  {
-    label: 'Buy Data',
-    description: 'Get data bundles for MTN, Glo, Airtel or 9mobile, delivered instantly.',
-    icon: Wifi,
-    route: '/buy-data',
-    tint: 'gold',
-    implemented: true,
-  },
-  {
-    label: 'Buy Airtime',
-    description: 'Top up any Nigerian network in seconds.',
-    icon: Smartphone,
-    route: '/buy-airtime',
-    tint: 'bronze',
-    implemented: true,
-  },
   {
     label: 'Airtime to Cash',
     description: 'Convert excess airtime back into your wallet balance.',

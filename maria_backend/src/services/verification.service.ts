@@ -8,8 +8,11 @@ import { recordProviderDebit } from './provider-ledger.service.js';
 import {
   techhubService,
   type TechhubBvnTier,
-  type TechhubSlipTier
+  type TechhubSlipTier,
+  type TechhubSlipResult
 } from './techhub.service.js';
+import { ktechService } from './ktech.service.js';
+import { activeIdentityVerificationProvider } from './pricing-settings.service.js';
 
 /**
  * Matches VerificationServiceX.key in the Flutter app's
@@ -218,7 +221,7 @@ async function purchaseSlip(params: {
   operational: Record<string, unknown>;
   pii: Record<string, unknown>;
   idempotencyKey?: string;
-  call: () => ReturnType<typeof techhubService.ninByNin>;
+  call: (reference: string) => Promise<TechhubSlipResult>;
 }): Promise<SlipPurchaseResult> {
   const price = await getVerificationPrice(params.service);
 
@@ -253,7 +256,7 @@ async function purchaseSlip(params: {
     };
   }
 
-  const provider = await params.call();
+  const provider = await params.call(debit.reference);
 
   if (provider.ok) {
     const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
@@ -331,34 +334,42 @@ const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> =
   standard: 'BVN_SLIP_STANDARD'
 };
 
-export function purchaseNinByNin(params: { userId: string; nin: string; tier: TechhubSlipTier; idempotencyKey?: string }) {
+export async function purchaseNinByNin(params: { userId: string; nin: string; tier: TechhubSlipTier; idempotencyKey?: string }) {
+  const provider = await activeIdentityVerificationProvider();
   return purchaseSlip({
     userId: params.userId,
     service: NIN_SLIP_SERVICE_BY_TIER[params.tier],
     transactionType: TransactionType.NIN_VERIFICATION,
     description: `NIN slip (${params.tier}) by NIN`,
-    operational: { mode: 'by_nin', tier: params.tier },
+    operational: { mode: 'by_nin', tier: params.tier, provider },
     pii: { nin: params.nin },
     idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.ninByNin(params.nin, params.tier)
+    call: (reference) =>
+      provider === 'ktech'
+        ? ktechService.ninByNin(params.nin, params.tier, reference)
+        : techhubService.ninByNin(params.nin, params.tier)
   });
 }
 
-export function purchaseNinByPhone(params: {
+export async function purchaseNinByPhone(params: {
   userId: string;
   phone: string;
   tier: Exclude<TechhubSlipTier, 'vnin'>;
   idempotencyKey?: string;
 }) {
+  const provider = await activeIdentityVerificationProvider();
   return purchaseSlip({
     userId: params.userId,
     service: NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier],
     transactionType: TransactionType.NIN_VERIFICATION,
     description: `NIN slip (${params.tier}) by Phone`,
-    operational: { mode: 'by_phone', tier: params.tier },
+    operational: { mode: 'by_phone', tier: params.tier, provider },
     pii: { phone: params.phone },
     idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.ninByPhone(params.phone, params.tier)
+    call: (reference) =>
+      provider === 'ktech'
+        ? ktechService.ninByPhone(params.phone, params.tier, reference)
+        : techhubService.ninByPhone(params.phone, params.tier)
   });
 }
 
@@ -370,6 +381,9 @@ export function purchaseNinByDemographic(params: {
   gender?: string;
   idempotencyKey?: string;
 }) {
+  // Always Techhub - K-Tech's demographic-lookup request body was never
+  // captured from the docs (see ktech.service.ts's doc comment), so
+  // switching this one isn't safe to do blind.
   return purchaseSlip({
     userId: params.userId,
     service: 'NIN_DEMOGRAPHIC',
@@ -393,16 +407,20 @@ export function purchaseNinByDemographic(params: {
   });
 }
 
-export function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string }) {
+export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string }) {
+  const provider = await activeIdentityVerificationProvider();
   return purchaseSlip({
     userId: params.userId,
     service: BVN_SLIP_SERVICE_BY_TIER[params.tier],
     transactionType: TransactionType.BVN_VERIFICATION,
     description: `BVN slip (${params.tier})`,
-    operational: { tier: params.tier },
+    operational: { tier: params.tier, provider },
     pii: { bvn: params.bvn },
     idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.bvnSlip(params.bvn, params.tier)
+    call: (reference) =>
+      provider === 'ktech'
+        ? ktechService.bvnSlip(params.bvn, params.tier, reference)
+        : techhubService.bvnSlip(params.bvn, params.tier)
   });
 }
 

@@ -69,6 +69,23 @@ const EnvSchema = z.object({
     .string()
     .default('false')
     .transform((value) => value.toLowerCase() !== 'false' && value !== '0'),
+
+  // K-Tech Solutions ("MAJOR DATA-LINK") — a second NIN/BVN identity
+  // verification provider, documented at
+  // https://k-tech.up.railway.app/partner-docs. Admin picks which of
+  // Techhub/K-Tech actually handles NIN-by-NIN, NIN-by-phone and BVN slip
+  // requests at /admin/bulk-pricing (PricingSettings.identityVerificationProvider,
+  // read fresh on every request - see ktech.service.ts). The base URL below
+  // is inferred from the docs host (same-origin /api/v1) since the docs
+  // page itself doesn't state a separate API host explicitly - confirm
+  // against the live dashboard/docs before relying on this in production.
+  KTECH_BASE_URL: z.string().url().default('https://k-tech.up.railway.app/api/v1'),
+  KTECH_API_KEY: z.string().optional(),
+  MOCK_KTECH: z
+    .string()
+    .default('false')
+    .transform((value) => value.toLowerCase() !== 'false' && value !== '0'),
+
   DATA_PLAN_MARKUP_PERCENT: z.coerce.number().min(0).default(0),
   DATA_PLAN_MARKUP_NAIRA: z.coerce.number().min(0).default(0),
   AUTH_TOKEN_SECRET: z.string().min(32).default('dev-only-insecure-auth-token-secret-32'),

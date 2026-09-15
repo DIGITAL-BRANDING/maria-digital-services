@@ -37,6 +37,7 @@ export async function updatePricingSettings(input: {
   dataPlanMarkupNaira?: number;
   dataAirtimeProvider?: 'alrahuz' | 'bilalsadasub';
   resultPinProvider?: 'alrahuz' | 'bilalsadasub';
+  identityVerificationProvider?: 'techhub' | 'ktech';
   cableMarkupPercent?: number;
   electricityMarkupPercent?: number;
 }) {
@@ -48,8 +49,21 @@ export async function updatePricingSettings(input: {
       ...(input.dataPlanMarkupNaira !== undefined ? { dataPlanMarkupNaira: input.dataPlanMarkupNaira } : {}),
       ...(input.dataAirtimeProvider !== undefined ? { dataAirtimeProvider: input.dataAirtimeProvider } : {}),
       ...(input.resultPinProvider !== undefined ? { resultPinProvider: input.resultPinProvider } : {}),
+      ...(input.identityVerificationProvider !== undefined ? { identityVerificationProvider: input.identityVerificationProvider } : {}),
       ...(input.cableMarkupPercent !== undefined ? { cableMarkupPercent: input.cableMarkupPercent } : {}),
       ...(input.electricityMarkupPercent !== undefined ? { electricityMarkupPercent: input.electricityMarkupPercent } : {})
     }
   });
+}
+
+/**
+ * Which upstream handles NIN-by-NIN, NIN-by-phone and BVN slip requests
+ * right now - 'techhub' (default) or 'ktech'. Read fresh on every call so
+ * an admin's switch at /admin/bulk-pricing takes effect immediately, same
+ * as activeDataAirtimeProvider() in vtu.routes.ts. Falls back to 'techhub'
+ * for any unrecognized DB value rather than throwing.
+ */
+export async function activeIdentityVerificationProvider(): Promise<'techhub' | 'ktech'> {
+  const settings = await getPricingSettings();
+  return settings.identityVerificationProvider === 'ktech' ? 'ktech' : 'techhub';
 }

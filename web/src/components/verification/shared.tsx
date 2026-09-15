@@ -279,8 +279,31 @@ function valueFor(data: Record<string, unknown>, ...keys: string[]) {
   return '';
 }
 
+// Techhub (and other providers) sometimes nest the *real* personal-details
+// object one level deeper - e.g. the top-level user_data payload itself
+// contains another `user_data` (or `data`/`details`) key holding the
+// actual name/phone/dob/address fields, with only a partial summary (name,
+// NIN, gender) at the top level. Left as-is, that nested object (a) hides
+// fields like phone/DOB/address from every lookup below, which only ever
+// looked at one level, and (b) got rendered as a literal "[object Object]"
+// row once it reached DetailsOverviewGrid, which just does String(value).
+// Flattening one level - merging any nested plain-object field's own keys
+// up, with the nested value winning over a same-named outer key since it's
+// typically the more complete payload - fixes both at once.
+function flattenIdentityFields(data: Record<string, unknown>): Record<string, unknown> {
+  const flat: Record<string, unknown> = { ...data };
+  for (const [key, value] of Object.entries(data)) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && !/pdf|base64/i.test(key)) {
+      delete flat[key];
+      Object.assign(flat, value as Record<string, unknown>);
+    }
+  }
+  return flat;
+}
+
 export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) {
-  const source = data.user_data && typeof data.user_data === 'object' && !Array.isArray(data.user_data) ? data.user_data as Record<string, unknown> : data;
+  const unwrapped = data.user_data && typeof data.user_data === 'object' && !Array.isArray(data.user_data) ? data.user_data as Record<string, unknown> : data;
+  const source = flattenIdentityFields(unwrapped);
   const firstName = valueFor(source, 'first_name', 'firstname', 'firstName');
   const lastName = valueFor(source, 'last_name', 'lastname', 'surname', 'lastName');
   const middleName = valueFor(source, 'middle_name', 'middlename', 'middleName');
@@ -293,6 +316,9 @@ export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) 
   const photo = valueFor(source, 'photo', 'photo_base64', 'image', 'image_base64', 'passport', 'passport_photo');
   const photoSrc = photo ? (photo.startsWith('data:') ? photo : `data:image/jpeg;base64,${photo}`) : '';
   const initials = name.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase();
+  const dob = valueFor(source, 'date_of_birth', 'dob', 'dateOfBirth', 'birth_date', 'birthdate');
+  const phone = valueFor(source, 'phone_number', 'phone', 'phoneNumber', 'mobile', 'msisdn', 'phone_no', 'telephone');
+  const address = valueFor(source, 'address', 'residential_address', 'home_address', 'res_address');
 
   if (!idValue && !firstName && !lastName && !fullNameField) return null;
   return (
@@ -300,7 +326,7 @@ export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) 
       <div className="flex items-center justify-between bg-[#0b2f73] px-5 py-3 text-white"><span className="font-display font-bold">{idLabel} Verification Slip</span><span className="rounded bg-gold-500 px-2 py-1 text-xs font-bold text-ink">VERIFIED</span></div>
       <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center">
         {photoSrc ? <img src={photoSrc} alt={name} className="h-24 w-24 rounded-xl border-2 border-gold-400 object-cover" /> : <div className="flex h-24 w-24 items-center justify-center rounded-xl bg-blue-100 font-display text-2xl font-bold text-[#0b2f73]">{initials}</div>}
-        <div className="min-w-0 flex-1"><h3 className="font-display text-xl font-bold text-[#0b2f73]">{name}</h3><p className="mt-1 font-mono text-sm font-semibold text-[#0b2f73]">{idLabel}: {idValue || '—'}</p><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-[#0b2f73]/80"><span>Gender: <b>{valueFor(source, 'gender') || '—'}</b></span><span>DOB: <b>{valueFor(source, 'date_of_birth', 'dob') || '—'}</b></span><span>Phone: <b>{valueFor(source, 'phone_number', 'phone') || '—'}</b></span><span className="truncate">Address: <b>{valueFor(source, 'address') || '—'}</b></span></div></div>
+        <div className="min-w-0 flex-1"><h3 className="font-display text-xl font-bold text-[#0b2f73]">{name}</h3><p className="mt-1 font-mono text-sm font-semibold text-[#0b2f73]">{idLabel}: {idValue || '—'}</p><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-[#0b2f73]/80"><span>Gender: <b>{valueFor(source, 'gender') || '—'}</b></span><span>DOB: <b>{dob || '—'}</b></span><span>Phone: <b>{phone || '—'}</b></span><span className="truncate">Address: <b>{address || '—'}</b></span></div></div>
       </div>
     </article>
   );
@@ -308,7 +334,13 @@ export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) 
 
 export function SlipResultView({ result, message, onDone }: { result: SlipResult; message: string; onDone: () => void }) {
   const { pdfBase64, pdfUrl } = extractPdfFields({ ...result.user_data, pdf_base64: result.pdf_base64, pdf_url: result.pdf_url });
-  const dataEntries = result.user_data ? Object.entries(result.user_data).filter(([key, v]) => v !== null && v !== undefined && !/pdf|base64/i.test(key)) : [];
+  // Flatten first (see flattenIdentityFields above) so a nested `user_data`
+  // sub-object shows up as its own individual rows below, instead of one
+  // unreadable "User Data: [object Object]" row.
+  const flattenedUserData = result.user_data ? flattenIdentityFields(result.user_data) : {};
+  const dataEntries = Object.entries(flattenedUserData).filter(
+    ([key, v]) => v !== null && v !== undefined && v !== '' && typeof v !== 'object' && !/pdf|base64/i.test(key)
+  );
 
   return (
     <div className="mt-6">
@@ -349,9 +381,13 @@ export function AsyncResultView({
   // provider that includes the slip inline would dump a giant unreadable
   // base64 blob as one of the "detail" rows instead of a proper file.
   const { pdfBase64, pdfUrl } = extractPdfFields(status?.response);
-  const responseEntries = status?.response
-    ? Object.entries(status.response).filter(([key, v]) => v !== null && v !== undefined && !['pdf_base64', 'pdf_url', 'slip_url'].includes(key))
-    : [];
+  // Same flatten-then-filter treatment as SlipResultView above, so a
+  // nested object in the raw provider response never renders as a bare
+  // "[object Object]" row here either.
+  const flattenedResponse = status?.response ? flattenIdentityFields(status.response) : {};
+  const responseEntries = Object.entries(flattenedResponse).filter(
+    ([key, v]) => v !== null && v !== undefined && v !== '' && typeof v !== 'object' && !['pdf_base64', 'pdf_url', 'slip_url'].includes(key) && !/pdf|base64/i.test(key)
+  );
 
   return (
     <div className="mt-6">

@@ -103,26 +103,28 @@ export function registerBulkPricingRoutes(router: Router) {
 
     const dataAirtimeProviderRaw = field(req, 'dataAirtimeProvider');
     const resultPinProviderRaw = field(req, 'resultPinProvider');
+    const identityVerificationProviderRaw = field(req, 'identityVerificationProvider');
     const cableMarkupPercent = parseNonNegativeNumber(field(req, 'cableMarkupPercent'));
     const electricityMarkupPercent = parseNonNegativeNumber(field(req, 'electricityMarkupPercent'));
 
     const dataAirtimeProvider = dataAirtimeProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
     const resultPinProvider = resultPinProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
+    const identityVerificationProvider = identityVerificationProviderRaw === 'ktech' ? 'ktech' : 'techhub';
 
     if (cableMarkupPercent === null || electricityMarkupPercent === null) {
       return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Cable and electricity markup % must both be valid numbers ≥ 0.'));
     }
 
     try {
-      await updatePricingSettings({ dataAirtimeProvider, resultPinProvider, cableMarkupPercent, electricityMarkupPercent });
+      await updatePricingSettings({ dataAirtimeProvider, resultPinProvider, identityVerificationProvider, cableMarkupPercent, electricityMarkupPercent });
       await logAdminAction({
         adminId: admin.id,
         action: 'UPDATE_PROVIDER_SWITCH',
         targetType: 'PricingSettings',
         targetId: 'default',
-        metadata: { dataAirtimeProvider, resultPinProvider, cableMarkupPercent, electricityMarkupPercent }
+        metadata: { dataAirtimeProvider, resultPinProvider, identityVerificationProvider, cableMarkupPercent, electricityMarkupPercent }
       });
-      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Providers updated - Data/Airtime: ${dataAirtimeProvider}, Result Pins: ${resultPinProvider}.`));
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Providers updated - Data/Airtime: ${dataAirtimeProvider}, Result Pins: ${resultPinProvider}, NIN/BVN Verification: ${identityVerificationProvider}.`));
     } catch (error) {
       console.error('[bulk-pricing] provider-switch update failed:', error);
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Something went wrong updating the provider switch. Check the server logs.'));
@@ -224,6 +226,7 @@ function renderPage(params: {
     dataPlanMarkupNaira: number;
     dataAirtimeProvider: string;
     resultPinProvider: string;
+    identityVerificationProvider: string;
     cableMarkupPercent: number;
     electricityMarkupPercent: number;
   };
@@ -312,6 +315,12 @@ function renderPage(params: {
         <option value="alrahuz" ${settings.resultPinProvider === 'alrahuz' ? 'selected' : ''}>Alrahuz</option>
         <option value="bilalsadasub" ${settings.resultPinProvider === 'bilalsadasub' ? 'selected' : ''}>BilalSadaSub</option>
       </select>
+      <label>NIN/BVN Verification provider</label>
+      <select name="identityVerificationProvider">
+        <option value="techhub" ${settings.identityVerificationProvider === 'techhub' ? 'selected' : ''}>Techhub</option>
+        <option value="ktech" ${settings.identityVerificationProvider === 'ktech' ? 'selected' : ''}>K-Tech Solutions</option>
+      </select>
+      <p class="hint">Covers NIN-by-NIN, NIN-by-Phone and BVN Slip only. Demographic lookup and the async services (Validation, Personalization, IPE Clearance, BVN Retrieval, Delinking) always use Techhub.</p>
       <div class="row">
         <div>
           <label>Cable TV markup %</label>

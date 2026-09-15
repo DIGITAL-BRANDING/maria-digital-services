@@ -170,7 +170,11 @@ export default function DashboardPage() {
       <div className="mt-8">
         <h2 className="font-display text-base font-semibold text-ink">Services</h2>
         <div className="mt-3 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-          {SERVICES.slice(0, 17).map((service) => (
+          {/* Buy Data and Buy Airtime are now SERVICES[0] and SERVICES[1] (see
+              lib/services.ts) - the +2 here keeps every tile that was
+              visible before this change still visible, just shifted down
+              by the two new ones pinned at the front. */}
+          {SERVICES.slice(0, 19).map((service) => (
             <ServiceTile key={service.route} {...service} />
           ))}
         </div>

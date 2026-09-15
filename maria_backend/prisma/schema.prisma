@@ -458,6 +458,13 @@ model PricingSettings {
   // bilalsadasub.service.ts regardless of these two settings.
   dataAirtimeProvider      String   @default("alrahuz")
   resultPinProvider        String   @default("alrahuz")
+  // Which upstream handles NIN-by-NIN, NIN-by-phone and BVN slip requests -
+  // 'techhub' or 'ktech'. Same admin-editable, read-fresh-every-request
+  // pattern as dataAirtimeProvider above. NIN-by-demographic and the async
+  // services (NIN Validation, Personalization, IPE Clearance, BVN
+  // Retrieval, Delinking) always go through Techhub regardless of this
+  // setting - see ktech.service.ts's doc comment for why.
+  identityVerificationProvider String @default("techhub")
   cableMarkupPercent       Float    @default(0)
   electricityMarkupPercent Float    @default(0)
   updatedAt                DateTime @updatedAt
