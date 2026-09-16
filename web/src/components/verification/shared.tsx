@@ -332,15 +332,23 @@ export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) 
   );
 }
 
+// A raw provider field is safe to show as a plain "label: value" detail row
+// only if it's short human-readable text. Anything else - a nested object
+// (handled separately by flattenIdentityFields), a pdf/base64 field, a
+// named photo/image/signature field, or ANY string that's simply too long
+// to be a real field value (the base64-photo-under-an-unrecognized-key
+// case that slipped through the named-key checks above) - gets dropped
+// here instead of dumped as an unreadable blob row.
+function isDisplayableDetailValue(key: string, value: unknown): value is string | number | boolean {
+  if (value === null || value === undefined || value === '') return false;
+  if (typeof value === 'object') return false;
+  if (/pdf|base64|photo|image|signature|passport/i.test(key)) return false;
+  if (typeof value === 'string' && value.length > 120) return false;
+  return true;
+}
+
 export function SlipResultView({ result, message, onDone }: { result: SlipResult; message: string; onDone: () => void }) {
   const { pdfBase64, pdfUrl } = extractPdfFields({ ...result.user_data, pdf_base64: result.pdf_base64, pdf_url: result.pdf_url });
-  // Flatten first (see flattenIdentityFields above) so a nested `user_data`
-  // sub-object shows up as its own individual rows below, instead of one
-  // unreadable "User Data: [object Object]" row.
-  const flattenedUserData = result.user_data ? flattenIdentityFields(result.user_data) : {};
-  const dataEntries = Object.entries(flattenedUserData).filter(
-    ([key, v]) => v !== null && v !== undefined && v !== '' && typeof v !== 'object' && !/pdf|base64/i.test(key)
-  );
 
   return (
     <div className="mt-6">
@@ -349,8 +357,14 @@ export function SlipResultView({ result, message, onDone }: { result: SlipResult
         <p className="font-body text-sm text-[#0b2f73]">{message}</p>
       </div>
 
+      {/* DigitalSlipPreview card is the whole preview now - it already shows
+          everything a user needs before downloading (name, NIN/BVN, gender,
+          DOB, phone, address, photo). The raw field-by-field dump that used
+          to follow it (DetailsOverviewGrid over every user_data key) was
+          both redundant with the card and, for providers whose photo field
+          is a raw base64 string rather than a nested object, rendered that
+          entire base64 blob as one unreadable "Photo: /9j/4AAQ..." row. */}
       {result.user_data && <DigitalSlipPreview data={result.user_data} />}
-      <DetailsOverviewGrid entries={dataEntries} />
       <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} />
 
       <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
@@ -386,7 +400,7 @@ export function AsyncResultView({
   // "[object Object]" row here either.
   const flattenedResponse = status?.response ? flattenIdentityFields(status.response) : {};
   const responseEntries = Object.entries(flattenedResponse).filter(
-    ([key, v]) => v !== null && v !== undefined && v !== '' && typeof v !== 'object' && !['pdf_base64', 'pdf_url', 'slip_url'].includes(key) && !/pdf|base64/i.test(key)
+    ([key, v]) => isDisplayableDetailValue(key, v) && !['pdf_base64', 'pdf_url', 'slip_url'].includes(key)
   );
 
   return (

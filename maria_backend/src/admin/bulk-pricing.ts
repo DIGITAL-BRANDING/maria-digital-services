@@ -107,7 +107,8 @@ export function registerBulkPricingRoutes(router: Router) {
     const cableMarkupPercent = parseNonNegativeNumber(field(req, 'cableMarkupPercent'));
     const electricityMarkupPercent = parseNonNegativeNumber(field(req, 'electricityMarkupPercent'));
 
-    const dataAirtimeProvider = dataAirtimeProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
+    const dataAirtimeProvider =
+      dataAirtimeProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : dataAirtimeProviderRaw === 'ktech' ? 'ktech' : 'alrahuz';
     const resultPinProvider = resultPinProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
     const identityVerificationProvider = identityVerificationProviderRaw === 'ktech' ? 'ktech' : 'techhub';
 
@@ -309,6 +310,7 @@ function renderPage(params: {
       <select name="dataAirtimeProvider">
         <option value="alrahuz" ${settings.dataAirtimeProvider === 'alrahuz' ? 'selected' : ''}>Alrahuz</option>
         <option value="bilalsadasub" ${settings.dataAirtimeProvider === 'bilalsadasub' ? 'selected' : ''}>BilalSadaSub</option>
+        <option value="ktech" ${settings.dataAirtimeProvider === 'ktech' ? 'selected' : ''}>K-Tech Solutions</option>
       </select>
       <label>Result Pin (WAEC/NECO/NABTEB) provider</label>
       <select name="resultPinProvider">

@@ -35,7 +35,7 @@ export async function getPricingSettings() {
 export async function updatePricingSettings(input: {
   dataPlanMarkupPercent?: number;
   dataPlanMarkupNaira?: number;
-  dataAirtimeProvider?: 'alrahuz' | 'bilalsadasub';
+  dataAirtimeProvider?: 'alrahuz' | 'bilalsadasub' | 'ktech';
   resultPinProvider?: 'alrahuz' | 'bilalsadasub';
   identityVerificationProvider?: 'techhub' | 'ktech';
   cableMarkupPercent?: number;

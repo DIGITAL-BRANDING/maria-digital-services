@@ -7,6 +7,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import { providerService, type ProviderPurchaseInput } from '../services/provider.service.js';
 import * as bilalsadasub from '../services/bilalsadasub.service.js';
+import * as ktech from '../services/ktech.service.js';
 import { getPricingSettings } from '../services/pricing-settings.service.js';
 import type { NormalizedProviderResponse } from '../services/provider-types.js';
 import { debitWallet, refundWallet } from '../services/wallet.service.js';
@@ -30,9 +31,11 @@ function idempotencyKeyFrom(req: Request) {
  * back to 'alrahuz' for any unrecognized value rather than throwing, so a
  * bad/blank DB value can never take purchasing down entirely.
  */
-async function activeDataAirtimeProvider(): Promise<'alrahuz' | 'bilalsadasub'> {
+async function activeDataAirtimeProvider(): Promise<'alrahuz' | 'bilalsadasub' | 'ktech'> {
   const settings = await getPricingSettings();
-  return settings.dataAirtimeProvider === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
+  if (settings.dataAirtimeProvider === 'bilalsadasub') return 'bilalsadasub';
+  if (settings.dataAirtimeProvider === 'ktech') return 'ktech';
+  return 'alrahuz';
 }
 
 /**
@@ -51,7 +54,7 @@ export async function processProviderPurchase(params: {
   description: string;
   metadata: Prisma.InputJsonValue;
   idempotencyKey?: string;
-  provider: 'alrahuz' | 'bilalsadasub';
+  provider: 'alrahuz' | 'bilalsadasub' | 'ktech';
   /**
    * Our best-known cost basis at debit time (e.g. plan.providerAmount for
    * data). Omit for purchase types with no config-based cost available up
@@ -176,9 +179,11 @@ export async function processProviderPurchase(params: {
 vtuRoutes.get('/data/plans/:network/categories', async (req, res) => {
   const provider = await activeDataAirtimeProvider();
   const categories =
-    provider === 'bilalsadasub'
-      ? await bilalsadasub.getDataPlanCategories(req.params.network)
-      : await providerService.getDataPlanCategories(req.params.network);
+    provider === 'ktech'
+      ? await ktech.getDataPlanCategories(req.params.network)
+      : provider === 'bilalsadasub'
+        ? await bilalsadasub.getDataPlanCategories(req.params.network)
+        : await providerService.getDataPlanCategories(req.params.network);
   res.json({ status: true, data: categories });
 });
 
@@ -186,9 +191,11 @@ vtuRoutes.get('/data/plans/:network', async (req, res) => {
   const category = typeof req.query.category === 'string' ? req.query.category : undefined;
   const provider = await activeDataAirtimeProvider();
   const plans =
-    provider === 'bilalsadasub'
-      ? await bilalsadasub.getDataPlans(req.params.network, category)
-      : await providerService.getDataPlans(req.params.network, category);
+    provider === 'ktech'
+      ? await ktech.getDataPlans(req.params.network, category)
+      : provider === 'bilalsadasub'
+        ? await bilalsadasub.getDataPlans(req.params.network, category)
+        : await providerService.getDataPlans(req.params.network, category);
   // Cheapest first, regardless of which provider/category this came from -
   // sorted here (not inside each provider service) so it's guaranteed
   // consistent no matter which one is active. Sorts on sellingAmount (what
@@ -210,9 +217,11 @@ vtuRoutes.post('/data/purchase', async (req, res) => {
 
   const provider = await activeDataAirtimeProvider();
   const plan =
-    provider === 'bilalsadasub'
-      ? await bilalsadasub.getDataPlan(body.network, body.plan_id)
-      : await providerService.getDataPlan(body.network, body.plan_id);
+    provider === 'ktech'
+      ? await ktech.getDataPlan(body.network, body.plan_id)
+      : provider === 'bilalsadasub'
+        ? await bilalsadasub.getDataPlan(body.network, body.plan_id)
+        : await providerService.getDataPlan(body.network, body.plan_id);
 
   // Never persist the PIN - `body` is spread into Transaction.metadata below,
   // so it's stripped out explicitly rather than trusting every future edit
@@ -232,15 +241,17 @@ vtuRoutes.post('/data/purchase', async (req, res) => {
     // actual reported balance delta on success, see processProviderPurchase above.
     costKobo: BigInt(Math.round(plan.providerAmount * 100)),
     callProvider: (reference) =>
-      provider === 'bilalsadasub'
-        ? bilalsadasub.buyData({ network: body.network, planId: body.plan_id, phone: body.phone, reference })
-        : providerService.buyData({
-            network: body.network,
-            planId: body.plan_id,
-            phone: body.phone,
-            amount: plan.amount,
-            reference
-          } satisfies ProviderPurchaseInput)
+      provider === 'ktech'
+        ? ktech.buyData({ network: body.network, planId: body.plan_id, phone: body.phone, reference })
+        : provider === 'bilalsadasub'
+          ? bilalsadasub.buyData({ network: body.network, planId: body.plan_id, phone: body.phone, reference })
+          : providerService.buyData({
+              network: body.network,
+              planId: body.plan_id,
+              phone: body.phone,
+              amount: plan.amount,
+              reference
+            } satisfies ProviderPurchaseInput)
   });
 
   res.json({
@@ -279,14 +290,16 @@ vtuRoutes.post('/airtime/purchase', async (req, res) => {
     idempotencyKey: idempotencyKeyFrom(req),
     provider,
     callProvider: (reference) =>
-      provider === 'bilalsadasub'
-        ? bilalsadasub.buyAirtime({ network: body.network, phone: body.phone, amount: body.amount, reference })
-        : providerService.buyAirtime({
-            network: body.network,
-            phone: body.phone,
-            amount: body.amount,
-            reference
-          } satisfies ProviderPurchaseInput)
+      provider === 'ktech'
+        ? ktech.buyAirtime({ network: body.network, phone: body.phone, amount: body.amount, reference })
+        : provider === 'bilalsadasub'
+          ? bilalsadasub.buyAirtime({ network: body.network, phone: body.phone, amount: body.amount, reference })
+          : providerService.buyAirtime({
+              network: body.network,
+              phone: body.phone,
+              amount: body.amount,
+              reference
+            } satisfies ProviderPurchaseInput)
   });
 
   res.json({
