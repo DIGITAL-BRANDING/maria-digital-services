@@ -1,11 +1,33 @@
 import { env } from '../config/env.js';
 import { ApiError } from '../middleware/error.js';
+import { prisma } from '../lib/prisma.js';
 import type { TechhubSlipResult, TechhubSlipTier, TechhubBvnTier } from './techhub.service.js';
 import type { NormalizedProviderResponse } from './provider-types.js';
 import type { DataPlan } from './data-plans.data.js';
 import { dataPlanPricingService } from './data-plan-pricing.service.js';
 
 const PROVIDER = 'ktech';
+
+/**
+ * Mirrors ProviderBalanceStatus.upsert in bilalsadasub.service.ts - keeps
+ * the admin's "Provider Ledger" page (ProviderBalanceStatus, surfaced via
+ * getProviderLedgerSummaries() in provider-ledger.service.ts) showing a
+ * live K-Tech balance next to Alrahuz/BilalSadaSub/Techhub's, instead of
+ * "— not checked yet" forever. Called both after every successful slip/data/
+ * airtime purchase (K-Tech's own `balance_after` in the response, when
+ * present) and on-demand from the admin "Refresh live balance" button (see
+ * refreshWalletBalance() below).
+ */
+async function recordKtechBalance(rawBalance: unknown) {
+  const balance =
+    typeof rawBalance === 'number' ? rawBalance : typeof rawBalance === 'string' ? Number(rawBalance) : undefined;
+  if (balance === undefined || !Number.isFinite(balance)) return null;
+  return prisma.providerBalanceStatus.upsert({
+    where: { provider: PROVIDER },
+    create: { provider: PROVIDER, lastKnownBalance: balance },
+    update: { lastKnownBalance: balance }
+  });
+}
 
 /**
  * K-Tech Solutions ("MAJOR DATA-LINK") — a second NIN/BVN identity
@@ -123,6 +145,12 @@ export class KtechService {
         message: data.message ?? `Verification provider returned HTTP ${response.status}`,
         raw: data
       };
+    }
+
+    if (typeof data.data?.balance_after === 'number') {
+      void recordKtechBalance(data.data.balance_after).catch((error) =>
+        console.error('[ktech-balance] failed to record post-slip balance:', error)
+      );
     }
 
     return {
@@ -313,4 +341,61 @@ export async function buyAirtime(input: { network: string; phone: string; amount
     idempotencyKey: input.reference
   });
   return normalizePurchase(body);
+}
+
+// ---- Wallet & Funding ----
+//
+// Backs the "K-Tech Solutions — Wallet" section on the admin Provider
+// Ledger page (see admin/provider-ledger.ts). Per the docs: "Every purchase
+// debits your partner wallet directly - fund it via a permanent virtual
+// account or a one-off Exact Transfer."
+//
+// CONFIDENCE NOTE: GET /wallet/balance was a documented endpoint (seen as a
+// bare "GET /wallet/balance" entry), but its response body was never
+// captured, so getWalletBalance() below guesses the balance lives at
+// `data.balance` (a number or numeric string) - the same shape convention
+// every other confirmed K-Tech response uses for numeric wallet figures
+// (`data.balance_after` on a slip purchase). POST /wallet/funding-account
+// and POST /wallet/fund/dynamic were seen only as bare endpoint entries too
+// - no parameter table or response example at all - so their exact request
+// body (especially fund/dynamic's amount field name) and response field
+// names (account_number/bank_name/etc.) are unconfirmed guesses. Because of
+// that, requestFundingInstructions() below returns the ENTIRE raw `data`
+// object rather than picking out named fields, and the admin page renders
+// whatever comes back generically (label: value rows) - so even if the
+// guessed field names are wrong, nothing returned by K-Tech is hidden from
+// the admin acting on it. Confirm against the live docs before depending on
+// specific field names here.
+
+export async function getWalletBalance(): Promise<{ balance: number | null; raw: unknown }> {
+  const body = await ktechRequest('GET', '/wallet/balance');
+  const data = (body.data ?? {}) as Record<string, unknown>;
+  const rawBalance = data.balance ?? data.wallet_balance;
+  const balance = typeof rawBalance === 'number' ? rawBalance : typeof rawBalance === 'string' ? Number(rawBalance) : undefined;
+  return { balance: balance !== undefined && Number.isFinite(balance) ? balance : null, raw: body };
+}
+
+/** GET /wallet/balance, then persists the result to ProviderBalanceStatus
+ *  (see recordKtechBalance above) so the admin ledger page reflects it
+ *  immediately - used by the "Refresh live balance" button. */
+export async function refreshWalletBalance() {
+  const { balance, raw } = await getWalletBalance();
+  if (balance !== null) await recordKtechBalance(balance);
+  return { balance, raw };
+}
+
+/** POST /wallet/funding-account - a reusable, permanent virtual account
+ *  number the admin can transfer into at any time to top up the K-Tech
+ *  wallet. Returns K-Tech's raw `data` object (see CONFIDENCE NOTE above). */
+export async function createFundingAccount(idempotencyKey: string): Promise<Record<string, unknown>> {
+  const body = await ktechRequest('POST', '/wallet/funding-account', { body: {}, idempotencyKey });
+  return (body.data ?? { message: body.message, status: body.status }) as Record<string, unknown>;
+}
+
+/** POST /wallet/fund/dynamic - a one-off "Exact Transfer" (an amount +
+ *  account number good for a single payment) for a specific top-up amount.
+ *  Returns K-Tech's raw `data` object (see CONFIDENCE NOTE above). */
+export async function requestDynamicFunding(amount: number, idempotencyKey: string): Promise<Record<string, unknown>> {
+  const body = await ktechRequest('POST', '/wallet/fund/dynamic', { body: { amount }, idempotencyKey });
+  return (body.data ?? { message: body.message, status: body.status }) as Record<string, unknown>;
 }
