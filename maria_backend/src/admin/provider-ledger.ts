@@ -321,6 +321,9 @@ function renderPage(params: {
   form.action-form input, form.action-form select, form.action-form textarea { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; font-family: inherit; }
   form.action-form button { background: var(--gold); color: #1A1508; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; margin-top: 4px; }
   form.action-form button:hover { background: var(--gold-dark); color: #fff; }
+  .button-link { background: var(--gold); color: #1A1508; padding: 10px 16px; border-radius: 8px; font-weight: 700; font-size: 13px; text-align: center; text-decoration: none; }
+  .button-link:hover { background: var(--gold-dark); color: #fff; }
+  .wallet-links { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 16px; }
   .filter-bar { margin-bottom: 12px; display: flex; align-items: center; gap: 10px; font-size: 13px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); padding: 8px 10px; border-bottom: 2px solid var(--border); }
@@ -348,6 +351,31 @@ function renderPage(params: {
 
   <div class="provider-cards">
     ${summaryCards || '<p style="color:var(--muted)">No provider ledger activity yet.</p>'}
+  </div>
+
+  <div class="card">
+    <h2>K-Tech Solutions — Wallet</h2>
+    <p class="hint">Live balance and funding actions call K-Tech's API directly. Funding gives you bank transfer instructions to complete yourself - it doesn't move money automatically.</p>
+    <div class="wallet-links">
+      <a class="button-link" href="https://k-tech.up.railway.app" target="_blank" rel="noopener noreferrer">Visit API Dashboard</a>
+      <a class="button-link" href="/admin">Return to Admin Dashboard</a>
+    </div>
+    <div class="forms" style="margin-bottom:0;">
+      <form class="action-form" method="POST" action="/admin/provider-ledger/ktech/refresh-balance">
+        <p class="hint" style="margin:0 0 4px;">Pulls K-Tech's current balance (GET /wallet/balance) and updates the card above.</p>
+        <button type="submit">Refresh live balance</button>
+      </form>
+      <form class="action-form" method="POST" action="/admin/provider-ledger/ktech/fund">
+        <label>Funding method
+          <select name="method" required>
+            <option value="permanent">Permanent funding account (reusable)</option>
+            <option value="dynamic">One-off Exact Transfer (fixed amount)</option>
+          </select>
+        </label>
+        <label>Amount (₦) — only used for "One-off Exact Transfer"<input type="number" name="amount" min="1" step="0.01"></label>
+        <button type="submit">Get funding instructions</button>
+      </form>
+    </div>
   </div>
 
   <div class="forms">
@@ -387,27 +415,6 @@ function renderPage(params: {
         <label>Amount (₦)<input type="number" name="amount" min="1" step="0.01" required></label>
         <label>Note (required)<textarea name="note" rows="2" required placeholder="Explain why this adjustment is needed"></textarea></label>
         <button type="submit">Record adjustment</button>
-      </form>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>K-Tech Solutions — Wallet</h2>
-    <p class="hint">Live balance and funding actions call K-Tech's API directly (see docs at k-tech.up.railway.app/partner-docs). Funding gives you bank transfer instructions to complete yourself - it doesn't move money automatically.</p>
-    <div class="forms" style="margin-bottom:0;">
-      <form class="action-form" method="POST" action="/admin/provider-ledger/ktech/refresh-balance">
-        <p class="hint" style="margin:0 0 4px;">Pulls K-Tech's current balance (GET /wallet/balance) and updates the card above.</p>
-        <button type="submit">Refresh live balance</button>
-      </form>
-      <form class="action-form" method="POST" action="/admin/provider-ledger/ktech/fund">
-        <label>Funding method
-          <select name="method" required>
-            <option value="permanent">Permanent funding account (reusable)</option>
-            <option value="dynamic">One-off Exact Transfer (fixed amount)</option>
-          </select>
-        </label>
-        <label>Amount (₦) — only used for "One-off Exact Transfer"<input type="number" name="amount" min="1" step="0.01"></label>
-        <button type="submit">Get funding instructions</button>
       </form>
     </div>
   </div>
