@@ -4,15 +4,16 @@ import { prisma } from '../../lib/prisma.js';
 
 /**
  * Read-only view of YOUR balance at each provider — Alrahuz (VTU),
- * BilalSadaSub (VTU), and Techhub (NIN/BVN verification), distinguished by
- * the `provider` column.
+ * BilalSadaSub (VTU), K-Tech Solutions (VTU/identity verification), and
+ * Techhub (NIN/BVN verification), distinguished by the `provider` column.
  * See ProviderBalanceStatus in schema.prisma, and recordProviderBalance in
  * provider.service.ts (Alrahuz) / techhub.service.ts (Techhub). Not
  * editable here because it's just a mirror of what each provider itself
  * reports; the only way to actually change it is to fund that provider
  * account directly. A provider's row only appears after its first
  * balance-reporting API call since deploy — BilalSadaSub reports it at
- * authentication/refresh, while Techhub only reports balance
+ * authentication/refresh, K-Tech when the admin uses "Refresh live balance"
+ * on Provider Ledger, while Techhub only reports balance
  * on the five async services (Delinking/NIN Validation/Personalization/BVN
  * Retrieval/IPE Clearance), not on slip lookups.
  */
@@ -31,7 +32,7 @@ export const providerBalanceResource: ResourceWithOptions = {
     properties: {
       lastKnownBalance: {
         description:
-          'Your last known balance at this provider — updates after Alrahuz purchases, BilalSadaSub authentication/refresh, or Techhub async-service calls.'
+          'Your last known balance at this provider — updates after Alrahuz purchases, BilalSadaSub authentication/refresh, K-Tech live-balance refreshes, or Techhub async-service calls.'
       }
     }
   }

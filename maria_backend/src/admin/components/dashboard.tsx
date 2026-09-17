@@ -97,9 +97,15 @@ const quickLinks: QuickLink[] = [
   },
   {
     label: 'Provider Ledger',
-    description: 'Our balance at Alrahuz/Techhub, settlements & adjustments',
+    description: 'Our balance at Alrahuz, BilalSadaSub, K-Tech & Techhub',
     href: `${ADMIN_ROOT_PATH}/provider-ledger`,
     icon: 'Repeat'
+  },
+  {
+    label: 'K-Tech Solutions Wallet',
+    description: 'Check live balance or get K-Tech funding instructions',
+    href: `${ADMIN_ROOT_PATH}/provider-ledger?provider=ktech`,
+    icon: 'CreditCard'
   },
   {
     label: 'Provider Reconciliation',
@@ -128,7 +134,7 @@ const quickLinks: QuickLink[] = [
   { label: 'Coupons', description: 'Discount codes & promotions', resourceId: 'Coupon', icon: 'CreditCard' },
   {
     label: 'Provider Balance',
-    description: 'Alrahuz, BilalSadaSub & Techhub provider wallet status',
+    description: 'Alrahuz, BilalSadaSub, K-Tech & Techhub wallet status',
     resourceId: 'ProviderBalanceStatus',
     icon: 'AlertTriangle'
   },
