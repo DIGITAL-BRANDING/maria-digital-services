@@ -198,7 +198,8 @@ export type SlipPurchaseResult = {
 
 /**
  * Shared by all four slip flows (NIN-by-NIN, NIN-by-Phone, NIN-by-Demographic,
- * BVN Slip): debit first, call Techhub, refund on failure. Exactly the same
+ * BVN Slip): debit first, call the selected identity provider, refund on
+ * failure. Exactly the same
  * shape as result-pin.service.ts's purchaseResultPin() - see that function's
  * comments for why the idempotent-replay branch reads back from the
  * transaction's own metadata instead of re-calling the provider.
@@ -216,6 +217,9 @@ export type SlipPurchaseResult = {
 async function purchaseSlip(params: {
   userId: string;
   service: VerificationServiceKey;
+  // This value must match the upstream that receives the request. It is
+  // persisted on both the customer transaction and provider ledger entry.
+  provider: 'techhub' | 'ktech';
   transactionType: typeof TransactionType.NIN_VERIFICATION | typeof TransactionType.BVN_VERIFICATION;
   description: string;
   operational: Record<string, unknown>;
@@ -264,7 +268,7 @@ async function purchaseSlip(params: {
       where: { id: debit.transaction.id },
       data: {
         status: TransactionStatus.SUCCESS,
-        provider: 'techhub',
+        provider: params.provider,
         metadata: {
           service: params.service,
           ...params.operational,
@@ -283,7 +287,7 @@ async function purchaseSlip(params: {
     // price.providerCostKobo above - no balance-delta correction available
     // or needed (unlike Alrahuz data/airtime).
     await recordProviderDebit({
-      provider: 'techhub',
+      provider: params.provider,
       amountKobo: price.providerCostKobo,
       relatedTransactionId: debit.transaction.id,
       description: params.description
@@ -304,7 +308,7 @@ async function purchaseSlip(params: {
 
   await prisma.transaction.update({
     where: { id: debit.transaction.id },
-    data: { status: TransactionStatus.FAILED, provider: 'techhub' }
+    data: { status: TransactionStatus.FAILED, provider: params.provider }
   });
   const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
 
@@ -339,6 +343,7 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
   return purchaseSlip({
     userId: params.userId,
     service: NIN_SLIP_SERVICE_BY_TIER[params.tier],
+    provider,
     transactionType: TransactionType.NIN_VERIFICATION,
     description: `NIN slip (${params.tier}) by NIN`,
     operational: { mode: 'by_nin', tier: params.tier, provider },
@@ -361,6 +366,7 @@ export async function purchaseNinByPhone(params: {
   return purchaseSlip({
     userId: params.userId,
     service: NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier],
+    provider,
     transactionType: TransactionType.NIN_VERIFICATION,
     description: `NIN slip (${params.tier}) by Phone`,
     operational: { mode: 'by_phone', tier: params.tier, provider },
@@ -387,6 +393,7 @@ export function purchaseNinByDemographic(params: {
   return purchaseSlip({
     userId: params.userId,
     service: 'NIN_DEMOGRAPHIC',
+    provider: 'techhub',
     transactionType: TransactionType.NIN_VERIFICATION,
     description: 'NIN slip by demographic details',
     operational: { mode: 'by_demographic' },
@@ -412,6 +419,7 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
   return purchaseSlip({
     userId: params.userId,
     service: BVN_SLIP_SERVICE_BY_TIER[params.tier],
+    provider,
     transactionType: TransactionType.BVN_VERIFICATION,
     description: `BVN slip (${params.tier})`,
     operational: { tier: params.tier, provider },
