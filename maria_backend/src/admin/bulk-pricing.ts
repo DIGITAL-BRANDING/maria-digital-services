@@ -335,7 +335,7 @@ function renderPage(params: {
         <option value="techhub" ${settings.identityVerificationProvider === 'techhub' ? 'selected' : ''}>Techhub</option>
         <option value="ktech" ${settings.identityVerificationProvider === 'ktech' ? 'selected' : ''}>K-Tech Solutions</option>
       </select>
-      <p class="hint">Covers NIN-by-NIN, NIN-by-Phone and BVN Slip only. Demographic lookup and the async services (Validation, Personalization, IPE Clearance, BVN Retrieval, Delinking) always use Techhub.</p>
+      <p class="hint">Covers NIN-by-NIN, NIN-by-Phone, BVN Slip, NIN Validation, Personalization, and IPE Clearance. Demographic lookup, BVN Retrieval, and Delinking always use Techhub.</p>
       <div class="row">
         <div>
           <label>Cable TV markup %</label>

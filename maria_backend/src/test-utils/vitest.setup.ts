@@ -8,6 +8,6 @@
  * PII_ENCRYPTION_KEY is set to a valid (if obviously fake) 64-hex-char key so
  * src/lib/pii-encryption.ts tests don't need a real one either.
  */
-process.env.DATABASE_URL ??= 'mysql://test:test@localhost:3306/test_db';
+process.env.DATABASE_URL ??= 'postgresql://test:test@localhost:5432/test_db?sslmode=require';
 process.env.PII_ENCRYPTION_KEY ??= 'a'.repeat(64);
 process.env.NODE_ENV ??= 'test';

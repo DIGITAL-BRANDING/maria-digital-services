@@ -1,7 +1,13 @@
 import { env } from '../config/env.js';
 import { ApiError } from '../middleware/error.js';
 import { prisma } from '../lib/prisma.js';
-import type { TechhubSlipResult, TechhubSlipTier, TechhubBvnTier } from './techhub.service.js';
+import type {
+  TechhubAsyncStatusResult,
+  TechhubAsyncSubmitResult,
+  TechhubSlipResult,
+  TechhubSlipTier,
+  TechhubBvnTier
+} from './techhub.service.js';
 import type { NormalizedProviderResponse } from './provider-types.js';
 import type { DataPlan } from './data-plans.data.js';
 import { dataPlanPricingService } from './data-plan-pricing.service.js';
@@ -55,11 +61,10 @@ async function recordKtechBalance(rawBalance: unknown) {
  * wasn't visible in what was captured, so `bvn`+`tier` below is inferred
  * from the same pattern every other tiered endpoint here uses - confirm
  * against the live docs (Authentication tab expanded, "BVN Slips" section)
- * before relying on it in production. NIN-by-demographic and the async
- * services (NIN Validation, Personalization, IPE Clearance) are NOT
- * implemented here at all - their request bodies were never captured, so
- * regardless of which provider is selected, those five continue to run
- * through Techhub only (see verification.service.ts).
+ * before relying on it in production. NIN-by-demographic, BVN Retrieval,
+ * and Delinking continue to use Techhub because their K-Tech request bodies
+ * were not captured. The documented NIN Validation, Personalization, and
+ * IPE Clearance endpoints are implemented below.
  *
  * Also unconfirmed: the docs page never states its API host explicitly
  * (only relative paths like "/api/v1/data/purchase"). KTECH_BASE_URL
@@ -107,6 +112,36 @@ export class KtechService {
 
   async bvnSlip(bvn: string, tier: TechhubBvnTier, idempotencyKey: string) {
     return this.postSlip('/verification/bvn/slip', { bvn, tier }, idempotencyKey);
+  }
+
+  // K-Tech's async NIN endpoints accept a request and return a ticket_id.
+  // Poll the matching endpoint with that ticket until it resolves.
+  async submitNinValidation(nin: string, validationType: string | undefined, idempotencyKey: string) {
+    return this.postAsync(
+      '/verification/nin/validation',
+      { nin, ...(validationType ? { validation_type: validationType } : {}) },
+      idempotencyKey
+    );
+  }
+
+  async checkNinValidation(ticketId: string) {
+    return this.getAsync('/verification/nin/validation', ticketId);
+  }
+
+  async submitPersonalization(trackingId: string, idempotencyKey: string) {
+    return this.postAsync('/verification/nin/personalization', { tracking_id: trackingId }, idempotencyKey);
+  }
+
+  async checkPersonalization(ticketId: string) {
+    return this.getAsync('/verification/nin/personalization', ticketId);
+  }
+
+  async submitIpeClearance(trackingId: string, idempotencyKey: string) {
+    return this.postAsync('/verification/nin/ipe-clearance', { tracking_id: trackingId }, idempotencyKey);
+  }
+
+  async checkIpeClearance(ticketId: string) {
+    return this.getAsync('/verification/nin/ipe-clearance', ticketId);
   }
 
   private async postSlip(path: string, body: Record<string, unknown>, idempotencyKey: string): Promise<TechhubSlipResult> {
@@ -166,6 +201,86 @@ export class KtechService {
       userData: data.data?.user_data,
       pdfBase64: data.data?.pdf_base64,
       pdfUrl: data.data?.pdf_url,
+      raw: data
+    };
+  }
+
+  private async postAsync(
+    path: string,
+    body: Record<string, unknown>,
+    idempotencyKey: string
+  ): Promise<TechhubAsyncSubmitResult> {
+    if (env.MOCK_KTECH) {
+      return { ok: true, ticketId: `MOCK-KTECH-${Date.now()}`, message: 'Request submitted successfully (mock)', raw: { mock: true } };
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl()}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': this.apiKey(),
+          'Idempotency-Key': idempotencyKey
+        },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      console.error(`[ktech] network error calling ${path}:`, error);
+      return { ok: false, message: 'Could not reach the verification provider - please try again shortly', raw: null };
+    }
+
+    const data = (await response.json().catch(() => ({}))) as KtechResponse;
+    if (typeof data.data?.balance_after === 'number') {
+      void recordKtechBalance(data.data.balance_after).catch((error) =>
+        console.error('[ktech-balance] failed to record post-submit balance:', error)
+      );
+    }
+
+    const ticketId = typeof data.data?.ticket_id === 'string' ? data.data.ticket_id : undefined;
+    if (!response.ok || data.status !== true || !ticketId) {
+      console.error(`[ktech] async submit failed (path=${path}, http=${response.status}):`, JSON.stringify(data));
+      return { ok: false, message: data.message ?? `Verification provider returned HTTP ${response.status}`, raw: data };
+    }
+
+    return { ok: true, ticketId, message: data.message ?? 'Request submitted successfully', raw: data };
+  }
+
+  private async getAsync(path: string, ticketId: string): Promise<TechhubAsyncStatusResult> {
+    if (env.MOCK_KTECH) {
+      return { ticketId, status: 'success', response: { note: 'Auto-approved - MOCK_KTECH is on' }, raw: { mock: true } };
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl()}${path}/${encodeURIComponent(ticketId)}`, {
+        headers: { 'X-API-Key': this.apiKey() }
+      });
+    } catch (error) {
+      console.error(`[ktech] network error checking ${path} (ticket=${ticketId}):`, error);
+      throw new ApiError(502, 'Could not reach the verification provider - please try again shortly', 'KTECH_STATUS_UNAVAILABLE');
+    }
+
+    const data = (await response.json().catch(() => ({}))) as KtechResponse;
+    const payload = (data.data ?? {}) as Record<string, unknown>;
+    const rawStatus = typeof payload.status === 'string' ? payload.status.toLowerCase() : '';
+    if (!response.ok || data.status !== true || !rawStatus) {
+      console.error(`[ktech] async status check failed (path=${path}, http=${response.status}):`, JSON.stringify(data));
+      throw new ApiError(response.status >= 400 ? response.status : 502, data.message ?? 'Could not check request status', 'KTECH_STATUS_FAILED');
+    }
+
+    const status = rawStatus === 'success' || rawStatus === 'successful'
+      ? 'success'
+      : rawStatus === 'pending' || rawStatus === 'processing'
+        ? 'pending'
+        : 'failed';
+    const responseData = payload.response;
+    return {
+      ticketId: typeof payload.ticket_id === 'string' ? payload.ticket_id : ticketId,
+      status,
+      response: responseData !== null && typeof responseData === 'object' && !Array.isArray(responseData)
+        ? responseData as Record<string, unknown>
+        : null,
       raw: data
     };
   }

@@ -5,9 +5,9 @@ const EnvSchema = z.object({
   NODE_ENV: z.string().default('development'),
   WEB_ALLOWED_ORIGINS: z.string().default(''),
   PORT: z.coerce.number().default(8787),
-  DATABASE_URL: z.string().url('DATABASE_URL must be a valid MySQL URL').refine(
-    (value) => value.startsWith('mysql://'),
-    'DATABASE_URL must use the mysql:// scheme'
+  DATABASE_URL: z.string().url('DATABASE_URL must be a valid PostgreSQL URL').refine(
+    (value) => value.startsWith('postgresql://') || value.startsWith('postgres://'),
+    'DATABASE_URL must use the postgresql:// or postgres:// scheme'
   ),
   FIREBASE_SERVICE_ACCOUNT_BASE64: z.string().optional(),
   ALRAHUZ_BASE_URL: z.string().url().default('https://alrahuzdata.com.ng/api'),

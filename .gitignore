@@ -19,6 +19,8 @@
 # Generated / local artifacts
 **/*.log
 **/*.zip
+**/*-mysql-backup.sql
+**/*-postgres-backup.sql
 **/*.apk
 **/*.aab
 **/*.jks

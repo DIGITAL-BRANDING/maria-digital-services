@@ -88,18 +88,12 @@ export type PendingReconciliationRow = Prisma.TransactionGetPayload<{
 export async function listPendingReconciliations(): Promise<PendingReconciliationRow[]> {
   // `metadata.reconciliation` is only ever set by flagPendingReconciliation()
   // above, so this JSON-path filter is exactly "has been flagged" - across
-  // any provider. This is the first place in the codebase filtering a JSON
-  // column by path on Postgres; the syntax is correct for Prisma 5.x, but
-  // since `prisma generate` couldn't run in the sandbox this was built in,
-  // it's only been checked against Prisma's docs, not a live database -
-  // worth confirming this returns the expected rows on first real use.
+  // any provider. PostgreSQL uses a string-array JSON path, unlike the MySQL
+  // string path used before the Supabase migration.
   return prisma.transaction.findMany({
     where: {
       status: TransactionStatus.PENDING,
-      // MySQL JSON paths are strings (unlike PostgreSQL, which accepts a
-      // string-array path).  Using the MySQL form also keeps Prisma's
-      // `include: { user: ... }` overload selected correctly.
-      metadata: { path: '$.reconciliation', not: Prisma.JsonNull }
+      metadata: { path: ['reconciliation'], not: Prisma.JsonNull }
     },
     orderBy: { createdAt: 'asc' },
     include: { user: { select: { id: true, fullName: true, email: true, phone: true } } }

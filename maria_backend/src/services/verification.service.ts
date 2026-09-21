@@ -439,12 +439,13 @@ export type AsyncStatusResult = { ticketId: string; status: 'pending' | 'success
 
 /**
  * Shared by all five async flows. Debits immediately (the wallet charge
- * happens at submit time, same as Techhub's own docs describe for THEIR
- * balance), submits to Techhub, and refunds right away if Techhub rejects
- * the submission outright. If Techhub accepts it, the transaction stays
- * PENDING with providerRef = Techhub's ticket_id - the eventual
+ * happens at submit time, same as the upstream provider's own docs
+ * describe for its balance), submits to the selected provider, and refunds
+ * right away if that provider rejects the submission outright. If accepted,
+ * the transaction stays PENDING with providerRef = the provider's ticket_id;
+ * the eventual
  * success/failure (and any refund for a failure) only happens later, when
- * checkAsyncServiceStatus() below is polled and Techhub reports an outcome.
+ * checkAsyncServiceStatus() below is polled and the provider reports an outcome.
  *
  * Same PII split as purchaseSlip() above: `operational` metadata (service,
  * ticket_id) stays plaintext; `pii` (nin/email/tracking_id/names/phone, plus
@@ -457,7 +458,8 @@ async function submitAsyncService(params: {
   operational: Record<string, unknown>;
   pii: Record<string, unknown>;
   idempotencyKey?: string;
-  call: () => ReturnType<typeof techhubService.submitDelinking>;
+  provider: 'techhub' | 'ktech';
+  call: (reference: string) => ReturnType<typeof techhubService.submitDelinking>;
 }): Promise<AsyncSubmitResult> {
   const price = await getVerificationPrice(params.service);
 
@@ -486,22 +488,22 @@ async function submitAsyncService(params: {
     // already refunded) - fall through and retry the submission below.
   }
 
-  const result = await params.call();
+  const result = await params.call(debit.reference);
 
   if (!result.ok || !result.ticketId) {
     await prisma.transaction.update({
       where: { id: debit.transaction.id },
-      data: { status: TransactionStatus.FAILED, provider: 'techhub' }
+      data: { status: TransactionStatus.FAILED, provider: params.provider }
     });
     await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
-    throw new ApiError(502, result.message, 'TECHHUB_SUBMIT_FAILED');
+    throw new ApiError(502, result.message, 'IDENTITY_PROVIDER_SUBMIT_FAILED');
   }
 
   const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
   await prisma.transaction.update({
     where: { id: debit.transaction.id },
     data: {
-      provider: 'techhub',
+      provider: params.provider,
       providerRef: result.ticketId,
       metadata: {
         service: params.service,
@@ -518,18 +520,18 @@ async function submitAsyncService(params: {
 }
 
 /**
- * Polls Techhub for a ticket this user already submitted. Settles (and, on
- * failure, refunds) the underlying Transaction the first time Techhub
+ * Polls the provider for a ticket this user already submitted. Settles (and,
+ * on failure, refunds) the underlying Transaction the first time the provider
  * reports success/failed; safe to call repeatedly after that since it reads
  * straight back from our own DB once a ticket is no longer PENDING.
  */
 async function checkAsyncServiceStatus(params: {
   userId: string;
   ticketId: string;
-  call: (ticketId: string) => ReturnType<typeof techhubService.checkDelinking>;
+  call: (ticketId: string, provider: 'techhub' | 'ktech') => ReturnType<typeof techhubService.checkDelinking>;
 }): Promise<AsyncStatusResult> {
   const transaction = await prisma.transaction.findFirst({
-    where: { userId: params.userId, providerRef: params.ticketId, provider: 'techhub' }
+    where: { userId: params.userId, providerRef: params.ticketId, provider: { in: ['techhub', 'ktech'] } }
   });
   if (!transaction) {
     throw new ApiError(404, 'Unknown ticket_id', 'TICKET_NOT_FOUND');
@@ -545,7 +547,8 @@ async function checkAsyncServiceStatus(params: {
     };
   }
 
-  const result = await params.call(params.ticketId);
+  const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+  const result = await params.call(params.ticketId, provider);
   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
 
   if (result.status === 'pending') {
@@ -565,12 +568,12 @@ async function checkAsyncServiceStatus(params: {
     });
 
     // costKobo was captured at submit time in submitAsyncService() above
-    // (Techhub charges our balance on submit, same as their own docs
+    // (the provider charges its balance on submit, as their own docs
     // describe) - reuse it here rather than re-deriving the price, since
     // pricing could have changed between submit and this eventual outcome.
     if (transaction.costKobo) {
       await recordProviderDebit({
-        provider: 'techhub',
+        provider,
         amountKobo: transaction.costKobo,
         relatedTransactionId: transaction.id,
         description: transaction.description
@@ -608,6 +611,7 @@ export function submitDelinking(params: { userId: string; nin: string; email: st
     operational: {},
     pii: { nin: params.nin, email: params.email },
     idempotencyKey: params.idempotencyKey,
+    provider: 'techhub',
     call: () => techhubService.submitDelinking(params.nin, params.email)
   });
 }
@@ -621,41 +625,41 @@ export function checkDelinkingStatus(params: { userId: string; ticketId: string 
 
 export function submitNinValidation(params: { userId: string; nin: string; validationType?: string; idempotencyKey?: string }) {
   const service = NIN_VALIDATION_SERVICE_BY_TYPE[params.validationType ?? 'nin_validation'] ?? 'NIN_VALIDATION_GENERAL';
-  return submitAsyncService({
-    userId: params.userId,
-    service,
-    description: `NIN validation request (${params.validationType ?? 'nin_validation'})`,
-    operational: { validation_type: params.validationType ?? 'nin_validation' },
-    pii: { nin: params.nin },
-    idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.submitNinValidation(params.nin, params.validationType)
-  });
+  return activeIdentityVerificationProvider().then((provider) =>
+    submitAsyncService({
+      userId: params.userId,
+      service,
+      provider,
+      description: `NIN validation request (${params.validationType ?? 'nin_validation'})`,
+      operational: { validation_type: params.validationType ?? 'nin_validation', provider },
+      pii: { nin: params.nin },
+      idempotencyKey: params.idempotencyKey,
+      call: (reference) => provider === 'ktech'
+        ? ktechService.submitNinValidation(params.nin, params.validationType, reference)
+        : techhubService.submitNinValidation(params.nin, params.validationType)
+    })
+  );
 }
-export function checkNinValidationStatus(params: { userId: string; ticketId: string }) {
-  return checkAsyncServiceStatus({
-    userId: params.userId,
-    ticketId: params.ticketId,
-    call: (id) => techhubService.checkNinValidation(id)
-  });
+export async function checkNinValidationStatus(params: { userId: string; ticketId: string }) {
+  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+    provider === 'ktech' ? ktechService.checkNinValidation(id) : techhubService.checkNinValidation(id) });
 }
 
 export function submitPersonalization(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return submitAsyncService({
-    userId: params.userId,
-    service: 'NIN_PERSONALIZATION',
-    description: 'NIN personalization request',
-    operational: {},
-    pii: { tracking_id: params.trackingId },
-    idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.submitPersonalization(params.trackingId)
-  });
+  return activeIdentityVerificationProvider().then((provider) =>
+    submitAsyncService({
+      userId: params.userId, service: 'NIN_PERSONALIZATION', provider,
+      description: 'NIN personalization request', operational: { provider }, pii: { tracking_id: params.trackingId },
+      idempotencyKey: params.idempotencyKey,
+      call: (reference) => provider === 'ktech'
+        ? ktechService.submitPersonalization(params.trackingId, reference)
+        : techhubService.submitPersonalization(params.trackingId)
+    })
+  );
 }
-export function checkPersonalizationStatus(params: { userId: string; ticketId: string }) {
-  return checkAsyncServiceStatus({
-    userId: params.userId,
-    ticketId: params.ticketId,
-    call: (id) => techhubService.checkPersonalization(id)
-  });
+export async function checkPersonalizationStatus(params: { userId: string; ticketId: string }) {
+  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+    provider === 'ktech' ? ktechService.checkPersonalization(id) : techhubService.checkPersonalization(id) });
 }
 
 export function submitBvnRetrieval(params: {
@@ -672,6 +676,7 @@ export function submitBvnRetrieval(params: {
     operational: {},
     pii: { first_name: params.firstName, last_name: params.lastName, phone_number: params.phoneNumber },
     idempotencyKey: params.idempotencyKey,
+    provider: 'techhub',
     call: () =>
       techhubService.submitBvnRetrieval({
         first_name: params.firstName,
@@ -689,22 +694,20 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
 }
 
 export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return submitAsyncService({
-    userId: params.userId,
-    service: 'IPE_CLEARANCE',
-    description: 'IPE clearance request',
-    operational: {},
-    pii: { tracking_id: params.trackingId },
-    idempotencyKey: params.idempotencyKey,
-    call: () => techhubService.submitIpeClearance(params.trackingId)
-  });
+  return activeIdentityVerificationProvider().then((provider) =>
+    submitAsyncService({
+      userId: params.userId, service: 'IPE_CLEARANCE', provider,
+      description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
+      idempotencyKey: params.idempotencyKey,
+      call: (reference) => provider === 'ktech'
+        ? ktechService.submitIpeClearance(params.trackingId, reference)
+        : techhubService.submitIpeClearance(params.trackingId)
+    })
+  );
 }
-export function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
-  return checkAsyncServiceStatus({
-    userId: params.userId,
-    ticketId: params.ticketId,
-    call: (id) => techhubService.checkIpeClearance(id)
-  });
+export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
+  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+    provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
 }
 
 export type ServiceTicketEntry = {

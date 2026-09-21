@@ -3,9 +3,9 @@ generator client {
 }
 
 datasource db {
-  provider = "mysql"
-  // Use one direct MySQL URL for both runtime queries and Prisma migrations.
-  // Do not point this at the retired PostgreSQL/Supabase database.
+  provider = "postgresql"
+  // Supabase Session Pooler URL at runtime. This is IPv4-compatible for the
+  // Railway deployment and must include sslmode=require.
   url      = env("DATABASE_URL")
 }
 

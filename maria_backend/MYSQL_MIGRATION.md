@@ -1,125 +1,64 @@
-# PostgreSQL to MySQL cutover
+# MySQL to Supabase PostgreSQL cutover
 
-## Production database on Railway
+## What this deployment uses
 
-The local XAMPP URL (`127.0.0.1`) is only for development. Railway cannot
-reach it. Put the API and a Railway MySQL service in the **same Railway
-project and environment** so their connection stays on Railway's private
-network.
+The application now uses PostgreSQL. In Railway, set `DATABASE_URL` to the
+Supabase **Session Pooler** connection string (the IPv4-compatible URL), with
+`?sslmode=require` appended. Do not use a local XAMPP URL or expose this URL
+to the web or mobile client.
 
-1. In the Railway project canvas, click **+ New** and choose **Database →
-   MySQL**. Keep its service private; do not enable Public Access merely for
-   the API.
-2. Wait until the MySQL service is healthy. In the backend service's
-   **Variables** tab, create `DATABASE_URL` as a reference to the MySQL
-   service's `MYSQL_URL`. In Railway raw-variable form this is
-   `${{MySQL.MYSQL_URL}}` when the database service is named `MySQL`; replace
-   `MySQL` with the exact service name shown in the canvas.
-3. Set `NODE_ENV=production`, the production `WEB_ALLOWED_ORIGINS`, and real
-   random values for `AUTH_TOKEN_SECRET`, `ADMIN_SESSION_SECRET`, and
-   `PII_ENCRYPTION_KEY`. Mark secrets as sealed in Railway.
-4. For the **first** backend deployment only, set
-   `RUN_MIGRATIONS_ON_START=true`. The app runs the versioned Prisma MySQL
-   baseline before starting. After a successful deployment, set it back to
-   `false` (or remove it) so ordinary restarts do not run a migration command.
-5. Deploy the backend, then check `/health` and perform one normal user login
-   and one admin login. Only after these checks should Supabase credentials be
-   removed or the old database be deleted.
-
-Railway documents the MySQL service variables and its private-network
-connection pattern at https://docs.railway.com/databases/mysql . Public Access
-is necessary only if a tool outside Railway needs direct database access; it
-creates a TCP proxy and is not required by this backend.
-
-This project now targets MySQL 8.0+ through Prisma. The old PostgreSQL
-migrations are retained under `prisma/migrations-postgres-archive` as an audit
-record; they must never be deployed to a MySQL database.
-
-## Before the maintenance window
-
-1. Keep the PostgreSQL database unchanged and take a provider-level backup.
-2. Provision an empty MySQL 8.0+ database using `utf8mb4` and a dedicated,
-   least-privileged application account. Set a TLS-enabled `DATABASE_URL` in
-   the deployment environment; it must start with `mysql://`.
-3. Deploy this code only after the MySQL baseline migration below has been
-   applied. Do not change production `DATABASE_URL` yet.
-4. Run `npm ci`, `npm run prisma:generate`, `npm run build`, and `npm test` in
-   CI using a MySQL URL. For local development, `docker compose up -d` starts
-   MySQL at `mysql://infoverify:infoverify_dev_only@localhost:3306/infoverify`.
-
-## Apply the schema
-
-The committed baseline migration is generated from `prisma/schema.prisma` for
-MySQL. On the new, empty target database run:
-
-```powershell
-$env:DATABASE_URL = 'mysql://user:password@host:3306/infoverify'
-npm run prisma:migrate:deploy
+```text
+postgresql://postgres.PROJECT_REF:password@aws-region.pooler.supabase.com:5432/postgres?sslmode=require
 ```
 
-`prisma migrate deploy` creates and records the schema; it does not copy data.
+The committed Prisma migrations in `prisma/migrations/` are PostgreSQL
+migrations. The prior MySQL-only baseline is retained under
+`prisma/migrations-mysql-archive/` for reference and must not be applied to
+PostgreSQL.
 
-## Copy and verify data
+## One-time data copy
 
-During a maintenance window, stop writes to the PostgreSQL application first.
-Use a direct, read-only PostgreSQL connection as the source. Never commit these
-URLs or paste them into scripts.
-
-```powershell
-$env:PG_SOURCE_URL = 'postgresql://readonly-user:password@source-host:5432/database'
-$env:MYSQL_DATABASE_URL = 'mysql://user:password@mysql-host:3306/infoverify'
-npm run migrate:postgres-to-mysql
-```
-
-The script streams tables in foreign-key order, preserves UTC timestamps,
-keeps foreign keys enabled, restores self-referencing transaction rows in a
-second pass, and fails if the destination schema differs or any row count does
-not match. It is restartable: existing primary keys are left intact, while
-invalid/truncated rows fail visibly rather than being ignored. First run it
-with `MIGRATION_DRY_RUN=true` to validate connectivity and schema only.
-
-### Data API fallback (no direct PostgreSQL connection)
-
-If the source network cannot reach Supabase's IPv6-only direct endpoint and a
-pooler is unreliable, the same script can read through Supabase's Data API.
-This uses an existing service-role key; it must never be exposed in a browser,
-source file, screenshot, or client application.
+During the maintenance window, stop application writes to MySQL. Apply the
+PostgreSQL migrations to the target first, then copy. Keep both connection
+strings out of source control, shells saved to disk, and screenshots.
 
 ```powershell
-$env:MIGRATION_SOURCE = 'supabase-api'
-$env:SUPABASE_SOURCE_URL = 'https://your-project.supabase.co'
-$env:SUPABASE_SOURCE_SERVICE_ROLE_KEY = '<service-role-key>'
-$env:MYSQL_DATABASE_URL = 'mysql://user:password@127.0.0.1:3306/infoverify'
+# MySQL is normally exposed locally through `railway connect MySQL`.
+$env:MYSQL_SOURCE_URL = 'mysql://migration_export:password@127.0.0.1:LOCAL_PORT/railway'
+$env:POSTGRES_DATABASE_URL = 'postgresql://postgres.PROJECT_REF:password@aws-region.pooler.supabase.com:5432/postgres?sslmode=require'
+
+# Optional safety check: checks both schemas without writing target data.
 $env:MIGRATION_DRY_RUN = 'true'
-npm run migrate:postgres-to-mysql
+npm run migrate:mysql-to-postgres
+
+# Final copy and row-count verification.
+$env:MIGRATION_DRY_RUN = 'false'
+npm run migrate:mysql-to-postgres
 ```
 
-The API mode reads every table in keyset-paginated batches, preserves raw
-PostgreSQL bigint values before JavaScript parses JSON, and performs the same
-row-count verification. After a successful dry run, set
-`MIGRATION_DRY_RUN=false` and rerun. It still requires the Supabase project to
-remain active and its API to be reachable.
+`scripts/migrate-mysql-to-postgres.mjs` reads from MySQL only. It is safe to
+rerun after a lost SSH tunnel: destination inserts use upserts and the script
+finishes by comparing the row count for every copied table. A successful run
+ends with `Migration completed and all row counts match.`
 
-## Cut over safely
+If `railway connect MySQL` asks for the SSH-key passphrase, keep that terminal
+open for the whole copy. If its connection terminates unexpectedly, rerun the
+same migration command after reconnecting; do not delete target data.
 
-1. Keep the write freeze in place until row-count verification succeeds.
-2. Spot-check wallet balances, transaction histories, encrypted JSON/PII,
-   support messages, user deliveries, and admin login/session persistence.
-3. Change the production `DATABASE_URL` to the MySQL URL and remove
-   `DIRECT_URL`; it no longer has a purpose.
-4. Deploy, monitor logs, and make a small controlled transaction before
-   reopening normal writes.
-5. Keep PostgreSQL read-only and retain its provider backup until the agreed
-   observation period completes. Revert by pointing the prior deployment at
-   PostgreSQL only while no writes have been accepted on MySQL.
+## Railway cutover checklist
 
-## MySQL-specific notes
+1. Confirm the final migration reports matching counts and spot-check a user,
+   wallet balance, transaction history, pricing, and an admin account.
+2. In Railway, replace the backend service's `DATABASE_URL` with the Supabase
+   Session Pooler URL. Remove old MySQL-only connection variables when no
+   longer needed.
+3. Deploy this code. The backend's admin session store also uses PostgreSQL,
+   so sessions survive normal restarts and multiple instances.
+4. Verify `/health`, a normal user login, an admin login, and one controlled
+   transaction before reopening writes.
+5. Keep MySQL read-only and retain its backup for the agreed observation
+   period. Only then retire the old database service.
 
-- Free-form messages/descriptions use `TEXT` so MySQL's default 191-character
-  `VARCHAR` limit cannot truncate business data.
-- Prisma represents the application's enums as MySQL enums. Future enum
-  changes must be made through a generated Prisma migration and deployed
-  before code uses the new value.
-- PostgreSQL row-level-security policies do not transfer to MySQL. Access is
-  enforced by the backend and MySQL database account privileges; do not grant
-  the runtime user schema-administration permissions.
+`RUN_MIGRATIONS_ON_START=true` is only for applying pending versioned Prisma
+migrations to an empty/new PostgreSQL database. Set it back to `false` after
+the one-time deployment.

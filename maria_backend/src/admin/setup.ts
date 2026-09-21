@@ -1,8 +1,8 @@
 import AdminJS from 'adminjs';
 import AdminJSExpress from '@adminjs/express';
 import session from 'express-session';
-import expressMySqlSession from 'express-mysql-session';
-import mysql from 'mysql2';
+import connectPgSimple from 'connect-pg-simple';
+import { Pool } from 'pg';
 import { Database, Resource } from '@adminjs/prisma';
 import { env } from '../config/env.js';
 import { authenticateAdmin } from './auth.js';
@@ -41,34 +41,18 @@ AdminJS.registerAdapter({ Database, Resource });
 
 export const ADMIN_ROOT_PATH = '/admin';
 
-// AdminJS uses express-session directly, so keep a small mysql2 pool for its
-// session table rather than routing it through Prisma. The store creates the
-// table on first boot and periodically removes expired sessions.
-const sessionPool = mysql.createPool(env.DATABASE_URL);
-const MySqlSessionStore = expressMySqlSession(session);
-const adminSessionStore = new MySqlSessionStore(
+// AdminJS uses express-session directly, so keep a small PostgreSQL pool for
+// its session table rather than routing it through Prisma. The store creates
+// the table on first boot and periodically removes expired sessions.
+const sessionPool = new Pool({ connectionString: env.DATABASE_URL });
+const PgSessionStore = connectPgSimple(session);
+const adminSessionStore = new PgSessionStore(
   {
-    createDatabaseTable: true,
-    clearExpired: true,
-    checkExpirationInterval: 60 * 15 * 1000,
-    // `tableName` only takes effect nested under `schema` - a top-level
-    // `tableName` property is silently ignored by this library (confirmed
-    // against its source), which would otherwise leave the session table
-    // named 'sessions' (the library's own default) instead of the
-    // intended 'admin_session'.
-    schema: {
-      tableName: 'admin_session'
-    }
-  },
-  // express-mysql-session and its @types package each pin a different
-  // exact mysql2 patch version than the one in this app's own
-  // package.json, so npm can't dedupe them into one copy - three separate
-  // mysql2 installations end up nested in node_modules (`npm ls mysql2`
-  // confirms this). TypeScript treats their `Pool` classes as nominally
-  // distinct even though they're structurally identical at runtime (this
-  // is a real mysql2 Pool). Safe to assert past - this isn't hiding a
-  // real type error.
-  sessionPool as unknown as ConstructorParameters<typeof MySqlSessionStore>[1]
+    pool: sessionPool,
+    createTableIfMissing: true,
+    pruneSessionInterval: 60 * 15,
+    tableName: 'admin_session'
+  }
 );
 
 export async function buildAdminRouter() {
