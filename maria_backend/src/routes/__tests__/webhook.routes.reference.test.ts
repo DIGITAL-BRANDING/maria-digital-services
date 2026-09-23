@@ -62,3 +62,17 @@ describe('pickKatpayTransactionReference', () => {
     expect(pickKatpayTransactionReference({ id: null, reference: undefined })).toBeUndefined();
   });
 });
+
+describe('normalizeKtechTicketStatus', async () => {
+  const { normalizeKtechTicketStatus } = await import('../webhook.routes.js');
+  it('maps known success/failed/pending words', () => {
+    expect(normalizeKtechTicketStatus('Successful')).toBe('success');
+    expect(normalizeKtechTicketStatus('REJECTED')).toBe('failed');
+    expect(normalizeKtechTicketStatus('processing')).toBe('pending');
+  });
+  it('never turns an unknown status into a failure (which would trigger a refund)', () => {
+    expect(normalizeKtechTicketStatus('on_hold')).toBeUndefined();
+    expect(normalizeKtechTicketStatus(undefined)).toBeUndefined();
+    expect(normalizeKtechTicketStatus(5)).toBeUndefined();
+  });
+});

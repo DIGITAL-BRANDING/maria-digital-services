@@ -95,6 +95,17 @@ select:focus-visible, textarea:focus-visible {
   box-shadow: inset 0 1px 0 rgba(255, 237, 169, .18), 0 8px 20px rgba(54, 31, 0, .22);
 }
 
+/* Explicit navy card for pages that set every text color themselves (see
+   WalletSummaryPage.tsx). Unlike the legacy `bg-parchment` recolor below, it
+   does NOT force descendants to white, so status pills and green/red amounts
+   keep their own readable colors. */
+.surface-navy {
+  background-color: #0b2f73;
+  background-image: linear-gradient(145deg, #0b2f73 0%, #0d438d 58%, #071d4d 100%);
+  border: 1px solid rgba(96, 165, 250, .5);
+  color: #f8fbff;
+}
+
 /* ── Royal-blue premium recolor for legacy pages ─────────────────────
    Several older pages (Dashboard, Buy Airtime/Data, Fund Wallet, Receipts,
    Referral, Result Checkers, the original all-in-one VerificationPage,
@@ -115,7 +126,6 @@ select:focus-visible, textarea:focus-visible {
    pages should opt in with `bg-cream`/`bg-parchment`, never `bg-white`. */
 main .bg-cream,
 main .bg-parchment,
-main .border-parchment-line,
 main [class~="bg-cream"],
 main [class~="bg-parchment"] {
   background-color: #0b2f73 !important;
@@ -123,6 +133,11 @@ main [class~="bg-parchment"] {
   border-color: rgba(96, 165, 250, .5) !important;
   color: #f8fbff !important;
 }
+/* `.border-parchment-line` used to sit in the list above, so ANY element that merely
+   had that border class - including bg-white cards such as the receipt - was painted
+   navy while keeping its dark text (dark-on-navy, unreadable). A border class must
+   only recolor the border. */
+main .border-parchment-line { border-color: rgba(96, 165, 250, .5) !important; }
 main .bg-cream *, main .bg-parchment * { color: #f8fbff; }
 main .bg-cream h1, main .bg-cream h2, main .bg-cream h3,
 main .bg-parchment h1, main .bg-parchment h2, main .bg-parchment h3 { color: #ffffff !important; }
@@ -242,3 +257,31 @@ main [class*="bg-\\#0b2f73"] h1, main [class*="bg-\\#0b2f73"] h2, main [class*="
 .verification-blue-page .bg-gold-500 { background: #d9ad2b !important; color: #071a40 !important; }
 .verification-blue-page .text-gold-700 { color: #f6d568 !important; }
 .verification-blue-page .border-parchment-line { border-color: #6f9bd8 !important; }
+
+
+/* ── Light surfaces inside legacy navy cards keep dark, readable text ─────
+   The legacy recolor above sets `color: #f8fbff` on EVERY descendant of a
+   `.bg-parchment` / `.bg-cream` card. That is right for text sitting on the
+   navy, but any pastel chip or light box nested inside (status badges such as
+   bg-emerald-100, success/error notices such as bg-emerald-50, white message
+   bubbles) then got white text on a near-white background - invisible.
+   These rules re-darken text on those light surfaces (and everything in them),
+   then give the common status hues back their own contrast-safe colors.
+   Specificity is intentionally higher than the blanket rule. */
+main .bg-parchment :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100),
+main .bg-parchment :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100) *,
+main .bg-cream :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100),
+main .bg-cream :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100) * {
+  color: #0f172a !important;
+}
+main :is(.bg-parchment, .bg-cream) :is(.bg-emerald-50, .bg-emerald-100) :is(.text-emerald-600, .text-emerald-700, .text-emerald-800) { color: #065f46 !important; }
+main :is(.bg-parchment, .bg-cream) :is(.bg-amber-50, .bg-amber-100) :is(.text-amber-600, .text-amber-700, .text-amber-800) { color: #78350f !important; }
+main :is(.bg-parchment, .bg-cream) :is(.bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100) :is(.text-rose-600, .text-rose-700, .text-red-600, .text-red-700) { color: #881337 !important; }
+main :is(.bg-parchment, .bg-cream) :is(.bg-slate-100, .bg-slate-200) :is(.text-slate-500, .text-slate-600, .text-slate-700) { color: #1e293b !important; }
+
+/* Pale gold surfaces (selected tabs/amount chips on FundWalletPage, the OPEN ticket
+   chip on SupportPage) get the same treatment as the pastel chips above: dark
+   text on the light fill instead of the blanket white. */
+main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200),
+main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200) * { color: #422006 !important; }
+main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200):is(.text-gold-700, .text-gold-600) { color: #713f12 !important; }

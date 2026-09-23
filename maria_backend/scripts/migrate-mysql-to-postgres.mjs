@@ -20,6 +20,9 @@ const mysqlUrl = process.env.MYSQL_SOURCE_URL;
 const postgresUrl = process.env.POSTGRES_DATABASE_URL ?? process.env.DATABASE_URL;
 const batchSize = Number.parseInt(process.env.MIGRATION_BATCH_SIZE ?? '250', 10);
 const dryRun = process.env.MIGRATION_DRY_RUN === 'true';
+// Read-only diagnostic for a completed cutover. Unlike a normal restartable
+// migration, this never upserts rows; it only prints source/target counts.
+const verifyOnly = process.env.MIGRATION_VERIFY_ONLY === 'true';
 
 if (!mysqlUrl?.startsWith('mysql://')) throw new Error('MYSQL_SOURCE_URL must use mysql://.');
 if (!postgresUrl?.startsWith('postgres')) throw new Error('POSTGRES_DATABASE_URL must use postgresql:// or postgres://.');
@@ -150,6 +153,19 @@ async function countRows(my, pg, table) {
   return { source: String(source.count), target: target.rows[0].count };
 }
 
+async function verifyRowCounts(my, pg) {
+  let mismatch = false;
+  console.log('\nRow-count verification:');
+  for (const table of tables) {
+    const { source, target } = await countRows(my, pg, table);
+    const ok = source === target;
+    mismatch ||= !ok;
+    console.log(`${table.padEnd(24)} MySQL=${source.padStart(8)} PostgreSQL=${target.padStart(8)} ${ok ? 'OK' : 'MISMATCH'}`);
+  }
+  if (mismatch) throw new Error('Row-count verification failed. Do not delete or overwrite either database.');
+  console.log('\nAll row counts match.');
+}
+
 async function main() {
   const my = await mysql.createConnection({ uri: mysqlUrl, timezone: 'Z', supportBigNumbers: true, bigNumberStrings: true });
   const pg = new Client({ connectionString: postgresUrl });
@@ -161,19 +177,15 @@ async function main() {
       console.log('Schema compatibility check passed; dry run did not write data.');
       return;
     }
+    if (verifyOnly) {
+      await verifyRowCounts(my, pg);
+      return;
+    }
 
     for (const table of tables) await copyTable(my, pg, table);
     await restoreTransactionReferences(my, pg);
 
-    let mismatch = false;
-    console.log('\nRow-count verification:');
-    for (const table of tables) {
-      const { source, target } = await countRows(my, pg, table);
-      const ok = source === target;
-      mismatch ||= !ok;
-      console.log(`${table.padEnd(24)} MySQL=${source.padStart(8)} PostgreSQL=${target.padStart(8)} ${ok ? 'OK' : 'MISMATCH'}`);
-    }
-    if (mismatch) throw new Error('Row-count verification failed. Do not cut over.');
+    await verifyRowCounts(my, pg);
     console.log('\nMigration completed and all row counts match.');
   } finally {
     await Promise.allSettled([my.end(), pg.end()]);

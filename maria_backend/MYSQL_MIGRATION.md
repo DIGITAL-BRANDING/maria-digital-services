@@ -41,6 +41,15 @@ rerun after a lost SSH tunnel: destination inserts use upserts and the script
 finishes by comparing the row count for every copied table. A successful run
 ends with `Migration completed and all row counts match.`
 
+To investigate a suspected missing record after cutover without changing either
+database, run the same command with `MIGRATION_VERIFY_ONLY=true`. It prints
+the MySQL and PostgreSQL counts for every copied table, including `Transaction`.
+
+```powershell
+$env:MIGRATION_VERIFY_ONLY = 'true'
+npm run migrate:mysql-to-postgres
+```
+
 If `railway connect MySQL` asks for the SSH-key passphrase, keep that terminal
 open for the whole copy. If its connection terminates unexpectedly, rerun the
 same migration command after reconnecting; do not delete target data.

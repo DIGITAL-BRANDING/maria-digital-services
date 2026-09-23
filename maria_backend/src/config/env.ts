@@ -81,6 +81,11 @@ const EnvSchema = z.object({
   // against the live dashboard/docs before relying on this in production.
   KTECH_BASE_URL: z.string().url().default('https://k-tech.up.railway.app/api/v1'),
   KTECH_API_KEY: z.string().optional(),
+  // The "webhook secret" shown next to the callback URL on the K-Tech partner
+  // dashboard. Without it POST /api/webhooks/ktech answers 503 (see
+  // webhook.routes.ts) - which is exactly what the dashboard reports as
+  // "Webhook test was not delivered yet (status: pending)".
+  KTECH_WEBHOOK_SECRET: z.string().optional(),
   MOCK_KTECH: z
     .string()
     .default('false')

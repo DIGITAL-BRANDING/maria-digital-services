@@ -78,7 +78,8 @@ function applyUpdate(record: Record<string, unknown>, data: Record<string, unkno
 function matchesWhere(record: Record<string, unknown>, where: WhereClause): boolean {
   return Object.entries(where).every(([key, expected]) => {
     if (expected !== null && typeof expected === 'object' && !Array.isArray(expected) && !(expected instanceof Date)) {
-      const op = expected as { gte?: unknown; lte?: unknown; in?: unknown[]; equals?: unknown; contains?: unknown };
+      const op = expected as { gte?: unknown; lte?: unknown; in?: unknown[]; equals?: unknown; contains?: unknown; not?: unknown };
+      if ('not' in op) return record[key] !== op.not;
       if ('in' in op) return (op.in as unknown[]).includes(record[key]);
       if ('gte' in op || 'lte' in op) {
         const value = record[key] as bigint | number | Date;

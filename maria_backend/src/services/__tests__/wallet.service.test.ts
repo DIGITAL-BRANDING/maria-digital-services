@@ -53,6 +53,7 @@ vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedV
 
 const { prisma } = await import('../../lib/prisma.js');
 const { debitWallet, refundWallet } = await import('../wallet.service.js');
+const { notifyUser } = await import('../notification.service.js');
 
 let userCounter = 0;
 async function seedUser(balanceNaira: number) {
@@ -254,5 +255,84 @@ describe('debitWallet + refundWallet round trip', () => {
     await refundWallet({ transactionId: debit.transaction.id, userId });
 
     expect(await balanceOf(userId)).toBe(10_000);
+  });
+});
+
+describe('refund ledger detail (balance before / after)', () => {
+  it('records the wallet balance before and after the refund on the REFUND row', async () => {
+    const userId = await seedUser(5000);
+    const debit = await debitWallet({
+      userId,
+      amount: 150,
+      type: TransactionType.NIN_VERIFICATION,
+      description: 'NIN slip (standard) by NIN'
+    });
+    // The debit row itself: 5000 -> 4850
+    expect(debit.transaction.balanceBeforeKobo).toBe(500000n);
+    expect(debit.transaction.balanceAfterKobo).toBe(485000n);
+
+    const refund = await refundWallet({ transactionId: debit.transaction.id, userId });
+
+    expect(refund.type).toBe('REFUND');
+    expect(refund.balanceBeforeKobo).toBe(485000n);
+    expect(refund.balanceAfterKobo).toBe(500000n);
+    expect(refund.balanceAfterKobo - refund.balanceBeforeKobo).toBe(refund.amountKobo);
+    expect(refund.relatedTransactionId).toBe(debit.transaction.id);
+  });
+
+  it('marks the original REVERSED without rewriting its own before/after', async () => {
+    const userId = await seedUser(5000);
+    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'x' });
+    await refundWallet({ transactionId: debit.transaction.id, userId });
+
+    const original = await prisma.transaction.findUniqueOrThrow({ where: { id: debit.transaction.id } });
+    expect(original.status).toBe('REVERSED');
+    expect(original.balanceBeforeKobo).toBe(500000n);
+    expect(original.balanceAfterKobo).toBe(485000n);
+  });
+
+  it('two consecutive failures each credit exactly once (the 621 -> 471 -> 621 scenario)', async () => {
+    const userId = await seedUser(621);
+    for (let i = 0; i < 2; i += 1) {
+      const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'NIN slip' });
+      expect(await balanceOf(userId)).toBe(471);
+      await refundWallet({ transactionId: debit.transaction.id, userId });
+      expect(await balanceOf(userId)).toBe(621);
+    }
+  });
+
+  it('refuses to refund a transaction that itself added money (refund of a refund, funding)', async () => {
+    const userId = await seedUser(5000);
+    const debit = await debitWallet({ userId, amount: 100, type: TransactionType.NIN_VERIFICATION, description: 'x' });
+    const refund = await refundWallet({ transactionId: debit.transaction.id, userId });
+
+    await expect(refundWallet({ transactionId: refund.id, userId })).rejects.toMatchObject({
+      statusCode: 422,
+      code: 'TRANSACTION_NOT_REVERSIBLE'
+    });
+    expect(await balanceOf(userId)).toBe(5000);
+  });
+
+  it('notification quotes the original description once, not "Refund for \"Refund for ...\""', async () => {
+    const userId = await seedUser(5000);
+    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'NIN slip (standard) by NIN' });
+    (notifyUser as unknown as { mockClear: () => void }).mockClear();
+
+    await refundWallet({ transactionId: debit.transaction.id, userId });
+
+    const call = (notifyUser as unknown as { mock: { calls: Array<[{ body: string }]> } }).mock.calls[0][0];
+    expect(call.body).toContain('for "NIN slip (standard) by NIN"');
+    expect(call.body).not.toContain('Refund for');
+    expect(call.body).toContain('New balance: NGN5,000.00');
+    expect(call.body).toContain('was NGN4,850.00');
+  });
+
+  it('a repeated refund does not send a second notification', async () => {
+    const userId = await seedUser(5000);
+    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'x' });
+    (notifyUser as unknown as { mockClear: () => void }).mockClear();
+    await refundWallet({ transactionId: debit.transaction.id, userId });
+    await refundWallet({ transactionId: debit.transaction.id, userId });
+    expect((notifyUser as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1);
   });
 });

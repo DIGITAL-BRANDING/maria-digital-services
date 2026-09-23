@@ -1,0 +1,1666 @@
+From 2d4eeb2bb1021b945c26874cab96d46db58dffc5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 22:23:51 +0000
+Subject: [PATCH] Fix refund display & ledger detail, add balance before/after,
+ fix unreadable colors, add K-Tech webhook receiver
+
+- refundWallet: atomic claim of REVERSED before crediting, before/after derived from the locked row,
+  refuses to refund credit-type rows, notification no longer says 'Refund for "Refund for ..."'
+- debitWallet: balanceBefore derived from the locked row
+- checkAsyncServiceStatus: REVERSED is a settled state (no re-poll / re-refund); shared settle logic
+- transactions API: balance_before, direction, balance_changed, related_transaction_id, /summary totals
+- web: history shows Balance before/after, refunds are +credit and not counted as spent
+- css: stop forcing white text on light chips/cards, stop painting border-parchment-line elements navy
+- POST/GET /api/webhooks/ktech + KTECH_WEBHOOK_SECRET
+- tests: 34 new (211 total)
+---
+ maria_backend/.env.example                    |   4 +
+ maria_backend/KTECH_WEBHOOK.md                |  34 ++++
+ maria_backend/src/config/env.ts               |   5 +
+ .../__tests__/transaction-direction.test.ts   |  30 +++
+ .../lib/__tests__/webhook-signature.test.ts   |  71 +++++++
+ .../src/lib/transaction-direction.ts          |  39 ++++
+ maria_backend/src/lib/webhook-signature.ts    | 118 +++++++++++
+ .../routes/__tests__/webhook.ktech.test.ts    |  94 +++++++++
+ .../webhook.routes.reference.test.ts          |  14 ++
+ .../src/routes/transaction.routes.ts          | 113 ++++++++---
+ maria_backend/src/routes/webhook.routes.ts    | 114 +++++++++++
+ .../services/__tests__/wallet.service.test.ts |  80 ++++++++
+ .../src/services/verification.service.ts      |  66 +++++-
+ maria_backend/src/services/wallet.service.ts  | 114 ++++++-----
+ maria_backend/src/test-utils/fake-prisma.ts   |   3 +-
+ web/src/index.css                             |  45 ++++-
+ web/src/pages/ReceiptPage.tsx                 |  58 ++++--
+ web/src/pages/WalletSummaryPage.tsx           | 188 ++++++++++++------
+ 18 files changed, 1040 insertions(+), 150 deletions(-)
+ create mode 100644 maria_backend/KTECH_WEBHOOK.md
+ create mode 100644 maria_backend/src/lib/__tests__/transaction-direction.test.ts
+ create mode 100644 maria_backend/src/lib/__tests__/webhook-signature.test.ts
+ create mode 100644 maria_backend/src/lib/transaction-direction.ts
+ create mode 100644 maria_backend/src/lib/webhook-signature.ts
+ create mode 100644 maria_backend/src/routes/__tests__/webhook.ktech.test.ts
+
+diff --git a/maria_backend/.env.example b/maria_backend/.env.example
+index 9a7f330..c0a8c0d 100644
+--- a/maria_backend/.env.example
++++ b/maria_backend/.env.example
+@@ -60,6 +60,10 @@ MOCK_TECHHUB=false
+ # against Techhub at /admin/bulk-pricing. See src/services/ktech.service.ts.
+ KTECH_BASE_URL=https://k-tech.up.railway.app/api/v1
+ KTECH_API_KEY=
++# Webhook secret from the K-Tech partner dashboard. Set the dashboard's callback
++# URL to https://<your-backend-domain>/api/webhooks/ktech (GET the same URL in a
++# browser to check it is reachable and that this secret is loaded).
++KTECH_WEBHOOK_SECRET=
+ MOCK_KTECH=false
+ 
+ # --- Auth / sessions ----------------------------------------------------------
+diff --git a/maria_backend/KTECH_WEBHOOK.md b/maria_backend/KTECH_WEBHOOK.md
+new file mode 100644
+index 0000000..bcfdb29
+--- /dev/null
++++ b/maria_backend/KTECH_WEBHOOK.md
+@@ -0,0 +1,34 @@
++# K-Tech webhook
++
++Endpoint: `POST https://<your-backend-domain>/api/webhooks/ktech`
++Readiness check (browser): `GET https://<your-backend-domain>/api/webhooks/ktech`
++
++## Setup
++1. On the K-Tech partner dashboard set the **callback URL** to the endpoint above.
++2. Copy the **webhook secret** from the same dashboard into the backend env var
++   `KTECH_WEBHOOK_SECRET` (Railway -> Variables) and redeploy.
++3. Open the GET URL in a browser. You should see `"ready": true`.
++4. Press "send test webhook" on the K-Tech dashboard.
++
++## What the server answers
++| Status | Meaning |
++| ------ | ------- |
++| 200 | Accepted (test event, ticket settled, or an event we deliberately ignore) |
++| 401 | Signature / secret did not match `KTECH_WEBHOOK_SECRET` |
++| 503 | `KTECH_WEBHOOK_SECRET` is not set on the server |
++| 500 | We failed while processing a valid event - K-Tech should retry |
++
++Check the Railway logs for lines starting with `[ktech-webhook]`:
++* `rejected - signature check failed` lists which header NAMES arrived (never values).
++* `received ... verifiedBy` tells you which signing scheme K-Tech actually uses.
++
++## Signature schemes accepted
++K-Tech's partner docs are behind a login, so the receiver accepts the common schemes
++(always requiring the shared secret): HMAC-SHA256 of the raw body (hex/base64, optional
++`sha256=`), HMAC-SHA256 of `timestamp.body`, `t=...,v1=...` headers, or the secret sent in
++`X-Webhook-Secret` / `Authorization: Bearer`. See `src/lib/webhook-signature.ts`.
++
++## Ticket events
++For async services (NIN validation, personalization, IPE clearance) a payload carrying
++`ticket_id` + `status` settles the matching PENDING transaction: `success` marks it done,
++`failed` marks it FAILED and refunds the wallet. Unknown statuses are never treated as failures.
+diff --git a/maria_backend/src/config/env.ts b/maria_backend/src/config/env.ts
+index 4b24212..6db83ca 100644
+--- a/maria_backend/src/config/env.ts
++++ b/maria_backend/src/config/env.ts
+@@ -81,6 +81,11 @@ const EnvSchema = z.object({
+   // against the live dashboard/docs before relying on this in production.
+   KTECH_BASE_URL: z.string().url().default('https://k-tech.up.railway.app/api/v1'),
+   KTECH_API_KEY: z.string().optional(),
++  // The "webhook secret" shown next to the callback URL on the K-Tech partner
++  // dashboard. Without it POST /api/webhooks/ktech answers 503 (see
++  // webhook.routes.ts) - which is exactly what the dashboard reports as
++  // "Webhook test was not delivered yet (status: pending)".
++  KTECH_WEBHOOK_SECRET: z.string().optional(),
+   MOCK_KTECH: z
+     .string()
+     .default('false')
+diff --git a/maria_backend/src/lib/__tests__/transaction-direction.test.ts b/maria_backend/src/lib/__tests__/transaction-direction.test.ts
+new file mode 100644
+index 0000000..99b8c3d
+--- /dev/null
++++ b/maria_backend/src/lib/__tests__/transaction-direction.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from 'vitest';
++import { isCreditType, transactionDirection } from '../transaction-direction.js';
++
++describe('transactionDirection', () => {
++  it('treats REFUND as a credit (was rendered as a debit before)', () => {
++    expect(transactionDirection('REFUND')).toBe('credit');
++  });
++
++  it.each(['WALLET_FUNDING', 'REFERRAL_COMMISSION', 'COUPON_REDEMPTION'])('%s is a credit', (type) => {
++    expect(transactionDirection(type)).toBe('credit');
++  });
++
++  it.each(['NIN_VERIFICATION', 'DATA_PURCHASE', 'AIRTIME_PURCHASE', 'WALLET_FUNDING_FEE', 'IDENTITY_SERVICE_REQUEST'])(
++    '%s is a debit',
++    (type) => {
++      expect(transactionDirection(type)).toBe('debit');
++    }
++  );
++
++  it('reads MANUAL_ADJUSTMENT direction from metadata', () => {
++    expect(transactionDirection('MANUAL_ADJUSTMENT', { direction: 'debit' })).toBe('debit');
++    expect(transactionDirection('MANUAL_ADJUSTMENT', { direction: 'credit' })).toBe('credit');
++    expect(transactionDirection('MANUAL_ADJUSTMENT', null)).toBe('credit');
++  });
++
++  it('isCreditType mirrors direction', () => {
++    expect(isCreditType('REFUND')).toBe(true);
++    expect(isCreditType('DATA_PURCHASE')).toBe(false);
++  });
++});
+diff --git a/maria_backend/src/lib/__tests__/webhook-signature.test.ts b/maria_backend/src/lib/__tests__/webhook-signature.test.ts
+new file mode 100644
+index 0000000..e84505f
+--- /dev/null
++++ b/maria_backend/src/lib/__tests__/webhook-signature.test.ts
+@@ -0,0 +1,71 @@
++import crypto from 'node:crypto';
++import { describe, expect, it } from 'vitest';
++import { timestampWithinTolerance, verifyPartnerWebhook } from '../webhook-signature.js';
++
++const secret = 'whsec_test_secret';
++const body = JSON.stringify({ event: 'webhook.test', data: { ok: true } });
++const raw = Buffer.from(body);
++const hmac = (data: string, enc: 'hex' | 'base64' = 'hex') => crypto.createHmac('sha256', secret).update(data).digest(enc);
++
++describe('verifyPartnerWebhook', () => {
++  it('accepts hex HMAC of the raw body', () => {
++    const r = verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-webhook-signature': hmac(body) } });
++    expect(r).toMatchObject({ valid: true, scheme: 'hmac-sha256(body)', header: 'x-webhook-signature' });
++  });
++
++  it('accepts sha256= prefix and base64 encoding', () => {
++    expect(verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-signature': `sha256=${hmac(body)}` } }).valid).toBe(true);
++    expect(verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-ktech-signature': hmac(body, 'base64') } }).valid).toBe(true);
++  });
++
++  it('accepts timestamp.body scheme with a separate timestamp header', () => {
++    const ts = String(Math.floor(Date.now() / 1000));
++    const r = verifyPartnerWebhook({
++      secret,
++      rawBody: raw,
++      headers: { 'x-ktech-signature': hmac(`${ts}.${body}`), 'x-ktech-timestamp': ts }
++    });
++    expect(r).toMatchObject({ valid: true, scheme: 'hmac-sha256(timestamp.body)' });
++  });
++
++  it('accepts a t=...,v1=... header', () => {
++    const ts = String(Math.floor(Date.now() / 1000));
++    const r = verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-signature': `t=${ts},v1=${hmac(`${ts}.${body}`)}` } });
++    expect(r.valid).toBe(true);
++  });
++
++  it('rejects a replayed (stale) timestamped signature', () => {
++    const ts = String(Math.floor(Date.now() / 1000) - 3600);
++    const r = verifyPartnerWebhook({
++      secret,
++      rawBody: raw,
++      headers: { 'x-webhook-signature': hmac(`${ts}.${body}`), 'x-webhook-timestamp': ts }
++    });
++    expect(r.valid).toBe(false);
++  });
++
++  it('accepts the secret itself in a header or as a bearer token', () => {
++    expect(verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-webhook-secret': secret } }).valid).toBe(true);
++    expect(verifyPartnerWebhook({ secret, rawBody: raw, headers: { authorization: `Bearer ${secret}` } }).valid).toBe(true);
++  });
++
++  it('rejects a wrong secret, a tampered body and a missing header - and reports header names seen', () => {
++    const wrong = crypto.createHmac('sha256', 'other').update(body).digest('hex');
++    expect(verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-webhook-signature': wrong } }).valid).toBe(false);
++    expect(verifyPartnerWebhook({ secret, rawBody: Buffer.from(body + ' '), headers: { 'x-webhook-signature': hmac(body) } }).valid).toBe(false);
++    const none = verifyPartnerWebhook({ secret, rawBody: raw, headers: {} });
++    expect(none).toMatchObject({ valid: false, headersSeen: [] });
++    const some = verifyPartnerWebhook({ secret, rawBody: raw, headers: { 'x-signature': 'nope' } });
++    expect(some).toMatchObject({ valid: false, headersSeen: ['x-signature'] });
++  });
++});
++
++describe('timestampWithinTolerance', () => {
++  it('handles seconds, milliseconds and ISO strings', () => {
++    const now = Date.now();
++    expect(timestampWithinTolerance(String(Math.floor(now / 1000)))).toBe(true);
++    expect(timestampWithinTolerance(String(now))).toBe(true);
++    expect(timestampWithinTolerance(new Date(now).toISOString())).toBe(true);
++    expect(timestampWithinTolerance('garbage')).toBe(false);
++  });
++});
+diff --git a/maria_backend/src/lib/transaction-direction.ts b/maria_backend/src/lib/transaction-direction.ts
+new file mode 100644
+index 0000000..8c98bd6
+--- /dev/null
++++ b/maria_backend/src/lib/transaction-direction.ts
+@@ -0,0 +1,39 @@
++/**
++ * Single source of truth for "does this transaction ADD money to the wallet
++ * or TAKE it out?".
++ *
++ * The web app used to keep its own hard-coded list of credit types
++ * (wallet_funding, referral_commission, coupon_redemption, manual_adjustment)
++ * which silently missed `refund` - so every refund was rendered as a red
++ * "-₦150.00" debit and was even added into "Total spent". Deciding this in
++ * one place on the server means every client (web, Flutter, admin) agrees.
++ *
++ * Kept free of `@prisma/client` imports on purpose (plain string unions) so it
++ * can be unit-tested without a generated Prisma client.
++ */
++
++const CREDIT_TYPES: ReadonlySet<string> = new Set([
++  'WALLET_FUNDING',
++  'REFERRAL_COMMISSION',
++  'COUPON_REDEMPTION',
++  'REFUND'
++]);
++
++export type TransactionDirection = 'credit' | 'debit';
++
++export function transactionDirection(type: string, metadata?: unknown): TransactionDirection {
++  // Admin adjustments can go either way - the direction is recorded in metadata
++  // by manualWalletAdjustment(). Anything without it is treated as a credit,
++  // which matches how these rows were displayed before.
++  if (type === 'MANUAL_ADJUSTMENT') {
++    const direction =
++      metadata !== null && typeof metadata === 'object' ? (metadata as Record<string, unknown>).direction : undefined;
++    return direction === 'debit' ? 'debit' : 'credit';
++  }
++  return CREDIT_TYPES.has(type) ? 'credit' : 'debit';
++}
++
++/** Types that are already a credit to the wallet - reversing them would ADD money, so they are never refundable. */
++export function isCreditType(type: string, metadata?: unknown): boolean {
++  return transactionDirection(type, metadata) === 'credit';
++}
+diff --git a/maria_backend/src/lib/webhook-signature.ts b/maria_backend/src/lib/webhook-signature.ts
+new file mode 100644
+index 0000000..87963c8
+--- /dev/null
++++ b/maria_backend/src/lib/webhook-signature.ts
+@@ -0,0 +1,118 @@
++import crypto from 'node:crypto';
++
++/**
++ * Verifies an inbound webhook from a partner whose exact signing scheme we
++ * cannot read up front (K-Tech's partner docs sit behind a login).
++ *
++ * Instead of guessing ONE scheme and silently failing on every real delivery,
++ * this accepts the handful of schemes almost every partner platform uses -
++ * always requiring knowledge of the shared secret:
++ *
++ *   1. HMAC-SHA256 of the raw body            (hex or base64, optional "sha256=" prefix)
++ *   2. HMAC-SHA256 of `${timestamp}.${body}`  (Stripe / KatPay style; timestamp from a
++ *                                              header or from a `t=...,v1=...` header)
++ *   3. The secret itself sent in a header     (X-Webhook-Secret / Authorization: Bearer ...)
++ *
++ * The result says WHICH scheme and header matched, so the first real delivery
++ * tells us exactly what K-Tech uses (it is logged by the route).
++ */
++
++const SIGNATURE_HEADERS = [
++  'x-ktech-signature',
++  'x-k-tech-signature',
++  'x-webhook-signature',
++  'x-signature',
++  'x-signature-256',
++  'x-hub-signature-256',
++  'signature'
++];
++const TIMESTAMP_HEADERS = ['x-ktech-timestamp', 'x-k-tech-timestamp', 'x-webhook-timestamp', 'x-timestamp'];
++const PLAIN_SECRET_HEADERS = ['x-webhook-secret', 'x-ktech-secret', 'x-k-tech-secret', 'x-api-key'];
++
++export type HeaderBag = Record<string, string | string[] | undefined>;
++
++export type SignatureResult =
++  | { valid: true; scheme: string; header: string }
++  | { valid: false; reason: string; headersSeen: string[] };
++
++function header(headers: HeaderBag, name: string): string | undefined {
++  const value = headers[name];
++  const first = Array.isArray(value) ? value[0] : value;
++  return first?.trim() || undefined;
++}
++
++function safeEqual(a: string, b: string) {
++  const left = Buffer.from(a);
++  const right = Buffer.from(b);
++  return left.length === right.length && crypto.timingSafeEqual(left, right);
++}
++
++/** `t=123,v1=abcd` (or `sha256=abcd`, or bare `abcd`) -> candidate signatures + optional timestamp. */
++function parseSignatureHeader(value: string): { candidates: string[]; timestamp?: string } {
++  if (!value.includes('=') || /^sha256=/i.test(value)) {
++    return { candidates: [value.replace(/^sha256=/i, '')] };
++  }
++  const candidates: string[] = [];
++  let timestamp: string | undefined;
++  for (const part of value.split(',')) {
++    const [key, ...rest] = part.split('=');
++    const val = rest.join('=').trim();
++    if (!val) continue;
++    if (key.trim() === 't') timestamp = val;
++    else candidates.push(val);
++  }
++  // Base64 values legitimately end in "=" - if nothing parsed as key=value, treat the whole thing as the signature.
++  return candidates.length || timestamp ? { candidates, timestamp } : { candidates: [value] };
++}
++
++export function timestampWithinTolerance(timestamp: string, toleranceMs = 10 * 60_000, now = Date.now()) {
++  const parsed = /^\d+$/.test(timestamp) ? Number(timestamp) * (timestamp.length <= 10 ? 1000 : 1) : Date.parse(timestamp);
++  return Number.isFinite(parsed) && Math.abs(now - parsed) <= toleranceMs;
++}
++
++export function verifyPartnerWebhook(params: { secret: string; rawBody: Buffer; headers: HeaderBag }): SignatureResult {
++  const { secret, rawBody, headers } = params;
++  const body = rawBody.toString('utf8');
++  const headersSeen = [...SIGNATURE_HEADERS, ...TIMESTAMP_HEADERS, ...PLAIN_SECRET_HEADERS, 'authorization'].filter(
++    (name) => header(headers, name) !== undefined
++  );
++
++  const headerTimestamp = TIMESTAMP_HEADERS.map((name) => header(headers, name)).find(Boolean);
++
++  for (const name of SIGNATURE_HEADERS) {
++    const raw = header(headers, name);
++    if (!raw) continue;
++    const { candidates, timestamp: embeddedTimestamp } = parseSignatureHeader(raw);
++    const timestamp = embeddedTimestamp ?? headerTimestamp;
++
++    const payloads: Array<{ scheme: string; data: string }> = [{ scheme: 'hmac-sha256(body)', data: body }];
++    if (timestamp) payloads.push({ scheme: 'hmac-sha256(timestamp.body)', data: `${timestamp}.${body}` });
++
++    for (const payload of payloads) {
++      const digest = crypto.createHmac('sha256', secret).update(payload.data).digest();
++      const expected = [digest.toString('hex'), digest.toString('base64')];
++      for (const candidate of candidates) {
++        const normalized = /^[0-9a-f]+$/i.test(candidate) ? candidate.toLowerCase() : candidate;
++        if (expected.some((value) => safeEqual(normalized, value))) {
++          if (payload.scheme.includes('timestamp') && timestamp && !timestampWithinTolerance(timestamp)) {
++            return { valid: false, reason: 'Signature is valid but the timestamp is stale (possible replay)', headersSeen };
++          }
++          return { valid: true, scheme: payload.scheme, header: name };
++        }
++      }
++    }
++  }
++
++  for (const name of PLAIN_SECRET_HEADERS) {
++    const value = header(headers, name);
++    if (value && safeEqual(value, secret)) return { valid: true, scheme: 'shared-secret-header', header: name };
++  }
++  const bearer = header(headers, 'authorization')?.replace(/^Bearer\s+/i, '');
++  if (bearer && safeEqual(bearer, secret)) return { valid: true, scheme: 'bearer-secret', header: 'authorization' };
++
++  return {
++    valid: false,
++    reason: headersSeen.length ? 'No signature/secret header matched KTECH_WEBHOOK_SECRET' : 'No signature or secret header was sent',
++    headersSeen
++  };
++}
+diff --git a/maria_backend/src/routes/__tests__/webhook.ktech.test.ts b/maria_backend/src/routes/__tests__/webhook.ktech.test.ts
+new file mode 100644
+index 0000000..d1d799e
+--- /dev/null
++++ b/maria_backend/src/routes/__tests__/webhook.ktech.test.ts
+@@ -0,0 +1,94 @@
++import crypto from 'node:crypto';
++import type { AddressInfo } from 'node:net';
++import express from 'express';
++import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++
++const settle = vi.fn();
++const envMock: { KTECH_WEBHOOK_SECRET?: string } = { KTECH_WEBHOOK_SECRET: 'whsec_route_test' };
++
++vi.mock('../../config/env.js', () => ({ env: new Proxy({}, { get: (_t, prop) => (envMock as Record<string, unknown>)[prop as string] }) }));
++vi.mock('../../lib/prisma.js', () => ({ prisma: {} }));
++vi.mock('../../services/wallet.service.js', () => ({
++  creditDirectDeposit: vi.fn(),
++  creditDirectDepositByAccountNumber: vi.fn(),
++  creditWalletByReference: vi.fn(),
++  markFundingFailed: vi.fn()
++}));
++vi.mock('../../services/paystack.service.js', () => ({ paystackService: {} }));
++vi.mock('../../services/katpay.service.js', () => ({ katpayService: {} }));
++vi.mock('../../services/whatsapp-session.service.js', () => ({ advanceSession: vi.fn() }));
++vi.mock('../../services/verification.service.js', () => ({ settleKtechTicket: (...args: unknown[]) => settle(...args) }));
++
++const { webhookRoutes } = await import('../webhook.routes.js');
++
++let server: ReturnType<express.Express['listen']>;
++let base = '';
++
++beforeAll(async () => {
++  const app = express();
++  // Same mounting as app.ts: raw body, no JSON parser in front.
++  app.use('/api/webhooks', express.raw({ type: '*/*' }), webhookRoutes);
++  await new Promise<void>((resolve) => {
++    server = app.listen(0, resolve);
++  });
++  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/webhooks/ktech`;
++});
++afterAll(() => server.close());
++beforeEach(() => {
++  settle.mockReset();
++  envMock.KTECH_WEBHOOK_SECRET = 'whsec_route_test';
++});
++
++const sign = (body: string) => crypto.createHmac('sha256', 'whsec_route_test').update(body).digest('hex');
++const post = (body: string, headers: Record<string, string> = {}) =>
++  fetch(base, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
++
++describe('POST /api/webhooks/ktech', () => {
++  it('GET reports readiness', async () => {
++    const res = await fetch(base);
++    expect(await res.json()).toMatchObject({ webhook: 'ktech', ready: true });
++  });
++
++  it('answers 503 (not a silent 404) when the secret is not configured', async () => {
++    envMock.KTECH_WEBHOOK_SECRET = undefined;
++    expect((await post('{}')).status).toBe(503);
++  });
++
++  it('answers 401 for a missing or wrong signature', async () => {
++    expect((await post('{"event":"webhook.test"}')).status).toBe(401);
++    expect((await post('{"event":"webhook.test"}', { 'x-webhook-signature': 'bad' })).status).toBe(401);
++    expect(settle).not.toHaveBeenCalled();
++  });
++
++  it('answers 200 for a correctly signed test event', async () => {
++    const body = JSON.stringify({ event: 'webhook.test', data: { hello: 'world' } });
++    const res = await post(body, { 'x-webhook-signature': sign(body) });
++    expect(res.status).toBe(200);
++    expect(await res.json()).toMatchObject({ ok: true, test: true });
++    expect(settle).not.toHaveBeenCalled();
++  });
++
++  it('settles a ticket outcome, and only for a verified request', async () => {
++    settle.mockResolvedValue({ handled: true, transactionId: 't1', status: 'failed' });
++    const body = JSON.stringify({ event: 'ticket.updated', data: { ticket_id: 'TK-1', status: 'failed', response: { note: 'no record' } } });
++    const res = await post(body, { 'x-ktech-signature': `sha256=${sign(body)}` });
++    expect(res.status).toBe(200);
++    expect(settle).toHaveBeenCalledWith(expect.objectContaining({ ticketId: 'TK-1', status: 'failed', response: { note: 'no record' } }));
++  });
++
++  it('acknowledges unknown events / unknown tickets with 200 so K-Tech stops retrying', async () => {
++    const other = JSON.stringify({ event: 'something.else', data: {} });
++    expect((await post(other, { 'x-signature': sign(other) })).status).toBe(200);
++
++    settle.mockResolvedValue({ handled: false });
++    const body = JSON.stringify({ data: { ticket_id: 'NOPE', status: 'success' } });
++    const res = await post(body, { 'x-signature': sign(body) });
++    expect(await res.json()).toMatchObject({ ignored: true });
++  });
++
++  it('answers 500 when settling throws, so K-Tech retries', async () => {
++    settle.mockRejectedValue(new Error('db down'));
++    const body = JSON.stringify({ data: { ticket_id: 'TK-2', status: 'success' } });
++    expect((await post(body, { 'x-signature': sign(body) })).status).toBe(500);
++  });
++});
+diff --git a/maria_backend/src/routes/__tests__/webhook.routes.reference.test.ts b/maria_backend/src/routes/__tests__/webhook.routes.reference.test.ts
+index e39d02a..ba248a1 100644
+--- a/maria_backend/src/routes/__tests__/webhook.routes.reference.test.ts
++++ b/maria_backend/src/routes/__tests__/webhook.routes.reference.test.ts
+@@ -62,3 +62,17 @@ describe('pickKatpayTransactionReference', () => {
+     expect(pickKatpayTransactionReference({ id: null, reference: undefined })).toBeUndefined();
+   });
+ });
++
++describe('normalizeKtechTicketStatus', async () => {
++  const { normalizeKtechTicketStatus } = await import('../webhook.routes.js');
++  it('maps known success/failed/pending words', () => {
++    expect(normalizeKtechTicketStatus('Successful')).toBe('success');
++    expect(normalizeKtechTicketStatus('REJECTED')).toBe('failed');
++    expect(normalizeKtechTicketStatus('processing')).toBe('pending');
++  });
++  it('never turns an unknown status into a failure (which would trigger a refund)', () => {
++    expect(normalizeKtechTicketStatus('on_hold')).toBeUndefined();
++    expect(normalizeKtechTicketStatus(undefined)).toBeUndefined();
++    expect(normalizeKtechTicketStatus(5)).toBeUndefined();
++  });
++});
+diff --git a/maria_backend/src/routes/transaction.routes.ts b/maria_backend/src/routes/transaction.routes.ts
+index 141cadb..94cab06 100644
+--- a/maria_backend/src/routes/transaction.routes.ts
++++ b/maria_backend/src/routes/transaction.routes.ts
+@@ -1,32 +1,109 @@
+ import { Router } from 'express';
++import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
+ import { prisma } from '../lib/prisma.js';
+ import { koboToNaira } from '../lib/money.js';
++import { transactionDirection } from '../lib/transaction-direction.js';
+ import { requireAuth } from '../middleware/auth.js';
+ 
+ export const transactionRoutes = Router();
+ 
+ transactionRoutes.use(requireAuth);
+ 
++type TransactionRow = Prisma.TransactionGetPayload<Record<string, never>>;
++
++/**
++ * One shape for the list and the single-transaction endpoint.
++ *
++ * `balance_before` / `balance_after` are the wallet balance immediately before
++ * and after THIS row moved money. `direction` tells the client whether the row
++ * added money (credit - funding, refund, coupon, referral...) or took it out
++ * (debit), so no client has to keep its own list of "credit types" again.
++ *
++ * `balance_changed` is false for rows that never touched the wallet - e.g. a
++ * funding attempt that is still PENDING or FAILED - so the UI can say "no
++ * change" instead of showing a before/after pair that are simply equal.
++ */
++function serialize(tx: TransactionRow) {
++  const type = tx.type;
++  return {
++    id: tx.id,
++    reference: tx.reference,
++    type: type.toLowerCase(),
++    status: tx.status.toLowerCase(),
++    direction: transactionDirection(type, tx.metadata),
++    amount: koboToNaira(tx.amountKobo),
++    balance_before: koboToNaira(tx.balanceBeforeKobo),
++    balance_after: koboToNaira(tx.balanceAfterKobo),
++    balance_changed: tx.balanceBeforeKobo !== tx.balanceAfterKobo,
++    related_transaction_id: tx.relatedTransactionId,
++    description: tx.description,
++    created_at: tx.createdAt.toISOString(),
++    metadata: tx.metadata
++  };
++}
++
+ transactionRoutes.get('/', async (req, res) => {
++  const requested = Number.parseInt(String(req.query.limit ?? ''), 10);
++  const take = Number.isFinite(requested) ? Math.min(Math.max(requested, 1), 200) : 50;
++
+   const transactions = await prisma.transaction.findMany({
+     where: { userId: req.user!.id },
+     orderBy: { createdAt: 'desc' },
+-    take: 50
++    take
+   });
+ 
++  res.json({ status: true, data: transactions.map(serialize) });
++});
++
++/**
++ * Lifetime totals for the wallet summary cards. Computed in the database over
++ * ALL of the user's transactions - the client used to add up whatever 50 rows
++ * it happened to have loaded, so "Total spent" drifted from reality as soon as
++ * history grew past one page (and it counted refunds as spending).
++ *
++ * Only SUCCESS rows count: a debit that was later reversed has status
++ * REVERSED, so it drops out of "spent" on its own and the REFUND row that
++ * returned the money is a credit, never spend.
++ */
++transactionRoutes.get('/summary', async (req, res) => {
++  const userId = req.user!.id;
++
++  const [byType, adjustments] = await Promise.all([
++    prisma.transaction.groupBy({
++      by: ['type'],
++      where: { userId, status: TransactionStatus.SUCCESS, type: { not: TransactionType.MANUAL_ADJUSTMENT } },
++      _sum: { amountKobo: true }
++    }),
++    // Admin adjustments can be credits or debits - the direction lives in metadata.
++    prisma.transaction.findMany({
++      where: { userId, status: TransactionStatus.SUCCESS, type: TransactionType.MANUAL_ADJUSTMENT },
++      select: { amountKobo: true, metadata: true }
++    })
++  ]);
++
++  let fundedKobo = 0n;
++  let spentKobo = 0n;
++  let refundedKobo = 0n;
++
++  for (const row of byType) {
++    const total = row._sum.amountKobo ?? 0n;
++    if (row.type === TransactionType.WALLET_FUNDING) fundedKobo += total;
++    else if (row.type === TransactionType.REFUND) refundedKobo += total;
++    else if (transactionDirection(row.type) === 'debit') spentKobo += total;
++  }
++  for (const adjustment of adjustments) {
++    if (transactionDirection(TransactionType.MANUAL_ADJUSTMENT, adjustment.metadata) === 'debit') {
++      spentKobo += adjustment.amountKobo;
++    }
++  }
++
+   res.json({
+     status: true,
+-    data: transactions.map((tx) => ({
+-      id: tx.id,
+-      reference: tx.reference,
+-      type: tx.type.toLowerCase(),
+-      status: tx.status.toLowerCase(),
+-      amount: koboToNaira(tx.amountKobo),
+-      balance_after: koboToNaira(tx.balanceAfterKobo),
+-      description: tx.description,
+-      created_at: tx.createdAt.toISOString(),
+-      metadata: tx.metadata
+-    }))
++    data: {
++      total_funded: koboToNaira(fundedKobo),
++      total_spent: koboToNaira(spentKobo),
++      total_refunded: koboToNaira(refundedKobo)
++    }
+   });
+ });
+ 
+@@ -35,15 +112,5 @@ transactionRoutes.get('/:id', async (req, res) => {
+     where: { id: req.params.id, userId: req.user!.id }
+   });
+ 
+-  res.json({
+-    id: tx.id,
+-    reference: tx.reference,
+-    type: tx.type.toLowerCase(),
+-    status: tx.status.toLowerCase(),
+-    amount: koboToNaira(tx.amountKobo),
+-    balance_after: koboToNaira(tx.balanceAfterKobo),
+-    description: tx.description,
+-    created_at: tx.createdAt.toISOString(),
+-    metadata: tx.metadata
+-  });
++  res.json(serialize(tx));
+ });
+diff --git a/maria_backend/src/routes/webhook.routes.ts b/maria_backend/src/routes/webhook.routes.ts
+index 4c6dad6..a2df383 100644
+--- a/maria_backend/src/routes/webhook.routes.ts
++++ b/maria_backend/src/routes/webhook.routes.ts
+@@ -11,6 +11,8 @@ import {
+ import { paystackService } from '../services/paystack.service.js';
+ import { katpayService } from '../services/katpay.service.js';
+ import { advanceSession } from '../services/whatsapp-session.service.js';
++import { settleKtechTicket } from '../services/verification.service.js';
++import { verifyPartnerWebhook } from '../lib/webhook-signature.js';
+ 
+ function normalizeKatpayStatus(value: unknown): string | undefined {
+   if (typeof value === 'string' || typeof value === 'number') return String(value).trim().toUpperCase();
+@@ -139,6 +141,118 @@ webhookRoutes.post('/paystack', async (req, res) => {
+   res.sendStatus(200);
+ });
+ 
++/**
++ * Maps K-Tech's ticket status vocabulary onto ours. Anything unrecognised is
++ * `undefined` (NOT treated as failed) so an unfamiliar status can never trigger
++ * a refund for a request that may still be in progress.
++ */
++export function normalizeKtechTicketStatus(value: unknown): 'pending' | 'success' | 'failed' | undefined {
++  if (typeof value !== 'string') return undefined;
++  const status = value.trim().toLowerCase();
++  if (['success', 'successful', 'completed', 'complete', 'done', 'approved'].includes(status)) return 'success';
++  if (['failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'].includes(status)) {
++    return 'failed';
++  }
++  if (['pending', 'processing', 'in_progress', 'queued', 'submitted'].includes(status)) return 'pending';
++  return undefined;
++}
++
++// Public, non-sensitive readiness check for the K-Tech partner dashboard
++// (same idea as GET /katpay above): open this URL in a browser to confirm the
++// route exists on the deployed backend and that KTECH_WEBHOOK_SECRET is loaded.
++webhookRoutes.get('/ktech', (_req, res) => {
++  res.json({
++    status: true,
++    webhook: 'ktech',
++    ready: Boolean(env.KTECH_WEBHOOK_SECRET),
++    message: env.KTECH_WEBHOOK_SECRET
++      ? 'POST signed K-Tech events to this path'
++      : 'KTECH_WEBHOOK_SECRET is not set on the server - deliveries will be rejected with 503'
++  });
++});
++
++/**
++ * K-Tech webhook receiver (POST /api/webhooks/ktech).
++ *
++ * This route did not exist before, so every delivery K-Tech attempted hit the
++ * app's 404/SPA fallback - which is why its dashboard kept saying "Webhook
++ * test was not delivered yet (status: pending, attempt: 1). Check the callback
++ * route and webhook secret."
++ *
++ * Mounted under express.raw() (see app.ts) so the signature is checked against
++ * the exact bytes K-Tech sent. Responses are chosen so K-Tech's retry logic does
++ * the right thing:
++ *   - 200: accepted (including tests, and events we deliberately don't act on)
++ *   - 401: signature/secret did not match  -> fix the secret, do not retry blindly
++ *   - 503: KTECH_WEBHOOK_SECRET missing on OUR side -> retry later
++ *   - 500: we failed while processing a valid event -> K-Tech should retry
++ */
++webhookRoutes.post('/ktech', async (req, res) => {
++  const secret = env.KTECH_WEBHOOK_SECRET;
++  if (!secret) {
++    console.error('[ktech-webhook] rejected - KTECH_WEBHOOK_SECRET is not configured on this server');
++    return res.status(503).json({ error: 'Webhook secret not configured' });
++  }
++
++  const rawBody = req.body as Buffer;
++  if (!Buffer.isBuffer(rawBody)) {
++    console.error('[ktech-webhook] rejected - body was not captured as a raw Buffer', {
++      bodyType: typeof rawBody,
++      contentType: req.header('content-type') ?? null
++    });
++    return res.status(400).json({ error: 'Could not read request body' });
++  }
++
++  const verification = verifyPartnerWebhook({ secret, rawBody, headers: req.headers });
++  if (!verification.valid) {
++    // Header NAMES only - never values, the secret, or the body.
++    console.error('[ktech-webhook] rejected - signature check failed', {
++      reason: verification.reason,
++      headersSeen: verification.headersSeen,
++      bodyByteLength: rawBody.length
++    });
++    return res.status(401).json({ error: 'Invalid signature' });
++  }
++
++  let payload: Record<string, any>;
++  try {
++    payload = JSON.parse(rawBody.toString('utf8') || '{}');
++  } catch {
++    console.error('[ktech-webhook] rejected - body is not valid JSON despite a valid signature');
++    return res.status(400).json({ error: 'Invalid JSON body' });
++  }
++
++  const eventName = String(payload.event ?? payload.event_type ?? payload.type ?? '').toLowerCase();
++  const data: Record<string, any> = payload.data && typeof payload.data === 'object' ? payload.data : payload;
++  console.log('[ktech-webhook] received', { event: eventName || null, verifiedBy: `${verification.scheme} via ${verification.header}` });
++
++  // Dashboard "send test webhook" button.
++  if (payload.test === true || /(^|[._-])(test|ping)($|[._-])/.test(eventName)) {
++    return res.status(200).json({ ok: true, test: true });
++  }
++
++  const ticketId = data.ticket_id ?? data.ticketId ?? payload.ticket_id;
++  const status = normalizeKtechTicketStatus(data.status ?? payload.status);
++  if (typeof ticketId !== 'string' || !status) {
++    // Not a ticket outcome we know how to act on. Acknowledge so K-Tech doesn't retry forever.
++    console.warn('[ktech-webhook] acknowledged but not acted on', { event: eventName || null, hasTicketId: typeof ticketId === 'string', status: data.status ?? null });
++    return res.status(200).json({ ok: true, ignored: true });
++  }
++
++  try {
++    const response = data.response && typeof data.response === 'object' && !Array.isArray(data.response) ? data.response : null;
++    const result = await settleKtechTicket({ ticketId, status, response, raw: payload });
++    if (!result.handled) {
++      console.warn('[ktech-webhook] ticket not found on our side', { ticketId });
++      return res.status(200).json({ ok: true, ignored: true, reason: 'Unknown ticket' });
++    }
++    return res.status(200).json({ ok: true, status: result.status });
++  } catch (error) {
++    console.error('[ktech-webhook] failed to settle ticket', ticketId, error);
++    return res.status(500).json({ error: 'Webhook processing failed' });
++  }
++});
++
+ /**
+  * KatPay webhook. Mounted under the same express.raw() as /paystack above (see
+  * app.ts) — KatPay's X-Katpay-Signature, like Paystack's, is computed over the
+diff --git a/maria_backend/src/services/__tests__/wallet.service.test.ts b/maria_backend/src/services/__tests__/wallet.service.test.ts
+index efac816..62cf305 100644
+--- a/maria_backend/src/services/__tests__/wallet.service.test.ts
++++ b/maria_backend/src/services/__tests__/wallet.service.test.ts
+@@ -53,6 +53,7 @@ vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedV
+ 
+ const { prisma } = await import('../../lib/prisma.js');
+ const { debitWallet, refundWallet } = await import('../wallet.service.js');
++const { notifyUser } = await import('../notification.service.js');
+ 
+ let userCounter = 0;
+ async function seedUser(balanceNaira: number) {
+@@ -256,3 +257,82 @@ describe('debitWallet + refundWallet round trip', () => {
+     expect(await balanceOf(userId)).toBe(10_000);
+   });
+ });
++
++describe('refund ledger detail (balance before / after)', () => {
++  it('records the wallet balance before and after the refund on the REFUND row', async () => {
++    const userId = await seedUser(5000);
++    const debit = await debitWallet({
++      userId,
++      amount: 150,
++      type: TransactionType.NIN_VERIFICATION,
++      description: 'NIN slip (standard) by NIN'
++    });
++    // The debit row itself: 5000 -> 4850
++    expect(debit.transaction.balanceBeforeKobo).toBe(500000n);
++    expect(debit.transaction.balanceAfterKobo).toBe(485000n);
++
++    const refund = await refundWallet({ transactionId: debit.transaction.id, userId });
++
++    expect(refund.type).toBe('REFUND');
++    expect(refund.balanceBeforeKobo).toBe(485000n);
++    expect(refund.balanceAfterKobo).toBe(500000n);
++    expect(refund.balanceAfterKobo - refund.balanceBeforeKobo).toBe(refund.amountKobo);
++    expect(refund.relatedTransactionId).toBe(debit.transaction.id);
++  });
++
++  it('marks the original REVERSED without rewriting its own before/after', async () => {
++    const userId = await seedUser(5000);
++    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'x' });
++    await refundWallet({ transactionId: debit.transaction.id, userId });
++
++    const original = await prisma.transaction.findUniqueOrThrow({ where: { id: debit.transaction.id } });
++    expect(original.status).toBe('REVERSED');
++    expect(original.balanceBeforeKobo).toBe(500000n);
++    expect(original.balanceAfterKobo).toBe(485000n);
++  });
++
++  it('two consecutive failures each credit exactly once (the 621 -> 471 -> 621 scenario)', async () => {
++    const userId = await seedUser(621);
++    for (let i = 0; i < 2; i += 1) {
++      const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'NIN slip' });
++      expect(await balanceOf(userId)).toBe(471);
++      await refundWallet({ transactionId: debit.transaction.id, userId });
++      expect(await balanceOf(userId)).toBe(621);
++    }
++  });
++
++  it('refuses to refund a transaction that itself added money (refund of a refund, funding)', async () => {
++    const userId = await seedUser(5000);
++    const debit = await debitWallet({ userId, amount: 100, type: TransactionType.NIN_VERIFICATION, description: 'x' });
++    const refund = await refundWallet({ transactionId: debit.transaction.id, userId });
++
++    await expect(refundWallet({ transactionId: refund.id, userId })).rejects.toMatchObject({
++      statusCode: 422,
++      code: 'TRANSACTION_NOT_REVERSIBLE'
++    });
++    expect(await balanceOf(userId)).toBe(5000);
++  });
++
++  it('notification quotes the original description once, not "Refund for \"Refund for ...\""', async () => {
++    const userId = await seedUser(5000);
++    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'NIN slip (standard) by NIN' });
++    (notifyUser as unknown as { mockClear: () => void }).mockClear();
++
++    await refundWallet({ transactionId: debit.transaction.id, userId });
++
++    const call = (notifyUser as unknown as { mock: { calls: Array<[{ body: string }]> } }).mock.calls[0][0];
++    expect(call.body).toContain('for "NIN slip (standard) by NIN"');
++    expect(call.body).not.toContain('Refund for');
++    expect(call.body).toContain('New balance: NGN5,000.00');
++    expect(call.body).toContain('was NGN4,850.00');
++  });
++
++  it('a repeated refund does not send a second notification', async () => {
++    const userId = await seedUser(5000);
++    const debit = await debitWallet({ userId, amount: 150, type: TransactionType.NIN_VERIFICATION, description: 'x' });
++    (notifyUser as unknown as { mockClear: () => void }).mockClear();
++    await refundWallet({ transactionId: debit.transaction.id, userId });
++    await refundWallet({ transactionId: debit.transaction.id, userId });
++    expect((notifyUser as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1);
++  });
++});
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index 0d7632d..51dda61 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -537,7 +537,15 @@ async function checkAsyncServiceStatus(params: {
+     throw new ApiError(404, 'Unknown ticket_id', 'TICKET_NOT_FOUND');
+   }
+ 
+-  if (transaction.status === TransactionStatus.SUCCESS || transaction.status === TransactionStatus.FAILED) {
++  // REVERSED is a settled state too: it is exactly what a FAILED ticket becomes the
++  // moment refundWallet() has credited the customer. Leaving it out meant the next
++  // poll called the provider again, wrote `FAILED` back over `REVERSED`, and tried
++  // to refund a second time.
++  if (
++    transaction.status === TransactionStatus.SUCCESS ||
++    transaction.status === TransactionStatus.FAILED ||
++    transaction.status === TransactionStatus.REVERSED
++  ) {
+     const metadata = transaction.metadata as Record<string, unknown> | null;
+     const pii = openPII<{ response?: Record<string, unknown> | null }>(metadata?.pii);
+     return {
+@@ -549,8 +557,39 @@ async function checkAsyncServiceStatus(params: {
+ 
+   const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+   const result = await params.call(params.ticketId, provider);
++  return settleAsyncTransaction(transaction, result);
++}
++
++type AsyncOutcome = {
++  ticketId: string;
++  status: 'pending' | 'success' | 'failed';
++  response: Record<string, unknown> | null;
++  raw: unknown;
++};
++
++/**
++ * Applies a provider-reported outcome to a still-PENDING async transaction.
++ * Shared by the polling path (checkAsyncServiceStatus) and the K-Tech webhook
++ * (settleKtechTicket), so both settle - and refund - in exactly the same way.
++ *
++ * Only a PENDING row is ever settled. Anything else is returned as-is, which is
++ * what makes a redelivered webhook, or a webhook racing a poll, harmless.
++ */
++async function settleAsyncTransaction(
++  transaction: Prisma.TransactionGetPayload<Record<string, never>>,
++  result: AsyncOutcome
++): Promise<AsyncStatusResult> {
++  const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
+ 
++  if (transaction.status !== TransactionStatus.PENDING) {
++    // Already settled (redelivered webhook, or a webhook racing a poll) - nothing to do.
++    return {
++      ticketId: result.ticketId,
++      status: transaction.status === TransactionStatus.SUCCESS ? 'success' : 'failed',
++      response: null
++    };
++  }
+   if (result.status === 'pending') {
+     return { ticketId: result.ticketId, status: 'pending', response: null };
+   }
+@@ -585,7 +624,7 @@ async function checkAsyncServiceStatus(params: {
+     return { ticketId: result.ticketId, status: 'success', response: result.response };
+   }
+ 
+-  // 'failed' - Techhub auto-refunds their own balance per the docs; we mirror
++  // 'failed' - the provider auto-refunds its own balance per the docs; we mirror
+   // that on our side by refunding the user's MDL wallet the moment we learn
+   // the outcome (which may be well after the original submit, hence this
+   // living here rather than in submitAsyncService above).
+@@ -599,10 +638,31 @@ async function checkAsyncServiceStatus(params: {
+       } as Prisma.InputJsonValue
+     }
+   });
+-  await refundWallet({ transactionId: transaction.id, userId: params.userId });
++  await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
+   return { ticketId: result.ticketId, status: 'failed', response: result.response };
+ }
+ 
++/**
++ * Called by POST /api/webhooks/ktech when K-Tech pushes the final outcome of an
++ * async ticket (NIN validation / personalization / IPE clearance), so the
++ * customer is settled - and refunded on failure - without waiting for them to
++ * press "Check status". Returns `handled: false` for a ticket we don't know.
++ */
++export async function settleKtechTicket(params: {
++  ticketId: string;
++  status: 'pending' | 'success' | 'failed';
++  response: Record<string, unknown> | null;
++  raw: unknown;
++}) {
++  const transaction = await prisma.transaction.findFirst({
++    where: { providerRef: params.ticketId, provider: 'ktech' }
++  });
++  if (!transaction) return { handled: false as const };
++
++  const outcome = await settleAsyncTransaction(transaction, params);
++  return { handled: true as const, transactionId: transaction.id, status: outcome.status };
++}
++
+ export function submitDelinking(params: { userId: string; nin: string; email: string; idempotencyKey?: string }) {
+   return submitAsyncService({
+     userId: params.userId,
+diff --git a/maria_backend/src/services/wallet.service.ts b/maria_backend/src/services/wallet.service.ts
+index 1171b83..cde72f5 100644
+--- a/maria_backend/src/services/wallet.service.ts
++++ b/maria_backend/src/services/wallet.service.ts
+@@ -7,6 +7,7 @@ import { koboToNaira, nairaToKobo } from '../lib/money.js';
+ import { prisma } from '../lib/prisma.js';
+ import { clearLockout, isLocked, recordFailure } from '../lib/lockout.js';
+ import { notifyUser } from './notification.service.js';
++import { isCreditType } from '../lib/transaction-direction.js';
+ 
+ function formatNaira(kobo: bigint) {
+   return `NGN${koboToNaira(kobo).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+@@ -192,6 +193,11 @@ export async function debitWallet(params: {
+     }
+ 
+     const after = await tx.user.findUniqueOrThrow({ where: { id: params.userId } });
++    // The row is locked by our own conditional UPDATE above, so `after` is exactly
++    // "balance the moment we debited". Deriving "before" from it (instead of from
++    // the unlocked read at the top of this function) keeps before/after
++    // consistent even when another request touches the wallet at the same time.
++    const balanceBeforeKobo = after.walletBalanceKobo + amountKobo;
+ 
+     let transaction;
+     try {
+@@ -202,7 +208,7 @@ export async function debitWallet(params: {
+           type: params.type,
+           status: TransactionStatus.PENDING,
+           amountKobo,
+-          balanceBeforeKobo: before.walletBalanceKobo,
++          balanceBeforeKobo,
+           balanceAfterKobo: after.walletBalanceKobo,
+           reference,
+           idempotencyKey: params.idempotencyKey,
+@@ -662,10 +668,10 @@ export async function manualWalletAdjustment(params: {
+  * obvious from the original row alone that it was reversed, while the actual
+  * money movement gets its own accurate, chronologically-ordered entry.
+  *
+- * Safe to call more than once for the same transaction: if it's already
+- * REVERSED, returns the existing REFUND entry instead of creating another
+- * (checked both via the status flag and, as a belt-and-braces fallback, the
+- * REFUND reference's uniqueness constraint - see the P2002 catch below).
++ * Safe to call more than once - and safe to call concurrently - for the same
++ * transaction: the REVERSED status is claimed with an atomic conditional
++ * update BEFORE the wallet is credited, so only one caller ever credits; every
++ * other caller just gets the existing REFUND entry back.
+  */
+ export async function refundWallet(params: {
+   transactionId: string;
+@@ -679,59 +685,70 @@ export async function refundWallet(params: {
+     });
+     if (!original) throw new ApiError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
+ 
+-    if (original.status === TransactionStatus.REVERSED) {
+-      const existingRefund = await tx.transaction.findFirst({
++    const existingRefundOf = async () =>
++      (await tx.transaction.findFirst({
+         where: { relatedTransactionId: original.id, type: TransactionType.REFUND }
+-      });
+-      return { transaction: existingRefund ?? original, alreadyReversed: true };
++      })) ?? original;
++
++    if (original.status === TransactionStatus.REVERSED) {
++      return { transaction: await existingRefundOf(), originalDescription: original.description, alreadyReversed: true };
++    }
++
++    // Refunding something that itself ADDED money (a funding, a coupon, an
++    // earlier refund...) would credit the wallet a second time instead of
++    // undoing a charge.
++    if (isCreditType(original.type, original.metadata)) {
++      throw new ApiError(
++        422,
++        'This transaction added money to the wallet, so it cannot be refunded',
++        'TRANSACTION_NOT_REVERSIBLE'
++      );
++    }
++
++    // Claim the reversal BEFORE touching the balance. The conditional update is
++    // atomic, so if two refunds race (poll + admin click, double webhook...)
++    // exactly one of them gets count === 1 and credits the wallet; the other
++    // sees count === 0 and just returns the winner's REFUND row. This replaces
++    // the old "create, and catch P2002" fallback, which cannot work on
++    // Postgres: a unique violation aborts the whole interactive transaction.
++    const claimed = await tx.transaction.updateMany({
++      where: { id: original.id, userId: params.userId, status: { not: TransactionStatus.REVERSED } },
++      data: { status: TransactionStatus.REVERSED }
++    });
++    if (claimed.count === 0) {
++      return { transaction: await existingRefundOf(), originalDescription: original.description, alreadyReversed: true };
+     }
+ 
+-    const user = await tx.user.findUniqueOrThrow({ where: { id: params.userId } });
+     const updatedUser = await tx.user.update({
+       where: { id: params.userId },
+       data: { walletBalanceKobo: { increment: original.amountKobo } }
+     });
++    // Derived from the row our own UPDATE just locked, so before + amount === after
++    // always holds - even if some other request changes the wallet right after.
++    const balanceBeforeKobo = updatedUser.walletBalanceKobo - original.amountKobo;
+ 
+-    let refund;
+-    try {
+-      refund = await tx.transaction.create({
+-        data: {
+-          id: nanoid(),
+-          userId: params.userId,
+-          type: TransactionType.REFUND,
+-          status: TransactionStatus.SUCCESS,
+-          amountKobo: original.amountKobo,
+-          balanceBeforeKobo: user.walletBalanceKobo,
+-          balanceAfterKobo: updatedUser.walletBalanceKobo,
+-          reference: `RFND-${original.reference}`,
+-          relatedTransactionId: original.id,
+-          description: params.reason
+-            ? `Refund: ${params.reason} (was: "${original.description}")`
+-            : `Refund for "${original.description}"`,
+-          metadata: {
+-            originalTransactionId: original.id,
+-            initiatedByAdminId: params.initiatedByAdminId ?? null
+-          }
++    const refund = await tx.transaction.create({
++      data: {
++        id: nanoid(),
++        userId: params.userId,
++        type: TransactionType.REFUND,
++        status: TransactionStatus.SUCCESS,
++        amountKobo: original.amountKobo,
++        balanceBeforeKobo,
++        balanceAfterKobo: updatedUser.walletBalanceKobo,
++        reference: `RFND-${original.reference}`,
++        relatedTransactionId: original.id,
++        description: params.reason
++          ? `Refund: ${params.reason} (was: "${original.description}")`
++          : `Refund for "${original.description}"`,
++        metadata: {
++          originalTransactionId: original.id,
++          initiatedByAdminId: params.initiatedByAdminId ?? null
+         }
+-      });
+-    } catch (error) {
+-      // Two concurrent refund attempts both passed the REVERSED check above
+-      // before either committed - the unique `reference` constraint on
+-      // `RFND-${original.reference}` catches the duplicate here. Whichever
+-      // request loses the race gets back the winner's row instead of erroring.
+-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+-        refund = await tx.transaction.findUniqueOrThrow({ where: { reference: `RFND-${original.reference}` } });
+-      } else {
+-        throw error;
+       }
+-    }
+-
+-    await tx.transaction.update({
+-      where: { id: original.id },
+-      data: { status: TransactionStatus.REVERSED }
+     });
+ 
+-    return { transaction: refund, alreadyReversed: false };
++    return { transaction: refund, originalDescription: original.description, alreadyReversed: false };
+   });
+ 
+   if (!result.alreadyReversed) {
+@@ -739,7 +756,10 @@ export async function refundWallet(params: {
+       userId: params.userId,
+       type: 'WALLET',
+       title: 'Transaction reversed',
+-      body: `${formatNaira(result.transaction.amountKobo)} was refunded to your wallet for "${result.transaction.description}". New balance: ${formatNaira(result.transaction.balanceAfterKobo)}.`,
++      // Uses the ORIGINAL description. The refund row's own description already
++      // starts with "Refund for ...", which made this read
++      // `refunded ... for "Refund for "NIN slip..""`.
++      body: `${formatNaira(result.transaction.amountKobo)} was refunded to your wallet for "${result.originalDescription}". New balance: ${formatNaira(result.transaction.balanceAfterKobo)} (was ${formatNaira(result.transaction.balanceBeforeKobo)}).`,
+       data: { transactionId: result.transaction.id }
+     });
+   }
+diff --git a/maria_backend/src/test-utils/fake-prisma.ts b/maria_backend/src/test-utils/fake-prisma.ts
+index 970a758..90e0221 100644
+--- a/maria_backend/src/test-utils/fake-prisma.ts
++++ b/maria_backend/src/test-utils/fake-prisma.ts
+@@ -78,7 +78,8 @@ function applyUpdate(record: Record<string, unknown>, data: Record<string, unkno
+ function matchesWhere(record: Record<string, unknown>, where: WhereClause): boolean {
+   return Object.entries(where).every(([key, expected]) => {
+     if (expected !== null && typeof expected === 'object' && !Array.isArray(expected) && !(expected instanceof Date)) {
+-      const op = expected as { gte?: unknown; lte?: unknown; in?: unknown[]; equals?: unknown; contains?: unknown };
++      const op = expected as { gte?: unknown; lte?: unknown; in?: unknown[]; equals?: unknown; contains?: unknown; not?: unknown };
++      if ('not' in op) return record[key] !== op.not;
+       if ('in' in op) return (op.in as unknown[]).includes(record[key]);
+       if ('gte' in op || 'lte' in op) {
+         const value = record[key] as bigint | number | Date;
+diff --git a/web/src/index.css b/web/src/index.css
+index b4dfcc0..55db2db 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -95,6 +95,17 @@ select:focus-visible, textarea:focus-visible {
+   box-shadow: inset 0 1px 0 rgba(255, 237, 169, .18), 0 8px 20px rgba(54, 31, 0, .22);
+ }
+ 
++/* Explicit navy card for pages that set every text color themselves (see
++   WalletSummaryPage.tsx). Unlike the legacy `bg-parchment` recolor below, it
++   does NOT force descendants to white, so status pills and green/red amounts
++   keep their own readable colors. */
++.surface-navy {
++  background-color: #0b2f73;
++  background-image: linear-gradient(145deg, #0b2f73 0%, #0d438d 58%, #071d4d 100%);
++  border: 1px solid rgba(96, 165, 250, .5);
++  color: #f8fbff;
++}
++
+ /* ── Royal-blue premium recolor for legacy pages ─────────────────────
+    Several older pages (Dashboard, Buy Airtime/Data, Fund Wallet, Receipts,
+    Referral, Result Checkers, the original all-in-one VerificationPage,
+@@ -115,7 +126,6 @@ select:focus-visible, textarea:focus-visible {
+    pages should opt in with `bg-cream`/`bg-parchment`, never `bg-white`. */
+ main .bg-cream,
+ main .bg-parchment,
+-main .border-parchment-line,
+ main [class~="bg-cream"],
+ main [class~="bg-parchment"] {
+   background-color: #0b2f73 !important;
+@@ -123,6 +133,11 @@ main [class~="bg-parchment"] {
+   border-color: rgba(96, 165, 250, .5) !important;
+   color: #f8fbff !important;
+ }
++/* `.border-parchment-line` used to sit in the list above, so ANY element that merely
++   had that border class - including bg-white cards such as the receipt - was painted
++   navy while keeping its dark text (dark-on-navy, unreadable). A border class must
++   only recolor the border. */
++main .border-parchment-line { border-color: rgba(96, 165, 250, .5) !important; }
+ main .bg-cream *, main .bg-parchment * { color: #f8fbff; }
+ main .bg-cream h1, main .bg-cream h2, main .bg-cream h3,
+ main .bg-parchment h1, main .bg-parchment h2, main .bg-parchment h3 { color: #ffffff !important; }
+@@ -242,3 +257,31 @@ main [class*="bg-\\#0b2f73"] h1, main [class*="bg-\\#0b2f73"] h2, main [class*="
+ .verification-blue-page .bg-gold-500 { background: #d9ad2b !important; color: #071a40 !important; }
+ .verification-blue-page .text-gold-700 { color: #f6d568 !important; }
+ .verification-blue-page .border-parchment-line { border-color: #6f9bd8 !important; }
++
++
++/* ── Light surfaces inside legacy navy cards keep dark, readable text ─────
++   The legacy recolor above sets `color: #f8fbff` on EVERY descendant of a
++   `.bg-parchment` / `.bg-cream` card. That is right for text sitting on the
++   navy, but any pastel chip or light box nested inside (status badges such as
++   bg-emerald-100, success/error notices such as bg-emerald-50, white message
++   bubbles) then got white text on a near-white background - invisible.
++   These rules re-darken text on those light surfaces (and everything in them),
++   then give the common status hues back their own contrast-safe colors.
++   Specificity is intentionally higher than the blanket rule. */
++main .bg-parchment :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100),
++main .bg-parchment :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100) *,
++main .bg-cream :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100),
++main .bg-cream :is(.bg-white, .bg-emerald-50, .bg-emerald-100, .bg-amber-50, .bg-amber-100, .bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100, .bg-slate-50, .bg-slate-100, .bg-slate-200, .bg-blue-50, .bg-blue-100) * {
++  color: #0f172a !important;
++}
++main :is(.bg-parchment, .bg-cream) :is(.bg-emerald-50, .bg-emerald-100) :is(.text-emerald-600, .text-emerald-700, .text-emerald-800) { color: #065f46 !important; }
++main :is(.bg-parchment, .bg-cream) :is(.bg-amber-50, .bg-amber-100) :is(.text-amber-600, .text-amber-700, .text-amber-800) { color: #78350f !important; }
++main :is(.bg-parchment, .bg-cream) :is(.bg-rose-50, .bg-rose-100, .bg-red-50, .bg-red-100) :is(.text-rose-600, .text-rose-700, .text-red-600, .text-red-700) { color: #881337 !important; }
++main :is(.bg-parchment, .bg-cream) :is(.bg-slate-100, .bg-slate-200) :is(.text-slate-500, .text-slate-600, .text-slate-700) { color: #1e293b !important; }
++
++/* Pale gold surfaces (selected tabs/amount chips on FundWalletPage, the OPEN ticket
++   chip on SupportPage) get the same treatment as the pastel chips above: dark
++   text on the light fill instead of the blanket white. */
++main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200),
++main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200) * { color: #422006 !important; }
++main :is(.bg-parchment, .bg-cream) :is(.bg-gold-50, .bg-gold-100, .bg-gold-200):is(.text-gold-700, .text-gold-600) { color: #713f12 !important; }
+diff --git a/web/src/pages/ReceiptPage.tsx b/web/src/pages/ReceiptPage.tsx
+index ef6ac76..3e55004 100644
+--- a/web/src/pages/ReceiptPage.tsx
++++ b/web/src/pages/ReceiptPage.tsx
+@@ -33,7 +33,13 @@ type Transaction = {
+   type: string;
+   status: string;
+   amount: number;
++  /** 'credit' = money added to the wallet (funding, refund, coupon...), 'debit' = money taken out. Decided by the server. */
++  direction: 'credit' | 'debit';
++  balance_before: number;
+   balance_after: number;
++  /** false for rows that never touched the wallet, e.g. a funding attempt that is still pending. */
++  balance_changed: boolean;
++  related_transaction_id: string | null;
+   description: string;
+   created_at: string;
+   metadata: Record<string, unknown> | null;
+@@ -60,6 +66,14 @@ const TYPE_META: Record<string, { label: string; icon: typeof Wallet }> = {
+   bvn_verification: { label: 'BVN Verification', icon: Fingerprint },
+   identity_service_request: { label: 'Identity Service', icon: ShieldCheck },
+   nin_modification: { label: 'NIN Modification', icon: IdCard },
++  refund: { label: 'Refund', icon: RotateCcw },
++  wallet_funding_fee: { label: 'Wallet Funding Fee', icon: Wallet },
++  bvn_license_onboarding: { label: 'BVN Licence Onboarding', icon: Fingerprint },
++  cac_service_request: { label: 'CAC Service', icon: ShieldCheck },
++  bvn_modification: { label: 'BVN Modification', icon: Fingerprint },
++  birth_attestation: { label: 'Birth Attestation', icon: ReceiptText },
++  newspaper_publication: { label: 'Newspaper Publication', icon: ReceiptText },
++  bvn_crm: { label: 'BVN CRM', icon: Fingerprint },
+ };
+ 
+ const STATUS_META: Record<string, { label: string; icon: typeof CheckCircle2; className: string }> = {
+@@ -69,11 +83,6 @@ const STATUS_META: Record<string, { label: string; icon: typeof CheckCircle2; cl
+   reversed: { label: 'Reversed', icon: RotateCcw, className: 'text-slate-600 bg-slate-100 border-slate-200' },
+ };
+ 
+-// Credits add to the balance, debits subtract - this decides the "+"/"-"
+-// prefix and green/ink amount color. Matches the schema comment in
+-// wallet.service.ts on which transaction types move money which direction.
+-const CREDIT_TYPES = new Set(['wallet_funding', 'referral_commission', 'coupon_redemption', 'manual_adjustment']);
+-
+ function money(amount: number) {
+   return `₦${amount.toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+ }
+@@ -127,7 +136,7 @@ export default function ReceiptPage() {
+   const statusMeta = STATUS_META[tx.status] ?? STATUS_META.pending;
+   const TypeIcon = typeMeta.icon;
+   const StatusIcon = statusMeta.icon;
+-  const isCredit = CREDIT_TYPES.has(tx.type);
++  const isCredit = tx.direction === 'credit';
+   const createdAt = new Date(tx.created_at);
+ 
+   return (
+@@ -137,7 +146,7 @@ export default function ReceiptPage() {
+         major-data-link-production.up.railway.app/receipt/{tx.id}
+       </p>
+ 
+-      <div className="receipt-card overflow-hidden rounded-2xl border border-parchment-line bg-white shadow-xl print:border-0 print:shadow-none">
++      <div className="receipt-card overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl print:border-0 print:shadow-none">
+         {/* Ink header band */}
+         <div className="bg-ink px-6 py-6 text-center sm:px-10 sm:py-8">
+           <Logo dark className="justify-center" />
+@@ -147,7 +156,7 @@ export default function ReceiptPage() {
+         </div>
+ 
+         {/* Status + amount hero */}
+-        <div className="border-b border-dashed border-parchment-line px-6 py-8 text-center sm:px-10">
++        <div className="border-b border-dashed border-slate-200 px-6 py-8 text-center sm:px-10">
+           <div
+             className={`mx-auto flex h-14 w-14 items-center justify-center rounded-full border ${statusMeta.className}`}
+           >
+@@ -168,6 +177,12 @@ export default function ReceiptPage() {
+           </p>
+         </div>
+ 
++        {tx.status === 'reversed' && (
++          <p className="border-b border-dashed border-slate-200 bg-amber-50 px-6 py-3 text-center font-body text-xs font-semibold text-amber-900 sm:px-10">
++            This charge was reversed. The amount was returned to your wallet as a separate Refund entry.
++          </p>
++        )}
++
+         {/* Details table */}
+         <div className="space-y-0 px-6 py-6 sm:px-10">
+           <ReceiptRow label="Description" value={tx.description} />
+@@ -189,11 +204,28 @@ export default function ReceiptPage() {
+             label="Date & time"
+             value={createdAt.toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}
+           />
+-          <ReceiptRow label="Wallet balance after" value={money(tx.balance_after)} last />
++          {tx.related_transaction_id && (
++            <ReceiptRow
++              label={tx.type === 'refund' ? 'Refund for' : 'Related to'}
++              value={
++                <Link to={`/receipt/${tx.related_transaction_id}`} className="font-semibold text-brand-700 underline">
++                  View original transaction
++                </Link>
++              }
++            />
++          )}
++          {tx.balance_changed ? (
++            <>
++              <ReceiptRow label="Wallet balance before" value={money(tx.balance_before)} />
++              <ReceiptRow label="Wallet balance after" value={money(tx.balance_after)} last />
++            </>
++          ) : (
++            <ReceiptRow label="Wallet balance" value="No change - nothing was taken from or added to your wallet" last />
++          )}
+         </div>
+ 
+         {/* Footer */}
+-        <div className="border-t border-parchment-line bg-parchment/50 px-6 py-5 text-center sm:px-10">
++        <div className="border-t border-slate-200 bg-slate-50 px-6 py-5 text-center sm:px-10">
+           <p className="font-body text-xs leading-relaxed text-ink-600">
+             This is an automatically generated receipt from MARIA Digital Solutions. Keep it for your
+             records — quote the reference above if you ever need support with this transaction.
+@@ -211,7 +243,7 @@ export default function ReceiptPage() {
+         </button>
+         <Link
+           to="/dashboard"
+-          className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-ink-line py-3 font-body text-sm font-semibold text-ink transition hover:bg-parchment"
++          className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-ink-line py-3 font-body text-sm font-semibold text-ink transition hover:bg-slate-100"
+         >
+           <ChevronLeft size={16} /> Back to dashboard
+         </Link>
+@@ -222,7 +254,7 @@ export default function ReceiptPage() {
+ 
+ function ReceiptRow({ label, value, last = false }: { label: string; value: React.ReactNode; last?: boolean }) {
+   return (
+-    <div className={`flex items-start justify-between gap-4 py-3 ${last ? '' : 'border-b border-parchment-line/70'}`}>
++    <div className={`flex items-start justify-between gap-4 py-3 ${last ? '' : 'border-b border-slate-200'}`}>
+       <span className="font-body text-xs font-medium uppercase tracking-wide text-ink-600/70">{label}</span>
+       <span className="text-right font-body text-sm font-semibold text-ink">{value}</span>
+     </div>
+@@ -236,7 +268,7 @@ function ReceiptRow({ label, value, last = false }: { label: string; value: Reac
+ function ReceiptShell({ children }: { children: React.ReactNode }) {
+   return (
+     <div className="min-h-screen bg-[#f5f7fb] print:bg-white">
+-      <header className="border-b border-parchment-line bg-white px-5 py-4 print:hidden">
++      <header className="border-b border-slate-200 bg-white px-5 py-4 print:hidden">
+         <div className="mx-auto flex max-w-lg items-center justify-between">
+           <Link to="/dashboard" className="flex items-center gap-1.5 font-body text-sm font-semibold text-ink-600 hover:text-ink">
+             <ChevronLeft size={16} /> Dashboard
+diff --git a/web/src/pages/WalletSummaryPage.tsx b/web/src/pages/WalletSummaryPage.tsx
+index 87f2db8..125682f 100644
+--- a/web/src/pages/WalletSummaryPage.tsx
++++ b/web/src/pages/WalletSummaryPage.tsx
+@@ -1,6 +1,6 @@
+-import { useEffect, useState } from 'react';
++import { useCallback, useEffect, useState } from 'react';
+ import { Link } from 'react-router-dom';
+-import { ArrowDownCircle, ArrowUpCircle, Landmark, Loader2, Plus, Wallet, WalletCards } from 'lucide-react';
++import { ArrowDownCircle, ArrowUpCircle, Landmark, Loader2, Plus, RotateCcw, Wallet, WalletCards } from 'lucide-react';
+ import AppShell from '../components/AppShell';
+ import { api } from '../lib/api';
+ 
+@@ -17,23 +17,40 @@ type Transaction = {
+   reference: string;
+   type: string;
+   status: string;
++  /** Decided by the server: 'credit' adds money to the wallet (funding, refund, coupon...), 'debit' takes it out. */
++  direction: 'credit' | 'debit';
+   amount: number;
++  balance_before: number;
+   balance_after: number;
++  /** false when the row never touched the wallet (e.g. a funding attempt still pending). */
++  balance_changed: boolean;
+   description: string;
+   created_at: string;
+ };
+ 
+-const CREDIT_TYPES = new Set(['wallet_funding', 'referral_commission', 'coupon_redemption', 'manual_adjustment']);
++type Summary = { total_funded: number; total_spent: number; total_refunded: number };
+ 
++// This page deliberately does NOT use the legacy `bg-parchment` / `bg-cream`
++// classes. index.css force-recolors everything inside those to white text
++// (`main .bg-parchment * { color: #f8fbff }`), which turned every status badge
++// into white-on-pastel and made it unreadable. Here every surface and every
++// text color is explicit, so what you read in the code is what renders.
+ const STATUS_CLASS: Record<string, string> = {
+-  success: 'bg-emerald-100 text-emerald-700',
+-  pending: 'bg-amber-100 text-amber-700',
+-  failed: 'bg-rose-100 text-rose-700',
+-  reversed: 'bg-slate-200 text-slate-600',
++  success: 'bg-emerald-100 text-emerald-900',
++  pending: 'bg-amber-100 text-amber-900',
++  failed: 'bg-rose-100 text-rose-900',
++  reversed: 'bg-slate-200 text-slate-900',
++};
++
++const STATUS_LABEL: Record<string, string> = {
++  success: 'Success',
++  pending: 'Pending',
++  failed: 'Failed',
++  reversed: 'Reversed',
+ };
+ 
+ function money(amount: number) {
+-  return `₦${amount.toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
++  return `₦${amount.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+ }
+ 
+ function friendlyType(type: string) {
+@@ -46,32 +63,60 @@ function friendlyType(type: string) {
+ export default function WalletSummaryPage() {
+   const [balance, setBalance] = useState<Balance | null>(null);
+   const [transactions, setTransactions] = useState<Transaction[]>([]);
++  const [summary, setSummary] = useState<Summary | null>(null);
+   const [loading, setLoading] = useState(true);
+   const [error, setError] = useState('');
+ 
+-  useEffect(() => {
+-    Promise.all([
++  const load = useCallback(() => {
++    return Promise.all([
+       api.get<Balance>('/wallet/balance'),
+       api.get<{ status: boolean; data: Transaction[] }>('/transactions'),
++      // Totals are computed by the server over the whole history. If that endpoint
++      // is unavailable the page still works and falls back to the loaded rows.
++      api.get<{ status: boolean; data: Summary }>('/transactions/summary').catch(() => null),
+     ])
+-      .then(([b, tx]) => {
++      .then(([b, tx, sum]) => {
+         setBalance(b);
+         setTransactions(tx.data ?? []);
++        setSummary(sum?.data ?? null);
++        setError('');
+       })
+-      .catch((e) => setError(e instanceof Error ? e.message : 'Unable to load your wallet summary.'))
+-      .finally(() => setLoading(false));
++      .catch((e) => setError(e instanceof Error ? e.message : 'Unable to load your wallet summary.'));
+   }, []);
+ 
+-  const totalFunded = transactions.filter((t) => t.type === 'wallet_funding' && t.status === 'success').reduce((sum, t) => sum + t.amount, 0);
+-  const totalSpent = transactions.filter((t) => !CREDIT_TYPES.has(t.type) && t.status === 'success').reduce((sum, t) => sum + t.amount, 0);
++  useEffect(() => {
++    load().finally(() => setLoading(false));
++    // Balance can change while this tab sits in the background (a refund landing,
++    // a webhook crediting a deposit) - refresh when the user comes back to it so
++    // the page never shows a stale balance next to a fresh notification.
++    const onVisible = () => {
++      if (document.visibilityState === 'visible') void load();
++    };
++    document.addEventListener('visibilitychange', onVisible);
++    return () => document.removeEventListener('visibilitychange', onVisible);
++  }, [load]);
++
++  const fallbackFunded = transactions
++    .filter((t) => t.type === 'wallet_funding' && t.status === 'success')
++    .reduce((sum, t) => sum + t.amount, 0);
++  const fallbackSpent = transactions
++    .filter((t) => t.direction === 'debit' && t.status === 'success')
++    .reduce((sum, t) => sum + t.amount, 0);
++  const fallbackRefunded = transactions
++    .filter((t) => t.type === 'refund' && t.status === 'success')
++    .reduce((sum, t) => sum + t.amount, 0);
++
++  const totalFunded = summary?.total_funded ?? fallbackFunded;
++  const totalSpent = summary?.total_spent ?? fallbackSpent;
++  const totalRefunded = summary?.total_refunded ?? fallbackRefunded;
+ 
+   return (
+     <AppShell>
+       <div className="max-w-3xl">
+-        <header className="rounded-2xl border border-gold-500/40 bg-ink p-6 text-cream shadow-xl">
++        <header className="surface-navy rounded-2xl p-6 shadow-xl">
+           <p className="text-sm font-semibold text-gold-300">Account resources</p>
+-          <h1 className="mt-1 text-3xl font-bold">Wallet Summary</h1>
+-          <p className="mt-2 text-sm text-cream/70">Your balance, funding, spend and full transaction history in one place.</p>
++          <h1 className="mt-1 text-3xl font-bold text-white">Wallet Summary</h1>
++          <p className="mt-2 text-sm text-blue-100">Your balance, funding, spend and full transaction history in one place.</p>
+         </header>
+ 
+         {loading ? (
+@@ -79,75 +124,94 @@ export default function WalletSummaryPage() {
+             <Loader2 className="animate-spin text-gold-500" />
+           </div>
+         ) : error ? (
+-          <p className="mt-6 rounded-xl bg-ember-500/10 p-4 text-sm text-ember-600">{error}</p>
++          <p className="mt-6 rounded-xl bg-rose-100 p-4 text-sm font-medium text-rose-900">{error}</p>
+         ) : (
+           <>
+             <section className="mt-6 grid gap-3 sm:grid-cols-3">
+-              <div className="rounded-2xl border border-parchment-line bg-parchment p-4">
+-                <div className="flex items-center gap-2 text-ink-600"><Wallet size={15} /><p className="text-xs">Current balance</p></div>
+-                <p className="mt-1 font-display text-xl font-bold text-ink">{money(balance?.balance ?? 0)}</p>
++              <div className="surface-navy rounded-2xl p-4">
++                <div className="flex items-center gap-2 text-blue-100"><Wallet size={15} /><p className="text-xs">Current balance</p></div>
++                <p className="mt-1 font-display text-xl font-bold text-white">{money(balance?.balance ?? 0)}</p>
+               </div>
+-              <div className="rounded-2xl border border-parchment-line bg-parchment p-4">
+-                <div className="flex items-center gap-2 text-ink-600"><ArrowDownCircle size={15} /><p className="text-xs">Total funded</p></div>
+-                <p className="mt-1 font-display text-xl font-bold text-emerald-600">{money(totalFunded)}</p>
++              <div className="surface-navy rounded-2xl p-4">
++                <div className="flex items-center gap-2 text-blue-100"><ArrowDownCircle size={15} /><p className="text-xs">Total funded</p></div>
++                <p className="mt-1 font-display text-xl font-bold text-emerald-300">{money(totalFunded)}</p>
+               </div>
+-              <div className="rounded-2xl border border-parchment-line bg-parchment p-4">
+-                <div className="flex items-center gap-2 text-ink-600"><ArrowUpCircle size={15} /><p className="text-xs">Total spent</p></div>
+-                <p className="mt-1 font-display text-xl font-bold text-ink">{money(totalSpent)}</p>
++              <div className="surface-navy rounded-2xl p-4">
++                <div className="flex items-center gap-2 text-blue-100"><ArrowUpCircle size={15} /><p className="text-xs">Total spent</p></div>
++                <p className="mt-1 font-display text-xl font-bold text-white">{money(totalSpent)}</p>
++                {totalRefunded > 0 && (
++                  <p className="mt-1 text-[11px] text-blue-100">Refunds returned to you: {money(totalRefunded)}</p>
++                )}
+               </div>
+             </section>
+ 
+-            {balance?.virtual_account_number && (
+-              <section className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-parchment-line bg-parchment p-4">
+-                <div className="flex items-center gap-3">
+-                  <Landmark className="text-gold-600" size={20} />
++            <section className="mt-4 flex flex-wrap items-center justify-between gap-3">
++              {balance?.virtual_account_number ? (
++                <div className="surface-navy flex flex-1 items-center gap-3 rounded-2xl p-4">
++                  <Landmark className="text-gold-300" size={20} />
+                   <div>
+-                    <p className="text-xs text-ink-600">Your virtual funding account</p>
+-                    <p className="font-display font-bold text-ink">{balance.virtual_account_number} · {balance.virtual_account_bank}</p>
++                    <p className="text-xs text-blue-100">Your virtual funding account</p>
++                    <p className="font-display font-bold text-white">{balance.virtual_account_number} · {balance.virtual_account_bank}</p>
+                   </div>
+                 </div>
+-                <Link to="/fund-wallet" className="flex items-center gap-2 rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-ink hover:bg-gold-400">
+-                  <Plus size={15} /> Fund wallet
+-                </Link>
+-              </section>
+-            )}
+-            {!balance?.virtual_account_number && (
+-              <section className="mt-4 flex justify-end">
+-                <Link to="/fund-wallet" className="flex items-center gap-2 rounded-lg bg-gold-500 px-4 py-2 text-sm font-bold text-ink hover:bg-gold-400">
+-                  <Plus size={15} /> Fund wallet
+-                </Link>
+-              </section>
+-            )}
++              ) : (
++                <span />
++              )}
++              <Link to="/fund-wallet" className="flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 text-sm font-bold text-white hover:bg-brand-700">
++                <Plus size={15} /> Fund wallet
++              </Link>
++            </section>
+ 
+             <section className="mt-6">
+-              <h2 className="font-display font-bold text-ink">Recent transactions</h2>
++              <h2 className="font-display font-bold text-slate-900">Recent transactions</h2>
+               {!transactions.length ? (
+-                <div className="mt-3 rounded-2xl border border-parchment-line bg-parchment p-10 text-center text-ink-600">
+-                  <WalletCards className="mx-auto mb-3 text-gold-400" />
++                <div className="surface-navy mt-3 rounded-2xl p-10 text-center text-blue-100">
++                  <WalletCards className="mx-auto mb-3 text-gold-300" />
+                   <p>No wallet activity yet.</p>
+                 </div>
+               ) : (
+                 <div className="mt-3 space-y-2">
+                   {transactions.map((t) => {
+-                    const isCredit = CREDIT_TYPES.has(t.type);
++                    const isCredit = t.direction === 'credit';
++                    const isRefund = t.type === 'refund';
+                     return (
+                       <Link
+                         key={t.id}
+                         to={`/receipt/${t.id}`}
+-                        className="flex items-center justify-between gap-4 rounded-xl border border-parchment-line bg-parchment px-4 py-3 hover:border-gold-400"
++                        className="surface-navy block rounded-xl px-4 py-3 hover:border-gold-400"
+                       >
+-                        <div className="min-w-0">
+-                          <p className="truncate text-sm font-semibold text-ink">{t.description || friendlyType(t.type)}</p>
+-                          <p className="mt-0.5 text-xs text-ink-600">{new Date(t.created_at).toLocaleString()}</p>
++                        <div className="flex items-start justify-between gap-4">
++                          <div className="min-w-0">
++                            <p className="flex items-center gap-1.5 text-sm font-semibold text-white">
++                              {isRefund && <RotateCcw size={13} className="shrink-0 text-emerald-300" aria-hidden />}
++                              <span className="truncate">{t.description || friendlyType(t.type)}</span>
++                            </p>
++                            <p className="mt-0.5 text-xs text-blue-100">{new Date(t.created_at).toLocaleString()}</p>
++                          </div>
++                          <div className="shrink-0 text-right">
++                            <p className={`font-display text-sm font-bold ${isCredit ? 'text-emerald-300' : 'text-white'}`}>
++                              {isCredit ? '+' : '-'}
++                              {money(t.amount)}
++                            </p>
++                            <span className={`mt-0.5 inline-block rounded-full px-2 py-0.5 text-[11px] font-bold ${STATUS_CLASS[t.status] ?? 'bg-slate-200 text-slate-900'}`}>
++                              {STATUS_LABEL[t.status] ?? friendlyType(t.status)}
++                            </span>
++                          </div>
+                         </div>
+-                        <div className="shrink-0 text-right">
+-                          <p className={`font-display text-sm font-bold ${isCredit ? 'text-emerald-600' : 'text-ink'}`}>
+-                            {isCredit ? '+' : '-'}
+-                            {money(t.amount)}
+-                          </p>
+-                          <span className={`mt-0.5 inline-block rounded-full px-2 py-0.5 text-[10px] font-bold capitalize ${STATUS_CLASS[t.status] ?? 'bg-slate-200 text-slate-600'}`}>
+-                            {t.status}
+-                          </span>
++
++                        <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1 border-t border-blue-300/30 pt-2 text-xs">
++                          {t.balance_changed ? (
++                            <>
++                              <p className="text-blue-100">
++                                Balance before: <span className="font-semibold text-white">{money(t.balance_before)}</span>
++                              </p>
++                              <p className="text-blue-100">
++                                Balance after: <span className="font-semibold text-white">{money(t.balance_after)}</span>
++                              </p>
++                            </>
++                          ) : (
++                            <p className="text-blue-100">No change to your wallet balance</p>
++                          )}
+                         </div>
+                       </Link>
+                     );
+-- 
+2.43.0
+

@@ -33,7 +33,13 @@ type Transaction = {
   type: string;
   status: string;
   amount: number;
+  /** 'credit' = money added to the wallet (funding, refund, coupon...), 'debit' = money taken out. Decided by the server. */
+  direction: 'credit' | 'debit';
+  balance_before: number;
   balance_after: number;
+  /** false for rows that never touched the wallet, e.g. a funding attempt that is still pending. */
+  balance_changed: boolean;
+  related_transaction_id: string | null;
   description: string;
   created_at: string;
   metadata: Record<string, unknown> | null;
@@ -60,6 +66,14 @@ const TYPE_META: Record<string, { label: string; icon: typeof Wallet }> = {
   bvn_verification: { label: 'BVN Verification', icon: Fingerprint },
   identity_service_request: { label: 'Identity Service', icon: ShieldCheck },
   nin_modification: { label: 'NIN Modification', icon: IdCard },
+  refund: { label: 'Refund', icon: RotateCcw },
+  wallet_funding_fee: { label: 'Wallet Funding Fee', icon: Wallet },
+  bvn_license_onboarding: { label: 'BVN Licence Onboarding', icon: Fingerprint },
+  cac_service_request: { label: 'CAC Service', icon: ShieldCheck },
+  bvn_modification: { label: 'BVN Modification', icon: Fingerprint },
+  birth_attestation: { label: 'Birth Attestation', icon: ReceiptText },
+  newspaper_publication: { label: 'Newspaper Publication', icon: ReceiptText },
+  bvn_crm: { label: 'BVN CRM', icon: Fingerprint },
 };
 
 const STATUS_META: Record<string, { label: string; icon: typeof CheckCircle2; className: string }> = {
@@ -68,11 +82,6 @@ const STATUS_META: Record<string, { label: string; icon: typeof CheckCircle2; cl
   failed: { label: 'Failed', icon: XCircle, className: 'text-rose-600 bg-rose-50 border-rose-200' },
   reversed: { label: 'Reversed', icon: RotateCcw, className: 'text-slate-600 bg-slate-100 border-slate-200' },
 };
-
-// Credits add to the balance, debits subtract - this decides the "+"/"-"
-// prefix and green/ink amount color. Matches the schema comment in
-// wallet.service.ts on which transaction types move money which direction.
-const CREDIT_TYPES = new Set(['wallet_funding', 'referral_commission', 'coupon_redemption', 'manual_adjustment']);
 
 function money(amount: number) {
   return `₦${amount.toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
@@ -127,7 +136,7 @@ export default function ReceiptPage() {
   const statusMeta = STATUS_META[tx.status] ?? STATUS_META.pending;
   const TypeIcon = typeMeta.icon;
   const StatusIcon = statusMeta.icon;
-  const isCredit = CREDIT_TYPES.has(tx.type);
+  const isCredit = tx.direction === 'credit';
   const createdAt = new Date(tx.created_at);
 
   return (
@@ -137,7 +146,7 @@ export default function ReceiptPage() {
         major-data-link-production.up.railway.app/receipt/{tx.id}
       </p>
 
-      <div className="receipt-card overflow-hidden rounded-2xl border border-parchment-line bg-white shadow-xl print:border-0 print:shadow-none">
+      <div className="receipt-card overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl print:border-0 print:shadow-none">
         {/* Ink header band */}
         <div className="bg-ink px-6 py-6 text-center sm:px-10 sm:py-8">
           <Logo dark className="justify-center" />
@@ -147,7 +156,7 @@ export default function ReceiptPage() {
         </div>
 
         {/* Status + amount hero */}
-        <div className="border-b border-dashed border-parchment-line px-6 py-8 text-center sm:px-10">
+        <div className="border-b border-dashed border-slate-200 px-6 py-8 text-center sm:px-10">
           <div
             className={`mx-auto flex h-14 w-14 items-center justify-center rounded-full border ${statusMeta.className}`}
           >
@@ -167,6 +176,12 @@ export default function ReceiptPage() {
             {typeMeta.label}
           </p>
         </div>
+
+        {tx.status === 'reversed' && (
+          <p className="border-b border-dashed border-slate-200 bg-amber-50 px-6 py-3 text-center font-body text-xs font-semibold text-amber-900 sm:px-10">
+            This charge was reversed. The amount was returned to your wallet as a separate Refund entry.
+          </p>
+        )}
 
         {/* Details table */}
         <div className="space-y-0 px-6 py-6 sm:px-10">
@@ -189,11 +204,28 @@ export default function ReceiptPage() {
             label="Date & time"
             value={createdAt.toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}
           />
-          <ReceiptRow label="Wallet balance after" value={money(tx.balance_after)} last />
+          {tx.related_transaction_id && (
+            <ReceiptRow
+              label={tx.type === 'refund' ? 'Refund for' : 'Related to'}
+              value={
+                <Link to={`/receipt/${tx.related_transaction_id}`} className="font-semibold text-brand-700 underline">
+                  View original transaction
+                </Link>
+              }
+            />
+          )}
+          {tx.balance_changed ? (
+            <>
+              <ReceiptRow label="Wallet balance before" value={money(tx.balance_before)} />
+              <ReceiptRow label="Wallet balance after" value={money(tx.balance_after)} last />
+            </>
+          ) : (
+            <ReceiptRow label="Wallet balance" value="No change - nothing was taken from or added to your wallet" last />
+          )}
         </div>
 
         {/* Footer */}
-        <div className="border-t border-parchment-line bg-parchment/50 px-6 py-5 text-center sm:px-10">
+        <div className="border-t border-slate-200 bg-slate-50 px-6 py-5 text-center sm:px-10">
           <p className="font-body text-xs leading-relaxed text-ink-600">
             This is an automatically generated receipt from MARIA Digital Solutions. Keep it for your
             records — quote the reference above if you ever need support with this transaction.
@@ -211,7 +243,7 @@ export default function ReceiptPage() {
         </button>
         <Link
           to="/dashboard"
-          className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-ink-line py-3 font-body text-sm font-semibold text-ink transition hover:bg-parchment"
+          className="flex flex-1 items-center justify-center gap-2 rounded-xl border border-ink-line py-3 font-body text-sm font-semibold text-ink transition hover:bg-slate-100"
         >
           <ChevronLeft size={16} /> Back to dashboard
         </Link>
@@ -222,7 +254,7 @@ export default function ReceiptPage() {
 
 function ReceiptRow({ label, value, last = false }: { label: string; value: React.ReactNode; last?: boolean }) {
   return (
-    <div className={`flex items-start justify-between gap-4 py-3 ${last ? '' : 'border-b border-parchment-line/70'}`}>
+    <div className={`flex items-start justify-between gap-4 py-3 ${last ? '' : 'border-b border-slate-200'}`}>
       <span className="font-body text-xs font-medium uppercase tracking-wide text-ink-600/70">{label}</span>
       <span className="text-right font-body text-sm font-semibold text-ink">{value}</span>
     </div>
@@ -236,7 +268,7 @@ function ReceiptRow({ label, value, last = false }: { label: string; value: Reac
 function ReceiptShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-screen bg-[#f5f7fb] print:bg-white">
-      <header className="border-b border-parchment-line bg-white px-5 py-4 print:hidden">
+      <header className="border-b border-slate-200 bg-white px-5 py-4 print:hidden">
         <div className="mx-auto flex max-w-lg items-center justify-between">
           <Link to="/dashboard" className="flex items-center gap-1.5 font-body text-sm font-semibold text-ink-600 hover:text-ink">
             <ChevronLeft size={16} /> Dashboard

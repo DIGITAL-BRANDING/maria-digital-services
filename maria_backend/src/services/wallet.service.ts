@@ -7,6 +7,7 @@ import { koboToNaira, nairaToKobo } from '../lib/money.js';
 import { prisma } from '../lib/prisma.js';
 import { clearLockout, isLocked, recordFailure } from '../lib/lockout.js';
 import { notifyUser } from './notification.service.js';
+import { isCreditType } from '../lib/transaction-direction.js';
 
 function formatNaira(kobo: bigint) {
   return `NGN${koboToNaira(kobo).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -192,6 +193,11 @@ export async function debitWallet(params: {
     }
 
     const after = await tx.user.findUniqueOrThrow({ where: { id: params.userId } });
+    // The row is locked by our own conditional UPDATE above, so `after` is exactly
+    // "balance the moment we debited". Deriving "before" from it (instead of from
+    // the unlocked read at the top of this function) keeps before/after
+    // consistent even when another request touches the wallet at the same time.
+    const balanceBeforeKobo = after.walletBalanceKobo + amountKobo;
 
     let transaction;
     try {
@@ -202,7 +208,7 @@ export async function debitWallet(params: {
           type: params.type,
           status: TransactionStatus.PENDING,
           amountKobo,
-          balanceBeforeKobo: before.walletBalanceKobo,
+          balanceBeforeKobo,
           balanceAfterKobo: after.walletBalanceKobo,
           reference,
           idempotencyKey: params.idempotencyKey,
@@ -662,10 +668,10 @@ export async function manualWalletAdjustment(params: {
  * obvious from the original row alone that it was reversed, while the actual
  * money movement gets its own accurate, chronologically-ordered entry.
  *
- * Safe to call more than once for the same transaction: if it's already
- * REVERSED, returns the existing REFUND entry instead of creating another
- * (checked both via the status flag and, as a belt-and-braces fallback, the
- * REFUND reference's uniqueness constraint - see the P2002 catch below).
+ * Safe to call more than once - and safe to call concurrently - for the same
+ * transaction: the REVERSED status is claimed with an atomic conditional
+ * update BEFORE the wallet is credited, so only one caller ever credits; every
+ * other caller just gets the existing REFUND entry back.
  */
 export async function refundWallet(params: {
   transactionId: string;
@@ -679,59 +685,70 @@ export async function refundWallet(params: {
     });
     if (!original) throw new ApiError(404, 'Transaction not found', 'TRANSACTION_NOT_FOUND');
 
-    if (original.status === TransactionStatus.REVERSED) {
-      const existingRefund = await tx.transaction.findFirst({
+    const existingRefundOf = async () =>
+      (await tx.transaction.findFirst({
         where: { relatedTransactionId: original.id, type: TransactionType.REFUND }
-      });
-      return { transaction: existingRefund ?? original, alreadyReversed: true };
+      })) ?? original;
+
+    if (original.status === TransactionStatus.REVERSED) {
+      return { transaction: await existingRefundOf(), originalDescription: original.description, alreadyReversed: true };
     }
 
-    const user = await tx.user.findUniqueOrThrow({ where: { id: params.userId } });
+    // Refunding something that itself ADDED money (a funding, a coupon, an
+    // earlier refund...) would credit the wallet a second time instead of
+    // undoing a charge.
+    if (isCreditType(original.type, original.metadata)) {
+      throw new ApiError(
+        422,
+        'This transaction added money to the wallet, so it cannot be refunded',
+        'TRANSACTION_NOT_REVERSIBLE'
+      );
+    }
+
+    // Claim the reversal BEFORE touching the balance. The conditional update is
+    // atomic, so if two refunds race (poll + admin click, double webhook...)
+    // exactly one of them gets count === 1 and credits the wallet; the other
+    // sees count === 0 and just returns the winner's REFUND row. This replaces
+    // the old "create, and catch P2002" fallback, which cannot work on
+    // Postgres: a unique violation aborts the whole interactive transaction.
+    const claimed = await tx.transaction.updateMany({
+      where: { id: original.id, userId: params.userId, status: { not: TransactionStatus.REVERSED } },
+      data: { status: TransactionStatus.REVERSED }
+    });
+    if (claimed.count === 0) {
+      return { transaction: await existingRefundOf(), originalDescription: original.description, alreadyReversed: true };
+    }
+
     const updatedUser = await tx.user.update({
       where: { id: params.userId },
       data: { walletBalanceKobo: { increment: original.amountKobo } }
     });
+    // Derived from the row our own UPDATE just locked, so before + amount === after
+    // always holds - even if some other request changes the wallet right after.
+    const balanceBeforeKobo = updatedUser.walletBalanceKobo - original.amountKobo;
 
-    let refund;
-    try {
-      refund = await tx.transaction.create({
-        data: {
-          id: nanoid(),
-          userId: params.userId,
-          type: TransactionType.REFUND,
-          status: TransactionStatus.SUCCESS,
-          amountKobo: original.amountKobo,
-          balanceBeforeKobo: user.walletBalanceKobo,
-          balanceAfterKobo: updatedUser.walletBalanceKobo,
-          reference: `RFND-${original.reference}`,
-          relatedTransactionId: original.id,
-          description: params.reason
-            ? `Refund: ${params.reason} (was: "${original.description}")`
-            : `Refund for "${original.description}"`,
-          metadata: {
-            originalTransactionId: original.id,
-            initiatedByAdminId: params.initiatedByAdminId ?? null
-          }
+    const refund = await tx.transaction.create({
+      data: {
+        id: nanoid(),
+        userId: params.userId,
+        type: TransactionType.REFUND,
+        status: TransactionStatus.SUCCESS,
+        amountKobo: original.amountKobo,
+        balanceBeforeKobo,
+        balanceAfterKobo: updatedUser.walletBalanceKobo,
+        reference: `RFND-${original.reference}`,
+        relatedTransactionId: original.id,
+        description: params.reason
+          ? `Refund: ${params.reason} (was: "${original.description}")`
+          : `Refund for "${original.description}"`,
+        metadata: {
+          originalTransactionId: original.id,
+          initiatedByAdminId: params.initiatedByAdminId ?? null
         }
-      });
-    } catch (error) {
-      // Two concurrent refund attempts both passed the REVERSED check above
-      // before either committed - the unique `reference` constraint on
-      // `RFND-${original.reference}` catches the duplicate here. Whichever
-      // request loses the race gets back the winner's row instead of erroring.
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
-        refund = await tx.transaction.findUniqueOrThrow({ where: { reference: `RFND-${original.reference}` } });
-      } else {
-        throw error;
       }
-    }
-
-    await tx.transaction.update({
-      where: { id: original.id },
-      data: { status: TransactionStatus.REVERSED }
     });
 
-    return { transaction: refund, alreadyReversed: false };
+    return { transaction: refund, originalDescription: original.description, alreadyReversed: false };
   });
 
   if (!result.alreadyReversed) {
@@ -739,7 +756,10 @@ export async function refundWallet(params: {
       userId: params.userId,
       type: 'WALLET',
       title: 'Transaction reversed',
-      body: `${formatNaira(result.transaction.amountKobo)} was refunded to your wallet for "${result.transaction.description}". New balance: ${formatNaira(result.transaction.balanceAfterKobo)}.`,
+      // Uses the ORIGINAL description. The refund row's own description already
+      // starts with "Refund for ...", which made this read
+      // `refunded ... for "Refund for "NIN slip..""`.
+      body: `${formatNaira(result.transaction.amountKobo)} was refunded to your wallet for "${result.originalDescription}". New balance: ${formatNaira(result.transaction.balanceAfterKobo)} (was ${formatNaira(result.transaction.balanceBeforeKobo)}).`,
       data: { transactionId: result.transaction.id }
     });
   }

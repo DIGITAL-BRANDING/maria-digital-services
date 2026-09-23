@@ -537,7 +537,15 @@ async function checkAsyncServiceStatus(params: {
     throw new ApiError(404, 'Unknown ticket_id', 'TICKET_NOT_FOUND');
   }
 
-  if (transaction.status === TransactionStatus.SUCCESS || transaction.status === TransactionStatus.FAILED) {
+  // REVERSED is a settled state too: it is exactly what a FAILED ticket becomes the
+  // moment refundWallet() has credited the customer. Leaving it out meant the next
+  // poll called the provider again, wrote `FAILED` back over `REVERSED`, and tried
+  // to refund a second time.
+  if (
+    transaction.status === TransactionStatus.SUCCESS ||
+    transaction.status === TransactionStatus.FAILED ||
+    transaction.status === TransactionStatus.REVERSED
+  ) {
     const metadata = transaction.metadata as Record<string, unknown> | null;
     const pii = openPII<{ response?: Record<string, unknown> | null }>(metadata?.pii);
     return {
@@ -549,8 +557,39 @@ async function checkAsyncServiceStatus(params: {
 
   const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
   const result = await params.call(params.ticketId, provider);
+  return settleAsyncTransaction(transaction, result);
+}
+
+type AsyncOutcome = {
+  ticketId: string;
+  status: 'pending' | 'success' | 'failed';
+  response: Record<string, unknown> | null;
+  raw: unknown;
+};
+
+/**
+ * Applies a provider-reported outcome to a still-PENDING async transaction.
+ * Shared by the polling path (checkAsyncServiceStatus) and the K-Tech webhook
+ * (settleKtechTicket), so both settle - and refund - in exactly the same way.
+ *
+ * Only a PENDING row is ever settled. Anything else is returned as-is, which is
+ * what makes a redelivered webhook, or a webhook racing a poll, harmless.
+ */
+async function settleAsyncTransaction(
+  transaction: Prisma.TransactionGetPayload<Record<string, never>>,
+  result: AsyncOutcome
+): Promise<AsyncStatusResult> {
+  const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
 
+  if (transaction.status !== TransactionStatus.PENDING) {
+    // Already settled (redelivered webhook, or a webhook racing a poll) - nothing to do.
+    return {
+      ticketId: result.ticketId,
+      status: transaction.status === TransactionStatus.SUCCESS ? 'success' : 'failed',
+      response: null
+    };
+  }
   if (result.status === 'pending') {
     return { ticketId: result.ticketId, status: 'pending', response: null };
   }
@@ -585,7 +624,7 @@ async function checkAsyncServiceStatus(params: {
     return { ticketId: result.ticketId, status: 'success', response: result.response };
   }
 
-  // 'failed' - Techhub auto-refunds their own balance per the docs; we mirror
+  // 'failed' - the provider auto-refunds its own balance per the docs; we mirror
   // that on our side by refunding the user's MDL wallet the moment we learn
   // the outcome (which may be well after the original submit, hence this
   // living here rather than in submitAsyncService above).
@@ -599,8 +638,29 @@ async function checkAsyncServiceStatus(params: {
       } as Prisma.InputJsonValue
     }
   });
-  await refundWallet({ transactionId: transaction.id, userId: params.userId });
+  await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
+}
+
+/**
+ * Called by POST /api/webhooks/ktech when K-Tech pushes the final outcome of an
+ * async ticket (NIN validation / personalization / IPE clearance), so the
+ * customer is settled - and refunded on failure - without waiting for them to
+ * press "Check status". Returns `handled: false` for a ticket we don't know.
+ */
+export async function settleKtechTicket(params: {
+  ticketId: string;
+  status: 'pending' | 'success' | 'failed';
+  response: Record<string, unknown> | null;
+  raw: unknown;
+}) {
+  const transaction = await prisma.transaction.findFirst({
+    where: { providerRef: params.ticketId, provider: 'ktech' }
+  });
+  if (!transaction) return { handled: false as const };
+
+  const outcome = await settleAsyncTransaction(transaction, params);
+  return { handled: true as const, transactionId: transaction.id, status: outcome.status };
 }
 
 export function submitDelinking(params: { userId: string; nin: string; email: string; idempotencyKey?: string }) {

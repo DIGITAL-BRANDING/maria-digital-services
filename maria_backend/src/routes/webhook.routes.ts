@@ -11,6 +11,8 @@ import {
 import { paystackService } from '../services/paystack.service.js';
 import { katpayService } from '../services/katpay.service.js';
 import { advanceSession } from '../services/whatsapp-session.service.js';
+import { settleKtechTicket } from '../services/verification.service.js';
+import { verifyPartnerWebhook } from '../lib/webhook-signature.js';
 
 function normalizeKatpayStatus(value: unknown): string | undefined {
   if (typeof value === 'string' || typeof value === 'number') return String(value).trim().toUpperCase();
@@ -137,6 +139,118 @@ webhookRoutes.post('/paystack', async (req, res) => {
 
   // Paystack expects a fast 200 regardless of whether we acted on the event type.
   res.sendStatus(200);
+});
+
+/**
+ * Maps K-Tech's ticket status vocabulary onto ours. Anything unrecognised is
+ * `undefined` (NOT treated as failed) so an unfamiliar status can never trigger
+ * a refund for a request that may still be in progress.
+ */
+export function normalizeKtechTicketStatus(value: unknown): 'pending' | 'success' | 'failed' | undefined {
+  if (typeof value !== 'string') return undefined;
+  const status = value.trim().toLowerCase();
+  if (['success', 'successful', 'completed', 'complete', 'done', 'approved'].includes(status)) return 'success';
+  if (['failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'].includes(status)) {
+    return 'failed';
+  }
+  if (['pending', 'processing', 'in_progress', 'queued', 'submitted'].includes(status)) return 'pending';
+  return undefined;
+}
+
+// Public, non-sensitive readiness check for the K-Tech partner dashboard
+// (same idea as GET /katpay above): open this URL in a browser to confirm the
+// route exists on the deployed backend and that KTECH_WEBHOOK_SECRET is loaded.
+webhookRoutes.get('/ktech', (_req, res) => {
+  res.json({
+    status: true,
+    webhook: 'ktech',
+    ready: Boolean(env.KTECH_WEBHOOK_SECRET),
+    message: env.KTECH_WEBHOOK_SECRET
+      ? 'POST signed K-Tech events to this path'
+      : 'KTECH_WEBHOOK_SECRET is not set on the server - deliveries will be rejected with 503'
+  });
+});
+
+/**
+ * K-Tech webhook receiver (POST /api/webhooks/ktech).
+ *
+ * This route did not exist before, so every delivery K-Tech attempted hit the
+ * app's 404/SPA fallback - which is why its dashboard kept saying "Webhook
+ * test was not delivered yet (status: pending, attempt: 1). Check the callback
+ * route and webhook secret."
+ *
+ * Mounted under express.raw() (see app.ts) so the signature is checked against
+ * the exact bytes K-Tech sent. Responses are chosen so K-Tech's retry logic does
+ * the right thing:
+ *   - 200: accepted (including tests, and events we deliberately don't act on)
+ *   - 401: signature/secret did not match  -> fix the secret, do not retry blindly
+ *   - 503: KTECH_WEBHOOK_SECRET missing on OUR side -> retry later
+ *   - 500: we failed while processing a valid event -> K-Tech should retry
+ */
+webhookRoutes.post('/ktech', async (req, res) => {
+  const secret = env.KTECH_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error('[ktech-webhook] rejected - KTECH_WEBHOOK_SECRET is not configured on this server');
+    return res.status(503).json({ error: 'Webhook secret not configured' });
+  }
+
+  const rawBody = req.body as Buffer;
+  if (!Buffer.isBuffer(rawBody)) {
+    console.error('[ktech-webhook] rejected - body was not captured as a raw Buffer', {
+      bodyType: typeof rawBody,
+      contentType: req.header('content-type') ?? null
+    });
+    return res.status(400).json({ error: 'Could not read request body' });
+  }
+
+  const verification = verifyPartnerWebhook({ secret, rawBody, headers: req.headers });
+  if (!verification.valid) {
+    // Header NAMES only - never values, the secret, or the body.
+    console.error('[ktech-webhook] rejected - signature check failed', {
+      reason: verification.reason,
+      headersSeen: verification.headersSeen,
+      bodyByteLength: rawBody.length
+    });
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  let payload: Record<string, any>;
+  try {
+    payload = JSON.parse(rawBody.toString('utf8') || '{}');
+  } catch {
+    console.error('[ktech-webhook] rejected - body is not valid JSON despite a valid signature');
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  const eventName = String(payload.event ?? payload.event_type ?? payload.type ?? '').toLowerCase();
+  const data: Record<string, any> = payload.data && typeof payload.data === 'object' ? payload.data : payload;
+  console.log('[ktech-webhook] received', { event: eventName || null, verifiedBy: `${verification.scheme} via ${verification.header}` });
+
+  // Dashboard "send test webhook" button.
+  if (payload.test === true || /(^|[._-])(test|ping)($|[._-])/.test(eventName)) {
+    return res.status(200).json({ ok: true, test: true });
+  }
+
+  const ticketId = data.ticket_id ?? data.ticketId ?? payload.ticket_id;
+  const status = normalizeKtechTicketStatus(data.status ?? payload.status);
+  if (typeof ticketId !== 'string' || !status) {
+    // Not a ticket outcome we know how to act on. Acknowledge so K-Tech doesn't retry forever.
+    console.warn('[ktech-webhook] acknowledged but not acted on', { event: eventName || null, hasTicketId: typeof ticketId === 'string', status: data.status ?? null });
+    return res.status(200).json({ ok: true, ignored: true });
+  }
+
+  try {
+    const response = data.response && typeof data.response === 'object' && !Array.isArray(data.response) ? data.response : null;
+    const result = await settleKtechTicket({ ticketId, status, response, raw: payload });
+    if (!result.handled) {
+      console.warn('[ktech-webhook] ticket not found on our side', { ticketId });
+      return res.status(200).json({ ok: true, ignored: true, reason: 'Unknown ticket' });
+    }
+    return res.status(200).json({ ok: true, status: result.status });
+  } catch (error) {
+    console.error('[ktech-webhook] failed to settle ticket', ticketId, error);
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
 });
 
 /**
