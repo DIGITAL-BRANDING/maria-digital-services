@@ -72,6 +72,23 @@ async function recordKtechBalance(rawBalance: unknown) {
  * KTECH_BASE_URL env var if the real API lives on a different host.
  */
 
+
+/**
+ * Provider error text is written for the integrator, not the customer: e.g.
+ * "Missing required parameters: api_key and/or nin" is what K-Tech returned for
+ * a NIN-by-phone request, and it was shown verbatim in the customer's browser.
+ * Anything that talks about keys/credentials/parameters/auth is replaced with a
+ * neutral message; the raw text is still logged and kept in `raw` for support.
+ */
+const INTERNAL_PROVIDER_MESSAGE = /api[\s_-]?key|missing required|required parameter|unauthori[sz]ed|forbidden|invalid (key|token|credentials)|authenticat|x-api|idempotency/i;
+export const PROVIDER_UNAVAILABLE_MESSAGE =
+  'The verification service could not process this request right now. You have not been charged - please try again shortly.';
+
+export function userSafeProviderMessage(message: string | undefined, fallback: string): string {
+  if (!message) return fallback;
+  return INTERNAL_PROVIDER_MESSAGE.test(message) ? PROVIDER_UNAVAILABLE_MESSAGE : message;
+}
+
 type KtechResponse = {
   status?: boolean;
   message?: string;
@@ -174,10 +191,12 @@ export class KtechService {
     const data = (await response.json().catch(() => ({}))) as KtechResponse;
 
     if (!response.ok || data.status !== true) {
-      console.error(`[ktech] slip lookup failed (path=${path}, http=${response.status}):`, JSON.stringify(data));
+      // `sentFields` = the NAMES of the body fields we sent (never values, they are personal data).
+      // When K-Tech complains about a missing parameter this shows at a glance whether we sent it.
+      console.error(`[ktech] slip lookup failed (path=${path}, http=${response.status}, sentFields=${Object.keys(body).join(',')}):`, JSON.stringify(data));
       return {
         ok: false,
-        message: data.message ?? `Verification provider returned HTTP ${response.status}`,
+        message: userSafeProviderMessage(data.message, `Verification provider returned HTTP ${response.status}`),
         raw: data
       };
     }
@@ -240,7 +259,7 @@ export class KtechService {
     const ticketId = typeof data.data?.ticket_id === 'string' ? data.data.ticket_id : undefined;
     if (!response.ok || data.status !== true || !ticketId) {
       console.error(`[ktech] async submit failed (path=${path}, http=${response.status}):`, JSON.stringify(data));
-      return { ok: false, message: data.message ?? `Verification provider returned HTTP ${response.status}`, raw: data };
+      return { ok: false, message: userSafeProviderMessage(data.message, `Verification provider returned HTTP ${response.status}`), raw: data };
     }
 
     return { ok: true, ticketId, message: data.message ?? 'Request submitted successfully', raw: data };
