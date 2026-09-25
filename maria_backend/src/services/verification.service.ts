@@ -4,6 +4,7 @@ import { mergeSealedPII, openPII, sealPII } from '../lib/pii.js';
 import { prisma } from '../lib/prisma.js';
 import { ApiError } from '../middleware/error.js';
 import { debitWallet, refundWallet } from './wallet.service.js';
+import { notifyUser } from './notification.service.js';
 import { recordProviderDebit } from './provider-ledger.service.js';
 import {
   techhubService,
@@ -624,10 +625,21 @@ async function settleAsyncTransaction(
     return { ticketId: result.ticketId, status: 'success', response: result.response };
   }
 
-  // 'failed' - the provider auto-refunds its own balance per the docs; we mirror
-  // that on our side by refunding the user's MDL wallet the moment we learn
-  // the outcome (which may be well after the original submit, hence this
-  // living here rather than in submitAsyncService above).
+  // 'failed' - for most async services the provider auto-refunds its own
+  // balance per the docs, and we mirror that by refunding the user's MDL
+  // wallet the moment we learn the outcome (which may be well after the
+  // original submit, hence this living here rather than in submitAsyncService
+  // above). IPE Clearance is the documented exception: K-Tech's own IPE page
+  // states in bold "IPE IS NOT REFUNDABLE" - NIMC does the lookup and is paid
+  // for it regardless of the result, so K-Tech does not refund its balance for
+  // a failed ticket, and refunding the customer here would mean MDL eats that
+  // cost every time. This only affects a ticket that was actually submitted
+  // and later resolves to 'failed'; a request that never got a ticket_id in
+  // the first place is still refunded in submitAsyncService above, since
+  // nothing was actually processed in that case.
+  const service = (existingMetadata as { service?: VerificationServiceKey }).service;
+  const refundable = service !== 'IPE_CLEARANCE';
+
   await prisma.transaction.update({
     where: { id: transaction.id },
     data: {
@@ -638,7 +650,18 @@ async function settleAsyncTransaction(
       } as Prisma.InputJsonValue
     }
   });
-  await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
+
+  if (refundable) {
+    await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
+  } else {
+    await notifyUser({
+      userId: transaction.userId,
+      type: 'WALLET',
+      title: 'IPE Clearance was not successful',
+      body: `Your IPE Clearance request (₦${koboToNaira(transaction.amountKobo).toLocaleString('en-NG', { minimumFractionDigits: 2 })}) could not be completed. This service is non-refundable once submitted, so the charge stands - please double-check the Tracking ID before submitting again.`,
+      data: { transactionId: transaction.id }
+    });
+  }
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
 }
 
@@ -753,21 +776,21 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
   });
 }
 
+// IPE Clearance is pinned to K-Tech, unlike the other identity services above
+// which follow the admin's Data/Airtime-style `identityVerificationProvider`
+// toggle. K-Tech's own IPE Clearance page (k-tech.com.ng/ipe) is the reference
+// this flow was built against, and is the one actually being used in
+// production - it is not switched by the general NIN/BVN provider setting.
 export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return activeIdentityVerificationProvider().then((provider) =>
-    submitAsyncService({
-      userId: params.userId, service: 'IPE_CLEARANCE', provider,
-      description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
-      idempotencyKey: params.idempotencyKey,
-      call: (reference) => provider === 'ktech'
-        ? ktechService.submitIpeClearance(params.trackingId, reference)
-        : techhubService.submitIpeClearance(params.trackingId)
-    })
-  );
+  return submitAsyncService({
+    userId: params.userId, service: 'IPE_CLEARANCE', provider: 'ktech',
+    description: 'IPE clearance request', operational: { provider: 'ktech' }, pii: { tracking_id: params.trackingId },
+    idempotencyKey: params.idempotencyKey,
+    call: (reference) => ktechService.submitIpeClearance(params.trackingId, reference)
+  });
 }
 export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
-  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
-    provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
+  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id) => ktechService.checkIpeClearance(id) });
 }
 
 export type ServiceTicketEntry = {

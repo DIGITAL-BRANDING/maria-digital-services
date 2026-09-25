@@ -1,0 +1,301 @@
+From 428b3d0c8cbcb40275befa2aed2b07f73abdb994 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 25 Sep 2026 10:37:14 +0000
+Subject: [PATCH] IPE Clearance: pin to K-Tech, no refund on a submitted ticket
+ that fails, restore original tile layout + add K-Tech's non-refundable
+ warning
+
+- verification.service.ts: submitIpeClearance/checkIpeClearanceStatus always use ktechService,
+  no longer follow the shared identityVerificationProvider admin toggle
+- settleAsyncTransaction: skip refundWallet for IPE_CLEARANCE on a failed ticket (K-Tech's own
+  IPE page states this is non-refundable once submitted); notify the user instead. A submit that
+  never got a ticket_id is unaffected and still refunds (nothing was processed in that case)
+- web: IpeClearancePage keeps its original Service Type / Slip Type / Tracking ID layout;
+  added a warning box with K-Tech's exact wording (non-refundable, 10-30min status, 24hr completion)
+- tests: 4 new (218 total)
+---
+ .../services/__tests__/ipe-clearance.test.ts  | 147 ++++++++++++++++++
+ .../src/services/verification.service.ts      |  57 +++++--
+ .../pages/verification/IpeClearancePage.tsx   |  15 +-
+ 3 files changed, 201 insertions(+), 18 deletions(-)
+ create mode 100644 maria_backend/src/services/__tests__/ipe-clearance.test.ts
+
+diff --git a/maria_backend/src/services/__tests__/ipe-clearance.test.ts b/maria_backend/src/services/__tests__/ipe-clearance.test.ts
+new file mode 100644
+index 0000000..b07c546
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/ipe-clearance.test.ts
+@@ -0,0 +1,147 @@
++import { describe, expect, it, vi } from 'vitest';
++
++/**
++ * Same mocking approach as wallet.service.test.ts: an in-memory fake Prisma
++ * (see test-utils/fake-prisma.ts) plus an echo-Proxy for the enums, because
++ * this sandbox's generated Prisma client is a stub missing real enum exports.
++ */
++vi.mock('@prisma/client', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('@prisma/client')>();
++  const echoEnum = new Proxy({}, { get: (_target, prop) => prop });
++  class PrismaClientKnownRequestError extends Error {
++    code: string;
++    constructor(message: string, opts: { code: string }) {
++      super(message);
++      this.code = opts.code;
++    }
++  }
++  return {
++    ...actual,
++    TransactionStatus: echoEnum,
++    TransactionType: echoEnum,
++    Prisma: { ...((actual as Record<string, unknown>).Prisma as Record<string, unknown>), PrismaClientKnownRequestError }
++  };
++});
++
++vi.mock('../../lib/prisma.js', async () => {
++  const { createFakePrisma } = await import('../../test-utils/fake-prisma.js');
++  const fake = createFakePrisma();
++  return { prisma: fake.api };
++});
++
++vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedValue(undefined) }));
++vi.mock('../provider-ledger.service.js', () => ({ recordProviderDebit: vi.fn().mockResolvedValue(undefined) }));
++
++const submitIpeClearanceMock = vi.fn();
++const checkIpeClearanceMock = vi.fn();
++// If IPE Clearance ever fell back to reading the admin's shared
++// identityVerificationProvider toggle, this mock throwing makes that
++// regression fail loudly instead of silently passing techhub calls through.
++vi.mock('../ktech.service.js', () => ({
++  ktechService: { submitIpeClearance: submitIpeClearanceMock, checkIpeClearance: checkIpeClearanceMock }
++}));
++vi.mock('../techhub.service.js', () => ({
++  techhubService: {
++    submitIpeClearance: vi.fn(() => {
++      throw new Error('IPE Clearance must not call Techhub - it is pinned to K-Tech');
++    }),
++    checkIpeClearance: vi.fn(() => {
++      throw new Error('IPE Clearance must not call Techhub - it is pinned to K-Tech');
++    })
++  }
++}));
++vi.mock('../pricing-settings.service.js', () => ({
++  activeIdentityVerificationProvider: vi.fn(() => {
++    throw new Error('IPE Clearance must not consult the shared NIN/BVN provider toggle');
++  })
++}));
++
++const { prisma } = await import('../../lib/prisma.js');
++const { notifyUser } = await import('../notification.service.js');
++const { submitIpeClearance, checkIpeClearanceStatus } = await import('../verification.service.js');
++
++let userCounter = 0;
++async function seedUser(balanceNaira: number) {
++  userCounter += 1;
++  const id = `ipe-user-${userCounter}`;
++  await prisma.user.create({
++    data: {
++      id,
++      walletBalanceKobo: BigInt(Math.round(balanceNaira * 100)),
++      fullName: `Test User ${userCounter}`,
++      email: `ipe-user-${userCounter}@example.test`,
++      phone: `+23481111${String(userCounter).padStart(4, '0')}`,
++      referralCode: `IPEREF${userCounter}`
++    }
++  });
++  return id;
++}
++
++async function balanceOf(userId: string) {
++  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
++  return Number(user.walletBalanceKobo) / 100;
++}
++
++describe('IPE Clearance', () => {
++  it('always submits through K-Tech, regardless of the admin NIN/BVN provider setting', async () => {
++    submitIpeClearanceMock.mockResolvedValue({ ok: true, ticketId: 'TICKET-1', message: 'submitted', raw: {} });
++    const userId = await seedUser(2000);
++
++    const result = await submitIpeClearance({ userId, trackingId: 'ABC123456789012' });
++
++    expect(submitIpeClearanceMock).toHaveBeenCalledWith('ABC123456789012', result.reference);
++    expect(result.ticketId).toBe('TICKET-1');
++  });
++
++  it('does NOT refund the wallet when a submitted ticket later resolves to failed (IPE is non-refundable)', async () => {
++    submitIpeClearanceMock.mockResolvedValue({ ok: true, ticketId: 'TICKET-2', message: 'submitted', raw: {} });
++    const userId = await seedUser(2000);
++    const { balanceAfter } = await submitIpeClearance({ userId, trackingId: 'BAD00000000001' });
++    expect(await balanceOf(userId)).toBe(balanceAfter);
++
++    checkIpeClearanceMock.mockResolvedValue({
++      ticketId: 'TICKET-2',
++      status: 'failed',
++      response: { reason: 'Tracking ID not found' },
++      raw: {}
++    });
++    (notifyUser as ReturnType<typeof vi.fn>).mockClear();
++
++    const status = await checkIpeClearanceStatus({ userId, ticketId: 'TICKET-2' });
++
++    expect(status.status).toBe('failed');
++    // Balance stays exactly where it was right after the debit - no refund happened.
++    expect(await balanceOf(userId)).toBe(balanceAfter);
++    expect(notifyUser).toHaveBeenCalledTimes(1);
++    const call = (notifyUser as ReturnType<typeof vi.fn>).mock.calls[0][0] as { body: string; title: string };
++    expect(call.title).toBe('IPE Clearance was not successful');
++    expect(call.body).toContain('non-refundable');
++  });
++
++  it('still refunds when the submit itself fails (no ticket was ever created, so nothing was processed)', async () => {
++    submitIpeClearanceMock.mockResolvedValue({ ok: false, message: 'Provider unreachable', raw: {} });
++    const userId = await seedUser(2000);
++    const startingBalance = await balanceOf(userId);
++
++    await expect(submitIpeClearance({ userId, trackingId: 'ABC123456789012' })).rejects.toMatchObject({
++      code: 'IDENTITY_PROVIDER_SUBMIT_FAILED'
++    });
++
++    expect(await balanceOf(userId)).toBe(startingBalance);
++  });
++
++  it('a repeated failed-status check does not send a second non-refundable notice', async () => {
++    submitIpeClearanceMock.mockResolvedValue({ ok: true, ticketId: 'TICKET-3', message: 'submitted', raw: {} });
++    const userId = await seedUser(2000);
++    await submitIpeClearance({ userId, trackingId: 'ABC123456789099' });
++
++    checkIpeClearanceMock.mockResolvedValue({ ticketId: 'TICKET-3', status: 'failed', response: null, raw: {} });
++    await checkIpeClearanceStatus({ userId, ticketId: 'TICKET-3' });
++    (notifyUser as ReturnType<typeof vi.fn>).mockClear();
++
++    const second = await checkIpeClearanceStatus({ userId, ticketId: 'TICKET-3' });
++
++    expect(second.status).toBe('failed');
++    expect(notifyUser).not.toHaveBeenCalled();
++  });
++});
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index 51dda61..c40fde1 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -4,6 +4,7 @@ import { mergeSealedPII, openPII, sealPII } from '../lib/pii.js';
+ import { prisma } from '../lib/prisma.js';
+ import { ApiError } from '../middleware/error.js';
+ import { debitWallet, refundWallet } from './wallet.service.js';
++import { notifyUser } from './notification.service.js';
+ import { recordProviderDebit } from './provider-ledger.service.js';
+ import {
+   techhubService,
+@@ -624,10 +625,21 @@ async function settleAsyncTransaction(
+     return { ticketId: result.ticketId, status: 'success', response: result.response };
+   }
+ 
+-  // 'failed' - the provider auto-refunds its own balance per the docs; we mirror
+-  // that on our side by refunding the user's MDL wallet the moment we learn
+-  // the outcome (which may be well after the original submit, hence this
+-  // living here rather than in submitAsyncService above).
++  // 'failed' - for most async services the provider auto-refunds its own
++  // balance per the docs, and we mirror that by refunding the user's MDL
++  // wallet the moment we learn the outcome (which may be well after the
++  // original submit, hence this living here rather than in submitAsyncService
++  // above). IPE Clearance is the documented exception: K-Tech's own IPE page
++  // states in bold "IPE IS NOT REFUNDABLE" - NIMC does the lookup and is paid
++  // for it regardless of the result, so K-Tech does not refund its balance for
++  // a failed ticket, and refunding the customer here would mean MDL eats that
++  // cost every time. This only affects a ticket that was actually submitted
++  // and later resolves to 'failed'; a request that never got a ticket_id in
++  // the first place is still refunded in submitAsyncService above, since
++  // nothing was actually processed in that case.
++  const service = (existingMetadata as { service?: VerificationServiceKey }).service;
++  const refundable = service !== 'IPE_CLEARANCE';
++
+   await prisma.transaction.update({
+     where: { id: transaction.id },
+     data: {
+@@ -638,7 +650,18 @@ async function settleAsyncTransaction(
+       } as Prisma.InputJsonValue
+     }
+   });
+-  await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
++
++  if (refundable) {
++    await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
++  } else {
++    await notifyUser({
++      userId: transaction.userId,
++      type: 'WALLET',
++      title: 'IPE Clearance was not successful',
++      body: `Your IPE Clearance request (₦${koboToNaira(transaction.amountKobo).toLocaleString('en-NG', { minimumFractionDigits: 2 })}) could not be completed. This service is non-refundable once submitted, so the charge stands - please double-check the Tracking ID before submitting again.`,
++      data: { transactionId: transaction.id }
++    });
++  }
+   return { ticketId: result.ticketId, status: 'failed', response: result.response };
+ }
+ 
+@@ -753,21 +776,21 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
+   });
+ }
+ 
++// IPE Clearance is pinned to K-Tech, unlike the other identity services above
++// which follow the admin's Data/Airtime-style `identityVerificationProvider`
++// toggle. K-Tech's own IPE Clearance page (k-tech.com.ng/ipe) is the reference
++// this flow was built against, and is the one actually being used in
++// production - it is not switched by the general NIN/BVN provider setting.
+ export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
+-  return activeIdentityVerificationProvider().then((provider) =>
+-    submitAsyncService({
+-      userId: params.userId, service: 'IPE_CLEARANCE', provider,
+-      description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
+-      idempotencyKey: params.idempotencyKey,
+-      call: (reference) => provider === 'ktech'
+-        ? ktechService.submitIpeClearance(params.trackingId, reference)
+-        : techhubService.submitIpeClearance(params.trackingId)
+-    })
+-  );
++  return submitAsyncService({
++    userId: params.userId, service: 'IPE_CLEARANCE', provider: 'ktech',
++    description: 'IPE clearance request', operational: { provider: 'ktech' }, pii: { tracking_id: params.trackingId },
++    idempotencyKey: params.idempotencyKey,
++    call: (reference) => ktechService.submitIpeClearance(params.trackingId, reference)
++  });
+ }
+ export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
+-  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+-    provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
++  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id) => ktechService.checkIpeClearance(id) });
+ }
+ 
+ export type ServiceTicketEntry = {
+diff --git a/web/src/pages/verification/IpeClearancePage.tsx b/web/src/pages/verification/IpeClearancePage.tsx
+index 49b1cb0..7655b1a 100644
+--- a/web/src/pages/verification/IpeClearancePage.tsx
++++ b/web/src/pages/verification/IpeClearancePage.tsx
+@@ -1,5 +1,5 @@
+ import { useState, type FormEvent } from 'react';
+-import { Loader2, Lock } from 'lucide-react';
++import { Clock, Loader2, Lock, TriangleAlert } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+ import { api, ApiError } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+@@ -88,6 +88,19 @@ export default function IpeClearancePage() {
+         <section className={FORM_SECTION_CLASSES}>
+           {!asyncResult ? (
+             <form onSubmit={prepare}>
++              <div className="rounded-xl border border-gold-500/40 bg-gold-50 p-4">
++                <p className="flex items-start gap-2 font-body text-sm font-bold text-amber-900">
++                  <TriangleAlert size={16} className="mt-0.5 shrink-0" />
++                  NOTE: IPE IS NOT REFUNDABLE. Ensure all details are correct before submission.
++                </p>
++                <p className="mt-2 font-body text-sm text-amber-900">
++                  After submitting, proceed to check history below. (Status usually updates within 10-30mins)
++                </p>
++                <p className="mt-2 flex items-center gap-1.5 font-body text-xs font-semibold text-amber-900">
++                  <Clock size={13} /> Typical completion time: within 24hrs
++                </p>
++              </div>
++
+               <StepLabel n={1}>Service Type</StepLabel>
+               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+                 {SERVICE_TYPES.map((s) => (
+-- 
+2.43.0
+

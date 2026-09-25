@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { Loader2, Lock } from 'lucide-react';
+import { Clock, Loader2, Lock, TriangleAlert } from 'lucide-react';
 import AppShell from '../../components/AppShell';
 import { api, ApiError } from '../../lib/api';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
@@ -88,6 +88,19 @@ export default function IpeClearancePage() {
         <section className={FORM_SECTION_CLASSES}>
           {!asyncResult ? (
             <form onSubmit={prepare}>
+              <div className="rounded-xl border border-gold-500/40 bg-gold-50 p-4">
+                <p className="flex items-start gap-2 font-body text-sm font-bold text-amber-900">
+                  <TriangleAlert size={16} className="mt-0.5 shrink-0" />
+                  NOTE: IPE IS NOT REFUNDABLE. Ensure all details are correct before submission.
+                </p>
+                <p className="mt-2 font-body text-sm text-amber-900">
+                  After submitting, proceed to check history below. (Status usually updates within 10-30mins)
+                </p>
+                <p className="mt-2 flex items-center gap-1.5 font-body text-xs font-semibold text-amber-900">
+                  <Clock size={13} /> Typical completion time: within 24hrs
+                </p>
+              </div>
+
               <StepLabel n={1}>Service Type</StepLabel>
               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
                 {SERVICE_TYPES.map((s) => (
