@@ -1,0 +1,26 @@
+From a13dc95be2ce02f75078d6a35453367ea1c28563 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 25 Sep 2026 09:47:43 +0000
+Subject: [PATCH] Fix production build: TS2769 in webhook.ktech.test.ts
+ (server.listen callback signature)
+
+---
+ maria_backend/src/routes/__tests__/webhook.ktech.test.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/maria_backend/src/routes/__tests__/webhook.ktech.test.ts b/maria_backend/src/routes/__tests__/webhook.ktech.test.ts
+index d1d799e..7b3d263 100644
+--- a/maria_backend/src/routes/__tests__/webhook.ktech.test.ts
++++ b/maria_backend/src/routes/__tests__/webhook.ktech.test.ts
+@@ -29,7 +29,7 @@ beforeAll(async () => {
+   // Same mounting as app.ts: raw body, no JSON parser in front.
+   app.use('/api/webhooks', express.raw({ type: '*/*' }), webhookRoutes);
+   await new Promise<void>((resolve) => {
+-    server = app.listen(0, resolve);
++    server = app.listen(0, () => resolve());
+   });
+   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/webhooks/ktech`;
+ });
+-- 
+2.43.0
+

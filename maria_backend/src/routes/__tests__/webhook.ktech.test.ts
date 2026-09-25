@@ -29,7 +29,7 @@ beforeAll(async () => {
   // Same mounting as app.ts: raw body, no JSON parser in front.
   app.use('/api/webhooks', express.raw({ type: '*/*' }), webhookRoutes);
   await new Promise<void>((resolve) => {
-    server = app.listen(0, resolve);
+    server = app.listen(0, () => resolve());
   });
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/webhooks/ktech`;
 });
