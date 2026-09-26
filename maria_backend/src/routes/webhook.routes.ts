@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { Router } from 'express';
+import type { Prisma } from '@prisma/client';
 import { env } from '../config/env.js';
 import { prisma } from '../lib/prisma.js';
 import {
@@ -80,7 +81,9 @@ webhookRoutes.post('/major-data-link', async (req, res) => {
   const data = payload.data && typeof payload.data === 'object' ? payload.data as Record<string, unknown> : {};
   const reference = typeof data.reference === 'string' ? data.reference : null;
   try {
-    await prisma.majorDataLinkWebhookEvent.create({ data: { eventId, event, reference, payload } });
+    // JSON.parse has the broad `Record<string, unknown>` type; after the
+    // signature check and object validation above, it is a Prisma JSON value.
+    await prisma.majorDataLinkWebhookEvent.create({ data: { eventId, event, reference, payload: payload as Prisma.InputJsonValue } });
   } catch (error: any) {
     if (error?.code !== 'P2002') {
       console.error('[mdl-webhook] could not store verified event', error);
