@@ -86,6 +86,9 @@ const EnvSchema = z.object({
   // webhook.routes.ts) - which is exactly what the dashboard reports as
   // "Webhook test was not delivered yet (status: pending)".
   KTECH_WEBHOOK_SECRET: z.string().optional(),
+  // Shared secret returned once by Major Data Link when this partner registers
+  // its callback URL. It is only used to verify MDL's signed outbound events.
+  MDL_WEBHOOK_SECRET: z.string().min(16).optional(),
   MOCK_KTECH: z
     .string()
     .default('false')

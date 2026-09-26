@@ -36,6 +36,7 @@ import { userDeliveryResource } from './resources/user-delivery.resource.js';
 import { registerUserDeliveryRoutes } from './user-deliveries.js';
 import { registerSupportInboxRoutes } from './support-inbox.js';
 import { registerPendingSummaryRoutes } from './pending-summary.js';
+import { majorDataLinkWebhookEventResource } from './resources/major-data-link-webhook-event.resource.js';
 
 AdminJS.registerAdapter({ Database, Resource });
 
@@ -95,6 +96,7 @@ export async function buildAdminRouter() {
       servicePricingResource,
       couponResource,
       providerBalanceResource,
+      majorDataLinkWebhookEventResource,
       referralSettingsResource,
       appConfigResource,
       supportTicketResource,

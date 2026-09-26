@@ -49,6 +49,47 @@ export function pickKatpayTransactionReference(transaction: Record<string, unkno
 
 export const webhookRoutes = Router();
 
+function secureEquals(actual: string, expected: string) {
+  const left = Buffer.from(actual, 'utf8');
+  const right = Buffer.from(expected, 'utf8');
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+webhookRoutes.get('/major-data-link', (_req, res) => {
+  res.json({ status: true, webhook: 'major-data-link', ready: Boolean(env.MDL_WEBHOOK_SECRET), signature_required: true });
+});
+
+/** MDL HMAC receiver. Events are persisted idempotently before 2xx response. */
+webhookRoutes.post('/major-data-link', async (req, res) => {
+  const secret = env.MDL_WEBHOOK_SECRET;
+  const rawBody = req.body as Buffer;
+  const timestamp = req.header('x-mdl-timestamp')?.trim() ?? '';
+  const signature = req.header('x-mdl-signature')?.trim().replace(/^sha256=/i, '') ?? '';
+  const event = req.header('x-mdl-event')?.trim() ?? '';
+  const eventId = req.header('x-mdl-event-id')?.trim() ?? '';
+  if (!secret) return res.status(503).json({ status: false, message: 'MDL webhook secret is not configured' });
+  if (!Buffer.isBuffer(rawBody)) return res.status(400).json({ status: false, message: 'Raw webhook body is required' });
+  if (!timestamp || !signature || !event || !eventId) return res.status(401).json({ status: false, message: 'Missing webhook authentication information' });
+  const seconds = /^\d+$/.test(timestamp) ? Number(timestamp) : Number.NaN;
+  if (!Number.isSafeInteger(seconds) || Math.abs(Math.floor(Date.now() / 1000) - seconds) > 300) return res.status(401).json({ status: false, message: 'Invalid or expired webhook timestamp' });
+  const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.`).update(rawBody).digest('hex');
+  if (!secureEquals(signature, expected)) return res.status(401).json({ status: false, message: 'Invalid webhook signature' });
+  let payload: Record<string, unknown>;
+  try { payload = JSON.parse(rawBody.toString('utf8')) as Record<string, unknown>; } catch { return res.status(400).json({ status: false, message: 'Malformed JSON webhook' }); }
+  if (payload.event !== event || payload.id !== eventId || !['transaction.updated', 'request.updated', 'webhook.test'].includes(event)) return res.status(422).json({ status: false, message: 'Invalid webhook event' });
+  const data = payload.data && typeof payload.data === 'object' ? payload.data as Record<string, unknown> : {};
+  const reference = typeof data.reference === 'string' ? data.reference : null;
+  try {
+    await prisma.majorDataLinkWebhookEvent.create({ data: { eventId, event, reference, payload } });
+  } catch (error: any) {
+    if (error?.code !== 'P2002') {
+      console.error('[mdl-webhook] could not store verified event', error);
+      return res.status(500).json({ status: false, message: 'Webhook processing failed' });
+    }
+  }
+  return res.status(200).json({ status: true, received: true });
+});
+
 // Public, non-sensitive connectivity check for KatPay's dashboard setup.
 // KatPay only POSTs signed events; this GET makes it possible to verify the
 // exact Railway URL in a browser before waiting for a real bank transfer.

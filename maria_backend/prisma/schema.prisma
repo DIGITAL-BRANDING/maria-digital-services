@@ -323,6 +323,21 @@ model Transaction {
   @@index([relatedTransactionId])
 }
 
+/// Immutable, deduplicated ledger of notifications received from Major Data
+/// Link. It lets operators inspect every progress/terminal event even if a
+/// downstream dashboard refresh happens later.
+model MajorDataLinkWebhookEvent {
+  id        String   @id @default(uuid())
+  eventId   String   @unique
+  event     String
+  reference String?
+  payload   Json
+  receivedAt DateTime @default(now())
+
+  @@index([reference, receivedAt])
+  @@index([event, receivedAt])
+}
+
 model DataPlanPricing {
   id               String   @id @default(uuid())
   provider         String   @default("alrahuz")
