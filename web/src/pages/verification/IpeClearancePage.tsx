@@ -8,9 +8,9 @@ import {
   StepLabel,
   ConsentCheckbox,
   AsyncResultView,
-  VerificationHistoryView,
+  TicketTrackingTable,
   useVerificationPrices,
-  useVerificationHistory,
+  useServiceTickets,
   useTicketPolling,
   money,
   FORM_SECTION_CLASSES,
@@ -52,8 +52,23 @@ export default function IpeClearancePage() {
   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
 
   const price = prices['IPE_CLEARANCE'];
-  const { history, loading: loadingHistory } = useVerificationHistory('IPE_CLEARANCE');
   const { polling, checkTicket } = useTicketPolling('/verification/ipe-clearance', asyncResult, ticketStatus, setTicketStatus);
+  const { tickets, loading: loadingTickets, refresh: refreshTickets } = useServiceTickets('IPE_CLEARANCE');
+  const [checkingId, setCheckingId] = useState<string | null>(null);
+  const [ticketSearch, setTicketSearch] = useState('');
+
+  async function checkTicketRow(ticketId: string | null) {
+    if (!ticketId) return;
+    setCheckingId(ticketId);
+    try {
+      await api.get(`/verification/ipe-clearance/${ticketId}`);
+    } catch {
+      // transient - the row just won't have updated this time
+    } finally {
+      setCheckingId(null);
+      void refreshTickets();
+    }
+  }
 
   function prepare(event: FormEvent) {
     event.preventDefault();
@@ -73,6 +88,7 @@ export default function IpeClearancePage() {
       if (!result.data?.ticket_id) throw new Error('No ticket was returned - please contact support.');
       setAsyncResult({ ticket_id: result.data.ticket_id, reference: result.data.reference });
       setMessage("Request submitted. We'll check its status below - this is usually reviewed within a few minutes.");
+      void refreshTickets();
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
@@ -160,7 +176,16 @@ export default function IpeClearancePage() {
             />
           )}
 
-          <VerificationHistoryView history={history} loading={loadingHistory} />
+          <TicketTrackingTable
+            tickets={tickets}
+            loading={loadingTickets}
+            checkingId={checkingId}
+            onCheck={checkTicketRow}
+            search={ticketSearch}
+            onSearchChange={setTicketSearch}
+            serviceLabel="IPE Clearance"
+            emptyMessage="No IPE Clearance requests found."
+          />
         </section>
       </div>
 

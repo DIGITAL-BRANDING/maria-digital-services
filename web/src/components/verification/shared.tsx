@@ -517,6 +517,8 @@ export function ConsentCheckbox({ checked, onChange }: { checked: boolean; onCha
 // "Check Status" tracking table like the reference screenshots show.
 export type ServiceTicket = {
   reference: string;
+  /** The VerificationServiceKey this ticket belongs to - lets a combined table (several service keys in one list) label each row. */
+  service: string;
   ticket_id: string | null;
   status: string;
   message: string;
@@ -528,14 +530,23 @@ export type ServiceTicket = {
   updated_at: string;
 };
 
-export function useServiceTickets(serviceKey: string) {
+/**
+ * `serviceKey` accepts one service, or several joined into a single combined
+ * table - e.g. Validation's four detail types (see ValidationPage.tsx), which
+ * are shown to the customer as one "recent requests" list rather than four
+ * separate ones. The backend (`GET /verification/tickets`) splits the
+ * comma-separated list back apart - see listServiceTickets in
+ * verification.service.ts.
+ */
+export function useServiceTickets(serviceKey: string | readonly string[]) {
   const [tickets, setTickets] = useState<ServiceTicket[]>([]);
   const [loading, setLoading] = useState(true);
+  const key = Array.isArray(serviceKey) ? serviceKey.join(',') : (serviceKey as string);
 
   async function refresh() {
     setLoading(true);
     try {
-      const result = await api.get<{ status: boolean; data: ServiceTicket[] }>(`/verification/tickets?service=${encodeURIComponent(serviceKey)}`);
+      const result = await api.get<{ status: boolean; data: ServiceTicket[] }>(`/verification/tickets?service=${encodeURIComponent(key)}`);
       setTickets(result.data ?? []);
     } catch {
       setTickets([]);
@@ -547,7 +558,7 @@ export function useServiceTickets(serviceKey: string) {
   useEffect(() => {
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serviceKey]);
+  }, [key]);
 
   return { tickets, loading, refresh };
 }
@@ -561,6 +572,107 @@ export function StatusBadge({ status }: { status: string }) {
   };
   const labels: Record<string, string> = { success: 'Completed', pending: 'Processing', failed: 'Rejected', reversed: 'Refunded' };
   return <span className={`rounded-full px-2 py-1 text-[10px] font-bold ${styles[status] ?? 'bg-blue-100 text-[#0b2f73]'}`}>{labels[status] ?? status}</span>;
+}
+
+/**
+ * "Recent requests" table with a per-row "Check Status" button plus a search
+ * box, backed by useServiceTickets() above. Extracted from PersonalizationPage
+ * (the original reference implementation) so Validation and IPE Clearance get
+ * the exact same tracking behaviour - every status shown (not just SUCCESS,
+ * unlike VerificationHistoryView), and a way to re-check a still-pending
+ * request - instead of duplicating this table a third and fourth time.
+ */
+export function TicketTrackingTable({
+  tickets,
+  loading,
+  checkingId,
+  onCheck,
+  search,
+  onSearchChange,
+  serviceLabel,
+  searchPlaceholder = 'Search tracking ID, status, amount, or reference...',
+  emptyMessage = 'No requests found.',
+}: {
+  tickets: ServiceTicket[];
+  loading: boolean;
+  checkingId: string | null;
+  onCheck: (ticketId: string | null) => void;
+  search: string;
+  onSearchChange: (v: string) => void;
+  /** How to label the "Service" column - a fixed string, or per-row when the table combines several service keys (e.g. Validation's four detail types). */
+  serviceLabel: string | ((ticket: ServiceTicket) => string);
+  searchPlaceholder?: string;
+  emptyMessage?: string;
+}) {
+  const q = search.trim().toLowerCase();
+  const filtered = tickets.filter((t) => {
+    if (!q) return true;
+    return (
+      t.reference.toLowerCase().includes(q) ||
+      (t.ticket_id ?? '').toLowerCase().includes(q) ||
+      (t.tracking_id ?? '').toLowerCase().includes(q) ||
+      t.status.includes(q) ||
+      String(t.amount).includes(q)
+    );
+  });
+  const labelFor = (t: ServiceTicket) => (typeof serviceLabel === 'function' ? serviceLabel(t) : serviceLabel);
+
+  return (
+    <div className="mt-8 border-t border-blue-100 pt-5">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h3 className="font-display text-base font-bold text-[#0b2f73]">Recent requests</h3>
+      </div>
+      <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+        <input placeholder={searchPlaceholder} value={search} onChange={(e) => onSearchChange(e.target.value)} className={FORM_INPUT_CLASSES} />
+      </div>
+
+      {loading ? (
+        <p className="mt-4 font-body text-sm text-[#0b2f73]/70">Loading…</p>
+      ) : filtered.length === 0 ? (
+        <p className="mt-4 rounded-xl border border-dashed border-blue-200 px-4 py-4 text-center font-body text-sm text-[#0b2f73]/70">{emptyMessage}</p>
+      ) : (
+        <div className="mt-4 overflow-x-auto rounded-xl border border-blue-100 bg-blue-50">
+          <table className="w-full text-left font-body text-xs">
+            <thead>
+              <tr className="border-b border-blue-100 text-[#0b2f73]/70">
+                {['Check Status', 'Service', 'Tracking ID', 'Message', 'Status', 'Date'].map((h) => (
+                  <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((t) => (
+                <tr key={t.reference} className="border-b border-blue-100 last:border-0">
+                  <td className="whitespace-nowrap px-3 py-2">
+                    {t.status === 'pending' ? (
+                      <button
+                        onClick={() => onCheck(t.ticket_id)}
+                        disabled={checkingId === t.ticket_id}
+                        className="flex items-center gap-1 rounded-lg bg-[#0b2f73] px-2 py-1.5 font-bold text-white disabled:opacity-60"
+                      >
+                        {checkingId === t.ticket_id ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Check
+                      </button>
+                    ) : (
+                      <span className="text-[#0b2f73]/40">—</span>
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]">{labelFor(t)}</td>
+                  <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{t.tracking_id ?? t.nin ?? '—'}</td>
+                  <td className="px-3 py-2 text-[#0b2f73]/70">{t.message}</td>
+                  <td className="whitespace-nowrap px-3 py-2">
+                    <StatusBadge status={t.status} />
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{new Date(t.created_at).toLocaleDateString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /**

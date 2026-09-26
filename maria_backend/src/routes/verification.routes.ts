@@ -459,8 +459,16 @@ verificationRoutes.get('/personalization/:ticketId', async (req, res) => {
 // from GET /history: it includes PENDING requests, not just SUCCESS ones.
 verificationRoutes.get('/tickets', async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  const service = z.string().trim().min(1).max(60).parse(req.query.service);
-  const data = await listServiceTickets(req.user!.id, service);
+  // Accepts either one service key or a comma-separated list. Validation has
+  // four separate service keys (one per detail type) but is shown to the
+  // customer as a single "recent requests" table across all of them - see
+  // ValidationPage.tsx, which passes all four joined with commas.
+  const raw = z.string().trim().min(1).max(300).parse(req.query.service);
+  const services = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const data = await listServiceTickets(req.user!.id, services);
   res.json({ status: true, data });
 });
 

@@ -795,6 +795,9 @@ export async function checkIpeClearanceStatus(params: { userId: string; ticketId
 
 export type ServiceTicketEntry = {
   reference: string;
+  /** The VerificationServiceKey this request was submitted under - lets a combined
+   * table (e.g. Validation's four detail types in one list) label each row correctly. */
+  service: string;
   ticket_id: string | null;
   status: string;
   message: string;
@@ -831,7 +834,8 @@ function friendlyTicketMessage(status: TransactionStatus): string {
  * "Check Status" action per row (see PersonalizationPage.tsx /
  * BvnRetrievalPage.tsx on the frontend).
  */
-export async function listServiceTickets(userId: string, service: string): Promise<ServiceTicketEntry[]> {
+export async function listServiceTickets(userId: string, services: string | string[]): Promise<ServiceTicketEntry[]> {
+  const wanted = new Set(Array.isArray(services) ? services : [services]);
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const transactions = await prisma.transaction.findMany({
     where: { userId, type: TransactionType.IDENTITY_SERVICE_REQUEST, createdAt: { gte: since } },
@@ -842,7 +846,7 @@ export async function listServiceTickets(userId: string, service: string): Promi
   return transactions
     .filter((transaction) => {
       const metadata = transaction.metadata as Record<string, unknown> | null;
-      return metadata?.service === service;
+      return typeof metadata?.service === 'string' && wanted.has(metadata.service);
     })
     .slice(0, 30)
     .map((transaction) => {
@@ -850,6 +854,7 @@ export async function listServiceTickets(userId: string, service: string): Promi
       const pii = openPII<{ tracking_id?: string; nin?: string; email?: string }>(metadata?.pii);
       return {
         reference: transaction.reference,
+        service: String(metadata?.service ?? ''),
         ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
         status: transaction.status.toLowerCase(),
         message: friendlyTicketMessage(transaction.status),

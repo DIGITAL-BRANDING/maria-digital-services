@@ -8,9 +8,9 @@ import {
   StepLabel,
   ConsentCheckbox,
   AsyncResultView,
-  VerificationHistoryView,
+  TicketTrackingTable,
   useVerificationPrices,
-  useVerificationHistory,
+  useServiceTickets,
   useTicketPolling,
   money,
   FORM_SECTION_CLASSES,
@@ -60,9 +60,29 @@ export default function ValidationPage() {
   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
 
   const serviceKey = DETAILS.find((d) => d.value === detail)!.serviceKey;
-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
   const price = useMemo(() => prices[serviceKey], [serviceKey, prices]);
   const { polling, checkTicket } = useTicketPolling('/verification/nin-validation', asyncResult, ticketStatus, setTicketStatus);
+
+  // One combined "recent requests" table across all four detail types (see
+  // TicketTrackingTable in shared.tsx) - not just the type currently selected
+  // above, so switching tiles never hides earlier requests.
+  const allServiceKeys = useMemo(() => DETAILS.map((d) => d.serviceKey), []);
+  const { tickets, loading: loadingTickets, refresh: refreshTickets } = useServiceTickets(allServiceKeys);
+  const [checkingId, setCheckingId] = useState<string | null>(null);
+  const [ticketSearch, setTicketSearch] = useState('');
+
+  async function checkTicketRow(ticketId: string | null) {
+    if (!ticketId) return;
+    setCheckingId(ticketId);
+    try {
+      await api.get(`/verification/nin-validation/${ticketId}`);
+    } catch {
+      // transient - the row just won't have updated this time
+    } finally {
+      setCheckingId(null);
+      void refreshTickets();
+    }
+  }
 
   function prepare(event: FormEvent) {
     event.preventDefault();
@@ -83,6 +103,7 @@ export default function ValidationPage() {
       if (!result.data?.ticket_id) throw new Error('No ticket was returned - please contact support.');
       setAsyncResult({ ticket_id: result.data.ticket_id, reference: result.data.reference });
       setMessage("Request submitted. We'll check its status below - this is usually reviewed within a few minutes.");
+      void refreshTickets();
     } catch (error) {
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
@@ -167,7 +188,16 @@ export default function ValidationPage() {
             />
           )}
 
-          <VerificationHistoryView history={history} loading={loadingHistory} />
+          <TicketTrackingTable
+            tickets={tickets}
+            loading={loadingTickets}
+            checkingId={checkingId}
+            onCheck={checkTicketRow}
+            search={ticketSearch}
+            onSearchChange={setTicketSearch}
+            serviceLabel={(t) => DETAILS.find((d) => d.serviceKey === t.service)?.label ?? 'Validation'}
+            emptyMessage="No validation requests found."
+          />
         </section>
       </div>
 

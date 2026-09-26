@@ -1,0 +1,464 @@
+From 6f5da3b052f5187d81fc4fdb4a7c2ea5f293c6e9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 26 Sep 2026 10:39:31 +0000
+Subject: [PATCH] Add Recent Requests history + Check Status button to
+ Validation and IPE Clearance
+
+- Both pages used VerificationHistoryView (SUCCESS-only, no check button, 7-day window),
+  unlike Personalization/BVN Retrieval which already have a full ticket table with a
+  per-row 'Check' button. Validation and IPE Clearance now use the same pattern.
+- New shared TicketTrackingTable component (components/verification/shared.tsx),
+  extracted from PersonalizationPage's table so it isn't duplicated a third/fourth time.
+- GET /verification/tickets now accepts a comma-separated list of service keys, not just
+  one - Validation has four separate service keys (one per detail type) and shows all of
+  them combined in one table, labeled per-row via a new  field on each ticket.
+- Layout/containers (Service Type tiles, Slip Type tiles, Supply ID/Tracking ID) are
+  untouched, per instruction to leave those as they are.
+- tests: 3 new (221 total)
+---
+ .../src/routes/verification.routes.ts         |  12 +-
+ .../__tests__/service-tickets.test.ts         |  67 ++++++++++
+ .../src/services/verification.service.ts      |   9 +-
+ web/src/components/verification/shared.tsx    | 118 +++++++++++++++++-
+ .../pages/verification/IpeClearancePage.tsx   |  33 ++++-
+ web/src/pages/verification/ValidationPage.tsx |  38 +++++-
+ 6 files changed, 262 insertions(+), 15 deletions(-)
+ create mode 100644 maria_backend/src/services/__tests__/service-tickets.test.ts
+
+diff --git a/maria_backend/src/routes/verification.routes.ts b/maria_backend/src/routes/verification.routes.ts
+index db2c0ea..610fe14 100644
+--- a/maria_backend/src/routes/verification.routes.ts
++++ b/maria_backend/src/routes/verification.routes.ts
+@@ -459,8 +459,16 @@ verificationRoutes.get('/personalization/:ticketId', async (req, res) => {
+ // from GET /history: it includes PENDING requests, not just SUCCESS ones.
+ verificationRoutes.get('/tickets', async (req, res) => {
+   res.set('Cache-Control', 'no-store');
+-  const service = z.string().trim().min(1).max(60).parse(req.query.service);
+-  const data = await listServiceTickets(req.user!.id, service);
++  // Accepts either one service key or a comma-separated list. Validation has
++  // four separate service keys (one per detail type) but is shown to the
++  // customer as a single "recent requests" table across all of them - see
++  // ValidationPage.tsx, which passes all four joined with commas.
++  const raw = z.string().trim().min(1).max(300).parse(req.query.service);
++  const services = raw
++    .split(',')
++    .map((s) => s.trim())
++    .filter(Boolean);
++  const data = await listServiceTickets(req.user!.id, services);
+   res.json({ status: true, data });
+ });
+ 
+diff --git a/maria_backend/src/services/__tests__/service-tickets.test.ts b/maria_backend/src/services/__tests__/service-tickets.test.ts
+new file mode 100644
+index 0000000..773c979
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/service-tickets.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, it, vi } from 'vitest';
++
++vi.mock('@prisma/client', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('@prisma/client')>();
++  const echoEnum = new Proxy({}, { get: (_target, prop) => prop });
++  return { ...actual, TransactionStatus: echoEnum, TransactionType: echoEnum };
++});
++
++vi.mock('../../lib/prisma.js', async () => {
++  const { createFakePrisma } = await import('../../test-utils/fake-prisma.js');
++  const fake = createFakePrisma();
++  return { prisma: fake.api };
++});
++
++const { prisma } = await import('../../lib/prisma.js');
++const { listServiceTickets } = await import('../verification.service.js');
++
++let counter = 0;
++async function seedTicket(userId: string, service: string, status: 'PENDING' | 'SUCCESS' | 'FAILED' = 'PENDING') {
++  counter += 1;
++  await prisma.transaction.create({
++    data: {
++      id: `t-${counter}`,
++      userId,
++      type: 'IDENTITY_SERVICE_REQUEST',
++      status,
++      amountKobo: 50000n,
++      balanceBeforeKobo: 100000n,
++      balanceAfterKobo: 50000n,
++      reference: `REF-${counter}`,
++      description: service,
++      metadata: { service, ticket_id: `TICKET-${counter}` }
++    }
++  });
++}
++
++describe('listServiceTickets', () => {
++  it('returns only the requested single service, tagging each row with its service key', async () => {
++    const userId = 'user-a';
++    await seedTicket(userId, 'NIN_PERSONALIZATION');
++    await seedTicket(userId, 'IPE_CLEARANCE');
++
++    const result = await listServiceTickets(userId, 'IPE_CLEARANCE');
++
++    expect(result).toHaveLength(1);
++    expect(result[0].service).toBe('IPE_CLEARANCE');
++  });
++
++  it('combines several service keys into one list - this is how Validation shows all four detail types together', async () => {
++    const userId = 'user-b';
++    await seedTicket(userId, 'NIN_VALIDATION_NO_RECORD');
++    await seedTicket(userId, 'NIN_VALIDATION_VNIN');
++    await seedTicket(userId, 'NIN_PERSONALIZATION'); // a different service - must be excluded
++
++    const result = await listServiceTickets(userId, ['NIN_VALIDATION_NO_RECORD', 'NIN_VALIDATION_UPDATE_RECORDS', 'NIN_VALIDATION_MODIFICATION', 'NIN_VALIDATION_VNIN']);
++
++    expect(result.map((r) => r.service).sort()).toEqual(['NIN_VALIDATION_NO_RECORD', 'NIN_VALIDATION_VNIN'].sort());
++  });
++
++  it('never mixes tickets between users', async () => {
++    await seedTicket('user-c', 'IPE_CLEARANCE');
++    await seedTicket('user-d', 'IPE_CLEARANCE');
++
++    const result = await listServiceTickets('user-c', 'IPE_CLEARANCE');
++    expect(result).toHaveLength(1);
++  });
++});
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index c40fde1..2321fa6 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -795,6 +795,9 @@ export async function checkIpeClearanceStatus(params: { userId: string; ticketId
+ 
+ export type ServiceTicketEntry = {
+   reference: string;
++  /** The VerificationServiceKey this request was submitted under - lets a combined
++   * table (e.g. Validation's four detail types in one list) label each row correctly. */
++  service: string;
+   ticket_id: string | null;
+   status: string;
+   message: string;
+@@ -831,7 +834,8 @@ function friendlyTicketMessage(status: TransactionStatus): string {
+  * "Check Status" action per row (see PersonalizationPage.tsx /
+  * BvnRetrievalPage.tsx on the frontend).
+  */
+-export async function listServiceTickets(userId: string, service: string): Promise<ServiceTicketEntry[]> {
++export async function listServiceTickets(userId: string, services: string | string[]): Promise<ServiceTicketEntry[]> {
++  const wanted = new Set(Array.isArray(services) ? services : [services]);
+   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+   const transactions = await prisma.transaction.findMany({
+     where: { userId, type: TransactionType.IDENTITY_SERVICE_REQUEST, createdAt: { gte: since } },
+@@ -842,7 +846,7 @@ export async function listServiceTickets(userId: string, service: string): Promi
+   return transactions
+     .filter((transaction) => {
+       const metadata = transaction.metadata as Record<string, unknown> | null;
+-      return metadata?.service === service;
++      return typeof metadata?.service === 'string' && wanted.has(metadata.service);
+     })
+     .slice(0, 30)
+     .map((transaction) => {
+@@ -850,6 +854,7 @@ export async function listServiceTickets(userId: string, service: string): Promi
+       const pii = openPII<{ tracking_id?: string; nin?: string; email?: string }>(metadata?.pii);
+       return {
+         reference: transaction.reference,
++        service: String(metadata?.service ?? ''),
+         ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
+         status: transaction.status.toLowerCase(),
+         message: friendlyTicketMessage(transaction.status),
+diff --git a/web/src/components/verification/shared.tsx b/web/src/components/verification/shared.tsx
+index aebcfc8..9ad80ab 100644
+--- a/web/src/components/verification/shared.tsx
++++ b/web/src/components/verification/shared.tsx
+@@ -517,6 +517,8 @@ export function ConsentCheckbox({ checked, onChange }: { checked: boolean; onCha
+ // "Check Status" tracking table like the reference screenshots show.
+ export type ServiceTicket = {
+   reference: string;
++  /** The VerificationServiceKey this ticket belongs to - lets a combined table (several service keys in one list) label each row. */
++  service: string;
+   ticket_id: string | null;
+   status: string;
+   message: string;
+@@ -528,14 +530,23 @@ export type ServiceTicket = {
+   updated_at: string;
+ };
+ 
+-export function useServiceTickets(serviceKey: string) {
++/**
++ * `serviceKey` accepts one service, or several joined into a single combined
++ * table - e.g. Validation's four detail types (see ValidationPage.tsx), which
++ * are shown to the customer as one "recent requests" list rather than four
++ * separate ones. The backend (`GET /verification/tickets`) splits the
++ * comma-separated list back apart - see listServiceTickets in
++ * verification.service.ts.
++ */
++export function useServiceTickets(serviceKey: string | readonly string[]) {
+   const [tickets, setTickets] = useState<ServiceTicket[]>([]);
+   const [loading, setLoading] = useState(true);
++  const key = Array.isArray(serviceKey) ? serviceKey.join(',') : (serviceKey as string);
+ 
+   async function refresh() {
+     setLoading(true);
+     try {
+-      const result = await api.get<{ status: boolean; data: ServiceTicket[] }>(`/verification/tickets?service=${encodeURIComponent(serviceKey)}`);
++      const result = await api.get<{ status: boolean; data: ServiceTicket[] }>(`/verification/tickets?service=${encodeURIComponent(key)}`);
+       setTickets(result.data ?? []);
+     } catch {
+       setTickets([]);
+@@ -547,7 +558,7 @@ export function useServiceTickets(serviceKey: string) {
+   useEffect(() => {
+     void refresh();
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [serviceKey]);
++  }, [key]);
+ 
+   return { tickets, loading, refresh };
+ }
+@@ -563,6 +574,107 @@ export function StatusBadge({ status }: { status: string }) {
+   return <span className={`rounded-full px-2 py-1 text-[10px] font-bold ${styles[status] ?? 'bg-blue-100 text-[#0b2f73]'}`}>{labels[status] ?? status}</span>;
+ }
+ 
++/**
++ * "Recent requests" table with a per-row "Check Status" button plus a search
++ * box, backed by useServiceTickets() above. Extracted from PersonalizationPage
++ * (the original reference implementation) so Validation and IPE Clearance get
++ * the exact same tracking behaviour - every status shown (not just SUCCESS,
++ * unlike VerificationHistoryView), and a way to re-check a still-pending
++ * request - instead of duplicating this table a third and fourth time.
++ */
++export function TicketTrackingTable({
++  tickets,
++  loading,
++  checkingId,
++  onCheck,
++  search,
++  onSearchChange,
++  serviceLabel,
++  searchPlaceholder = 'Search tracking ID, status, amount, or reference...',
++  emptyMessage = 'No requests found.',
++}: {
++  tickets: ServiceTicket[];
++  loading: boolean;
++  checkingId: string | null;
++  onCheck: (ticketId: string | null) => void;
++  search: string;
++  onSearchChange: (v: string) => void;
++  /** How to label the "Service" column - a fixed string, or per-row when the table combines several service keys (e.g. Validation's four detail types). */
++  serviceLabel: string | ((ticket: ServiceTicket) => string);
++  searchPlaceholder?: string;
++  emptyMessage?: string;
++}) {
++  const q = search.trim().toLowerCase();
++  const filtered = tickets.filter((t) => {
++    if (!q) return true;
++    return (
++      t.reference.toLowerCase().includes(q) ||
++      (t.ticket_id ?? '').toLowerCase().includes(q) ||
++      (t.tracking_id ?? '').toLowerCase().includes(q) ||
++      t.status.includes(q) ||
++      String(t.amount).includes(q)
++    );
++  });
++  const labelFor = (t: ServiceTicket) => (typeof serviceLabel === 'function' ? serviceLabel(t) : serviceLabel);
++
++  return (
++    <div className="mt-8 border-t border-blue-100 pt-5">
++      <div className="flex flex-wrap items-baseline justify-between gap-2">
++        <h3 className="font-display text-base font-bold text-[#0b2f73]">Recent requests</h3>
++      </div>
++      <div className="mt-3 flex flex-col gap-2 sm:flex-row">
++        <input placeholder={searchPlaceholder} value={search} onChange={(e) => onSearchChange(e.target.value)} className={FORM_INPUT_CLASSES} />
++      </div>
++
++      {loading ? (
++        <p className="mt-4 font-body text-sm text-[#0b2f73]/70">Loading…</p>
++      ) : filtered.length === 0 ? (
++        <p className="mt-4 rounded-xl border border-dashed border-blue-200 px-4 py-4 text-center font-body text-sm text-[#0b2f73]/70">{emptyMessage}</p>
++      ) : (
++        <div className="mt-4 overflow-x-auto rounded-xl border border-blue-100 bg-blue-50">
++          <table className="w-full text-left font-body text-xs">
++            <thead>
++              <tr className="border-b border-blue-100 text-[#0b2f73]/70">
++                {['Check Status', 'Service', 'Tracking ID', 'Message', 'Status', 'Date'].map((h) => (
++                  <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">
++                    {h}
++                  </th>
++                ))}
++              </tr>
++            </thead>
++            <tbody>
++              {filtered.map((t) => (
++                <tr key={t.reference} className="border-b border-blue-100 last:border-0">
++                  <td className="whitespace-nowrap px-3 py-2">
++                    {t.status === 'pending' ? (
++                      <button
++                        onClick={() => onCheck(t.ticket_id)}
++                        disabled={checkingId === t.ticket_id}
++                        className="flex items-center gap-1 rounded-lg bg-[#0b2f73] px-2 py-1.5 font-bold text-white disabled:opacity-60"
++                      >
++                        {checkingId === t.ticket_id ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Check
++                      </button>
++                    ) : (
++                      <span className="text-[#0b2f73]/40">—</span>
++                    )}
++                  </td>
++                  <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]">{labelFor(t)}</td>
++                  <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{t.tracking_id ?? t.nin ?? '—'}</td>
++                  <td className="px-3 py-2 text-[#0b2f73]/70">{t.message}</td>
++                  <td className="whitespace-nowrap px-3 py-2">
++                    <StatusBadge status={t.status} />
++                  </td>
++                  <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{new Date(t.created_at).toLocaleDateString()}</td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      )}
++    </div>
++  );
++}
++
+ /**
+  * Small preview icons for each slip type, sitting above the label in
+  * TierCardGrid — matching the reference design's use of a distinct little
+diff --git a/web/src/pages/verification/IpeClearancePage.tsx b/web/src/pages/verification/IpeClearancePage.tsx
+index 7655b1a..405a0f6 100644
+--- a/web/src/pages/verification/IpeClearancePage.tsx
++++ b/web/src/pages/verification/IpeClearancePage.tsx
+@@ -8,9 +8,9 @@ import {
+   StepLabel,
+   ConsentCheckbox,
+   AsyncResultView,
+-  VerificationHistoryView,
++  TicketTrackingTable,
+   useVerificationPrices,
+-  useVerificationHistory,
++  useServiceTickets,
+   useTicketPolling,
+   money,
+   FORM_SECTION_CLASSES,
+@@ -52,8 +52,23 @@ export default function IpeClearancePage() {
+   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
+ 
+   const price = prices['IPE_CLEARANCE'];
+-  const { history, loading: loadingHistory } = useVerificationHistory('IPE_CLEARANCE');
+   const { polling, checkTicket } = useTicketPolling('/verification/ipe-clearance', asyncResult, ticketStatus, setTicketStatus);
++  const { tickets, loading: loadingTickets, refresh: refreshTickets } = useServiceTickets('IPE_CLEARANCE');
++  const [checkingId, setCheckingId] = useState<string | null>(null);
++  const [ticketSearch, setTicketSearch] = useState('');
++
++  async function checkTicketRow(ticketId: string | null) {
++    if (!ticketId) return;
++    setCheckingId(ticketId);
++    try {
++      await api.get(`/verification/ipe-clearance/${ticketId}`);
++    } catch {
++      // transient - the row just won't have updated this time
++    } finally {
++      setCheckingId(null);
++      void refreshTickets();
++    }
++  }
+ 
+   function prepare(event: FormEvent) {
+     event.preventDefault();
+@@ -73,6 +88,7 @@ export default function IpeClearancePage() {
+       if (!result.data?.ticket_id) throw new Error('No ticket was returned - please contact support.');
+       setAsyncResult({ ticket_id: result.data.ticket_id, reference: result.data.reference });
+       setMessage("Request submitted. We'll check its status below - this is usually reviewed within a few minutes.");
++      void refreshTickets();
+     } catch (error) {
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+@@ -160,7 +176,16 @@ export default function IpeClearancePage() {
+             />
+           )}
+ 
+-          <VerificationHistoryView history={history} loading={loadingHistory} />
++          <TicketTrackingTable
++            tickets={tickets}
++            loading={loadingTickets}
++            checkingId={checkingId}
++            onCheck={checkTicketRow}
++            search={ticketSearch}
++            onSearchChange={setTicketSearch}
++            serviceLabel="IPE Clearance"
++            emptyMessage="No IPE Clearance requests found."
++          />
+         </section>
+       </div>
+ 
+diff --git a/web/src/pages/verification/ValidationPage.tsx b/web/src/pages/verification/ValidationPage.tsx
+index f0ca49d..8f5f011 100644
+--- a/web/src/pages/verification/ValidationPage.tsx
++++ b/web/src/pages/verification/ValidationPage.tsx
+@@ -8,9 +8,9 @@ import {
+   StepLabel,
+   ConsentCheckbox,
+   AsyncResultView,
+-  VerificationHistoryView,
++  TicketTrackingTable,
+   useVerificationPrices,
+-  useVerificationHistory,
++  useServiceTickets,
+   useTicketPolling,
+   money,
+   FORM_SECTION_CLASSES,
+@@ -60,10 +60,30 @@ export default function ValidationPage() {
+   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
+ 
+   const serviceKey = DETAILS.find((d) => d.value === detail)!.serviceKey;
+-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
+   const price = useMemo(() => prices[serviceKey], [serviceKey, prices]);
+   const { polling, checkTicket } = useTicketPolling('/verification/nin-validation', asyncResult, ticketStatus, setTicketStatus);
+ 
++  // One combined "recent requests" table across all four detail types (see
++  // TicketTrackingTable in shared.tsx) - not just the type currently selected
++  // above, so switching tiles never hides earlier requests.
++  const allServiceKeys = useMemo(() => DETAILS.map((d) => d.serviceKey), []);
++  const { tickets, loading: loadingTickets, refresh: refreshTickets } = useServiceTickets(allServiceKeys);
++  const [checkingId, setCheckingId] = useState<string | null>(null);
++  const [ticketSearch, setTicketSearch] = useState('');
++
++  async function checkTicketRow(ticketId: string | null) {
++    if (!ticketId) return;
++    setCheckingId(ticketId);
++    try {
++      await api.get(`/verification/nin-validation/${ticketId}`);
++    } catch {
++      // transient - the row just won't have updated this time
++    } finally {
++      setCheckingId(null);
++      void refreshTickets();
++    }
++  }
++
+   function prepare(event: FormEvent) {
+     event.preventDefault();
+     setShowPin(true);
+@@ -83,6 +103,7 @@ export default function ValidationPage() {
+       if (!result.data?.ticket_id) throw new Error('No ticket was returned - please contact support.');
+       setAsyncResult({ ticket_id: result.data.ticket_id, reference: result.data.reference });
+       setMessage("Request submitted. We'll check its status below - this is usually reviewed within a few minutes.");
++      void refreshTickets();
+     } catch (error) {
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+@@ -167,7 +188,16 @@ export default function ValidationPage() {
+             />
+           )}
+ 
+-          <VerificationHistoryView history={history} loading={loadingHistory} />
++          <TicketTrackingTable
++            tickets={tickets}
++            loading={loadingTickets}
++            checkingId={checkingId}
++            onCheck={checkTicketRow}
++            search={ticketSearch}
++            onSearchChange={setTicketSearch}
++            serviceLabel={(t) => DETAILS.find((d) => d.serviceKey === t.service)?.label ?? 'Validation'}
++            emptyMessage="No validation requests found."
++          />
+         </section>
+       </div>
+ 
+-- 
+2.43.0
+
