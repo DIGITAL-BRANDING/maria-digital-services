@@ -357,7 +357,7 @@ function renderPage(params: {
     <h2>K-Tech Solutions — Wallet</h2>
     <p class="hint">Live balance and funding actions call K-Tech's API directly. Funding gives you bank transfer instructions to complete yourself - it doesn't move money automatically.</p>
     <div class="wallet-links">
-      <a class="button-link" href="https://k-tech.up.railway.app" target="_blank" rel="noopener noreferrer">Visit API Dashboard</a>
+      <a class="button-link" href="https://k-tech.com.ng/partner-dashboard" target="_blank" rel="noopener noreferrer">Visit API Dashboard</a>
       <a class="button-link" href="/admin">Return to Admin Dashboard</a>
     </div>
     <div class="forms" style="margin-bottom:0;">

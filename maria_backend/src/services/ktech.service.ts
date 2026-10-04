@@ -38,7 +38,7 @@ async function recordKtechBalance(rawBalance: unknown) {
 /**
  * K-Tech Solutions ("MAJOR DATA-LINK") — a second NIN/BVN identity
  * verification provider, documented at
- * https://k-tech.up.railway.app/partner-docs. Same role as
+ * https://k-tech.com.ng/partner-docs. Same role as
  * techhub.service.ts (both are picked between via
  * PricingSettings.identityVerificationProvider, see
  * verification.service.ts), deliberately returning the exact same
@@ -66,10 +66,8 @@ async function recordKtechBalance(rawBalance: unknown) {
  * were not captured. The documented NIN Validation, Personalization, and
  * IPE Clearance endpoints are implemented below.
  *
- * Also unconfirmed: the docs page never states its API host explicitly
- * (only relative paths like "/api/v1/data/purchase"). KTECH_BASE_URL
- * defaults to the docs' own host + /api/v1 - correct this via the
- * KTECH_BASE_URL env var if the real API lives on a different host.
+ * The API base URL is https://k-tech.com.ng/api/v1. Override it with
+ * KTECH_BASE_URL only when deploying against a different environment.
  */
 
 
