@@ -24,9 +24,10 @@ const SIGNATURE_HEADERS = [
   'x-signature',
   'x-signature-256',
   'x-hub-signature-256',
-  'signature'
+  'signature',
+  'x-mdl-signature'
 ];
-const TIMESTAMP_HEADERS = ['x-ktech-timestamp', 'x-k-tech-timestamp', 'x-webhook-timestamp', 'x-timestamp'];
+const TIMESTAMP_HEADERS = ['x-ktech-timestamp', 'x-k-tech-timestamp', 'x-webhook-timestamp', 'x-timestamp', 'x-mdl-timestamp'];
 const PLAIN_SECRET_HEADERS = ['x-webhook-secret', 'x-ktech-secret', 'x-k-tech-secret', 'x-api-key'];
 
 export type HeaderBag = Record<string, string | string[] | undefined>;

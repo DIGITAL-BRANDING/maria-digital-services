@@ -25,7 +25,7 @@ Check the Railway logs for lines starting with `[ktech-webhook]`:
 ## Signature schemes accepted
 K-Tech's partner docs are behind a login, so the receiver accepts the common schemes
 (always requiring the shared secret): HMAC-SHA256 of the raw body (hex/base64, optional
-`sha256=`), HMAC-SHA256 of `timestamp.body`, `t=...,v1=...` headers, or the secret sent in
+`sha256=`), HMAC-SHA256 of `timestamp.body` (including K-Tech sender headers `X-MDL-Signature` + `X-MDL-Timestamp`), `t=...,v1=...` headers, or the secret sent in
 `X-Webhook-Secret` / `Authorization: Bearer`. See `src/lib/webhook-signature.ts`.
 
 ## Ticket events
