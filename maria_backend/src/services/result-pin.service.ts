@@ -140,8 +140,12 @@ export async function updateServicePrice(service: string, input: { sellingPrice?
  * data-plan-pricing.service.ts - see that function's comment for why the
  * loop is sequential (DATABASE_URL's connection_limit=1).
  */
-export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz'; markupNaira: number; markupPercent: number }) {
-  const rows = await prisma.servicePricing.findMany({ where: { provider: params.provider } });
+export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number }) {
+  const bvnTier = params.provider === 'bvn_modification_agency' ? 'AGENCY' : params.provider === 'bvn_modification_bank' ? 'BANK' : null;
+  const where = bvnTier
+    ? { provider: 'manual', service: { startsWith: 'BVN_MODIFICATION_', endsWith: `_${bvnTier}` } }
+    : { provider: params.provider };
+  const rows = await prisma.servicePricing.findMany({ where });
 
   let updated = 0;
   let skipped = 0;

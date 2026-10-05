@@ -33,6 +33,7 @@ export const BVN_MODIFICATION_TYPES = [
 ] as const;
 
 export type BvnModificationType = (typeof BVN_MODIFICATION_TYPES)[number];
+export type BvnEnrollmentType = 'Agency' | 'Bank';
 
 export type BvnModificationFieldInput = 'text' | 'date' | 'phone' | 'email' | 'bvn' | 'nin' | 'image' | 'select';
 
@@ -73,22 +74,12 @@ export const BVN_MODIFICATION_BANKS = [
 // locate and verify the record before changing anything on it, plus proof
 // of identity (the NIN and a photo of the National ID card) so an admin can
 // actually confirm the requester is who they say they are before re-keying
-// anything. "Bank Name" only appears once "Bank" is chosen as the
-// enrollment type (an agency enrollment has no associated bank) - see
-// `dependsOn` above.
+// anything. Enrollment type and bank/network are collected in their own
+// step before the customer chooses a modification type.
 const identifyingFields: BvnModificationField[] = [
   { key: 'bvn', label: 'BVN Number', required: true, input: 'bvn' },
   { key: 'nin', label: 'NIN Number', required: true, input: 'nin' },
   { key: 'id_card_image', label: 'National ID Card (photo)', required: true, input: 'image' },
-  { key: 'enrollment_type', label: 'Enrollment Type', required: true, input: 'select', options: ['Agency', 'Bank'] },
-  {
-    key: 'bank_name',
-    label: 'Bank Name',
-    required: true,
-    input: 'select',
-    options: [...BVN_MODIFICATION_BANKS],
-    dependsOn: { key: 'enrollment_type', value: 'Bank' }
-  }
 ];
 
 const nameFields: BvnModificationField[] = [
@@ -146,12 +137,16 @@ function serviceKeyFor(type: BvnModificationType) {
   return `BVN_MODIFICATION_${type.toUpperCase()}`;
 }
 
+function pricingServiceKey(type: BvnModificationType, enrollmentType: BvnEnrollmentType) {
+  return `${serviceKeyFor(type)}_${enrollmentType.toUpperCase()}`;
+}
+
 /** Same plain-findUnique-then-conditional-create shape as
  *  getOrCreatePricingRow() in nin-modification.service.ts - never resets an
  *  admin's already-configured price back to the default. */
-async function getOrCreatePricingRow(type: BvnModificationType) {
+async function getOrCreatePricingRow(type: BvnModificationType, enrollmentType: BvnEnrollmentType) {
   const config = BVN_MODIFICATION_CONFIG[type];
-  const service = serviceKeyFor(type);
+  const service = pricingServiceKey(type, enrollmentType);
   const existing = await prisma.servicePricing.findUnique({ where: { service } });
   if (existing) return existing;
 
@@ -160,7 +155,7 @@ async function getOrCreatePricingRow(type: BvnModificationType) {
       data: {
         service,
         provider: 'manual',
-        label: `BVN Modification \u2014 ${config.title}`,
+        label: `BVN Modification \u2014 ${enrollmentType === 'Agency' ? 'Agency Banking' : 'Banks'} \u2014 ${config.title}`,
         providerCostKobo: priceToKobo(config.price)
       }
     });
@@ -172,8 +167,8 @@ async function getOrCreatePricingRow(type: BvnModificationType) {
   }
 }
 
-export async function getBvnModificationPrice(type: BvnModificationType) {
-  const row = await getOrCreatePricingRow(type);
+export async function getBvnModificationPrice(type: BvnModificationType, enrollmentType: BvnEnrollmentType = 'Agency') {
+  const row = await getOrCreatePricingRow(type, enrollmentType);
   if (!row.isActive) {
     throw new ApiError(422, `${row.label} is currently unavailable`, 'SERVICE_INACTIVE');
   }
@@ -183,10 +178,14 @@ export async function getBvnModificationPrice(type: BvnModificationType) {
 
 /** Public price list, keyed by modification type id - never throws on a disabled service. */
 export async function listBvnModificationPrices() {
-  const rows = await Promise.all(BVN_MODIFICATION_TYPES.map((type) => getOrCreatePricingRow(type)));
-  return rows.map((row, index) => ({
-    type: BVN_MODIFICATION_TYPES[index],
-    title: BVN_MODIFICATION_CONFIG[BVN_MODIFICATION_TYPES[index]].title,
+  const enrollments: BvnEnrollmentType[] = ['Agency', 'Bank'];
+  const rows = await Promise.all(BVN_MODIFICATION_TYPES.flatMap((type) =>
+    enrollments.map(async (enrollmentType) => ({ type, enrollmentType, row: await getOrCreatePricingRow(type, enrollmentType) }))
+  ));
+  return rows.map(({ type, enrollmentType, row }) => ({
+    type,
+    enrollmentType,
+    title: `${enrollmentType === 'Agency' ? 'Agency Banking' : 'Banks'} \u2014 ${BVN_MODIFICATION_CONFIG[type].title}`,
     unitPrice: koboToNaira(row.sellingPriceKobo ?? row.providerCostKobo),
     isActive: row.isActive
   }));
@@ -219,6 +218,10 @@ function renderBvnModificationPdf(params: {
 
     doc.fontSize(10).font('Helvetica-Bold').text('Reference: ', { continued: true }).font('Helvetica').text(params.reference);
     doc.font('Helvetica-Bold').text('Submitted: ', { continued: true }).font('Helvetica').text(params.submittedAt.toISOString());
+    doc.font('Helvetica-Bold').text('Enrollment type: ', { continued: true }).font('Helvetica').text(String(params.values.enrollment_type ?? 'Agency'));
+    if (params.values.enrollment_type === 'Bank') {
+      doc.font('Helvetica-Bold').text('Bank: ', { continued: true }).font('Helvetica').text(String(params.values.bank_name ?? '\u2014'));
+    }
     doc.moveDown(1);
 
     doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#ccc').stroke();
@@ -269,21 +272,25 @@ export type SubmitBvnModificationResult = { reference: string; balanceAfter: num
 export async function submitBvnModificationRequest(params: {
   userId: string;
   type: BvnModificationType;
+  enrollmentType?: BvnEnrollmentType;
   values: Record<string, unknown>;
   idempotencyKey?: string;
 }): Promise<SubmitBvnModificationResult> {
   const config = BVN_MODIFICATION_CONFIG[params.type];
-  const price = await getBvnModificationPrice(params.type);
-  const service = serviceKeyFor(params.type);
+  const enrollmentType = params.enrollmentType ?? (params.values.enrollment_type === 'Bank' ? 'Bank' : 'Agency');
+  const price = await getBvnModificationPrice(params.type, enrollmentType);
+  const service = pricingServiceKey(params.type, enrollmentType);
+  const enrollmentLabel = enrollmentType === 'Agency' ? 'Agency Banking' : String(params.values.bank_name ?? 'Banks');
 
   const debit = await debitWallet({
     userId: params.userId,
     amount: price.unitPrice,
     type: TransactionType.BVN_MODIFICATION,
-    description: `BVN Modification \u2014 ${config.title}`,
+    description: `BVN Modification \u2014 ${enrollmentLabel} \u2014 ${config.title}`,
     metadata: {
       service,
       modification_type: params.type,
+      enrollment_type: enrollmentType,
       unit_price: price.unitPrice,
       pii: sealPII(params.values)
     } as Prisma.InputJsonValue,
@@ -311,6 +318,7 @@ export async function submitBvnModificationRequest(params: {
       metadata: {
         service,
         modification_type: params.type,
+        enrollment_type: enrollmentType,
         unit_price: price.unitPrice,
         pii: sealPII({ ...params.values, pdf_base64: pdfBase64 })
       } as Prisma.InputJsonValue

@@ -73,26 +73,17 @@ beforeEach(() => {
 });
 
 describe('getBvnModificationPrice / listBvnModificationPrices', () => {
-  it('creates a default-priced row per type on first lookup', async () => {
+  it('creates a default-priced row per type and enrollment on first lookup', async () => {
     expect((await getBvnModificationPrice('update_phone')).unitPrice).toBe(3500);
     expect((await getBvnModificationPrice('update_name')).unitPrice).toBe(5000);
     expect((await getBvnModificationPrice('update_name_dob')).unitPrice).toBe(8000);
   });
 
-  it('lists all eight types', async () => {
+  it('lists all eight types with separate Agency and Bank prices', async () => {
     const prices = await listBvnModificationPrices();
-    expect(prices.map((p) => p.type).sort()).toEqual(
-      [
-        'update_address',
-        'update_dob',
-        'update_dob_phone',
-        'update_name',
-        'update_name_address',
-        'update_name_dob',
-        'update_name_phone',
-        'update_phone'
-      ].sort()
-    );
+    expect(prices).toHaveLength(16);
+    expect(prices.filter((p) => p.enrollmentType === 'Agency')).toHaveLength(8);
+    expect(prices.filter((p) => p.enrollmentType === 'Bank')).toHaveLength(8);
   });
 });
 

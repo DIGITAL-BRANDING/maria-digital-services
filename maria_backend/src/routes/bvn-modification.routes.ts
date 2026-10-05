@@ -4,8 +4,10 @@ import { requireAuth } from '../middleware/auth.js';
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import {
   BVN_MODIFICATION_CONFIG,
+  BVN_MODIFICATION_BANKS,
   BVN_MODIFICATION_TYPES,
   type BvnModificationField,
+  type BvnEnrollmentType,
   type BvnModificationType,
   listBvnModificationHistory,
   listBvnModificationPrices,
@@ -72,13 +74,16 @@ function schemaFor(type: BvnModificationType) {
   for (const field of fields) {
     shape[field.key] = zodFor(field);
   }
+  shape.enrollment_type = z.enum(['Agency', 'Bank']);
+  shape.bank_name = z.enum(BVN_MODIFICATION_BANKS as unknown as [string, ...string[]]).optional().or(z.literal(''));
   const base = z.object({ ...shape, ...pinField });
-
-  const conditional = fields.filter((f) => f.dependsOn && f.required);
-  if (conditional.length === 0) return base;
 
   return base.superRefine((value, ctx) => {
     const record = value as Record<string, unknown>;
+    if (record.enrollment_type === 'Bank' && (typeof record.bank_name !== 'string' || !record.bank_name.trim())) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['bank_name'], message: 'Bank Name is required' });
+    }
+    const conditional = fields.filter((f) => f.dependsOn && f.required);
     for (const field of conditional) {
       const dependsOn = field.dependsOn!;
       if (record[dependsOn.key] !== dependsOn.value) continue;
@@ -155,9 +160,11 @@ for (const type of BVN_MODIFICATION_TYPES) {
     await requirePinConfirmation(req.user!.id, body.pin);
     const { pin, ...values } = body;
     void pin;
+    const enrollmentType = z.enum(['Agency', 'Bank']).parse(body.enrollment_type) as BvnEnrollmentType;
     const result = await submitBvnModificationRequest({
       userId: req.user!.id,
       type,
+      enrollmentType,
       values,
       idempotencyKey: idempotencyKeyFrom(req)
     });

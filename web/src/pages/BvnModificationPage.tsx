@@ -20,7 +20,7 @@ import {
 type FieldInput = 'text' | 'date' | 'phone' | 'email' | 'bvn' | 'nin' | 'image' | 'select';
 type Field = { key: string; label: string; required: boolean; input: FieldInput; options?: string[]; dependsOn?: { key: string; value: string } };
 type TypeConfig = { id: string; title: string; fields: Field[] };
-type PriceRow = { type: string; title: string; unitPrice: number; isActive: boolean };
+type PriceRow = { type: string; enrollmentType: 'Agency' | 'Bank'; title: string; unitPrice: number; isActive: boolean };
 type HistoryEntry = { reference: string; status: string; created_at: string; pdf_base64: string | null; modification_type: string | null };
 type MatchResult = {
   bvn_date_of_birth: string | null;
@@ -52,7 +52,7 @@ const TYPE_ORDER = [
   'update_dob_phone'
 ];
 
-type Stage = 'decide' | 'verify' | 'select' | 'form';
+type Stage = 'decide' | 'verify' | 'enrollment' | 'select' | 'form';
 
 export default function BvnModificationPage() {
   const nav = useNavigate();
@@ -61,6 +61,8 @@ export default function BvnModificationPage() {
 
   const [types, setTypes] = useState<TypeConfig[]>([]);
   const [prices, setPrices] = useState<Record<string, number>>({});
+  const [enrollmentType, setEnrollmentType] = useState<'Agency' | 'Bank' | null>(null);
+  const [bankName, setBankName] = useState('');
   const [selectedType, setSelectedType] = useState<string | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
   const [imageErrors, setImageErrors] = useState<Record<string, string>>({});
@@ -87,17 +89,23 @@ export default function BvnModificationPage() {
       .then(([typesRes, pricesRes]) => {
         const ordered = [...typesRes.data].sort((a, b) => TYPE_ORDER.indexOf(a.id) - TYPE_ORDER.indexOf(b.id));
         setTypes(ordered);
-        setPrices(Object.fromEntries(pricesRes.data.map((row) => [row.type, row.unitPrice])));
+        setPrices(Object.fromEntries(pricesRes.data.map((row) => [`${row.type}:${row.enrollmentType}`, row.unitPrice])));
       })
       .catch(() => setMessage('Unable to load modification types. Please refresh and try again.'));
   }, []);
 
   const selected = useMemo(() => types.find((t) => t.id === selectedType) ?? null, [types, selectedType]);
-  const selectedPrice = selectedType ? prices[selectedType] : undefined;
+  const selectedPrice = selectedType && enrollmentType ? prices[`${selectedType}:${enrollmentType}`] : undefined;
+
+  function chooseEnrollment(value: 'Agency' | 'Bank') {
+    setEnrollmentType(value);
+    setBankName('');
+    setStage('select');
+  }
 
   function pickType(id: string) {
     setSelectedType(id);
-    setValues({});
+    setValues({ enrollment_type: enrollmentType ?? '', ...(enrollmentType === 'Bank' && bankName ? { bank_name: bankName } : {}) });
     setImageErrors({});
     setMessage('');
     setReference('');
@@ -204,7 +212,7 @@ export default function BvnModificationPage() {
       <div className="mx-auto max-w-5xl">
         <button
           onClick={() => {
-            if (stage === 'form' || stage === 'select') return setStage('decide');
+            if (stage === 'form' || stage === 'select' || stage === 'enrollment') return setStage('decide');
             if (stage === 'verify') return setStage('decide');
             nav('/bvn-services');
           }}
@@ -229,12 +237,12 @@ export default function BvnModificationPage() {
 
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <button
-                onClick={() => setStage('select')}
+                onClick={() => setStage('enrollment')}
                 className={`${TILE_CLASSES} ${TILE_UNSELECTED_CLASSES} flex flex-col items-center gap-2 p-6`}
               >
                 <CheckCircle2 size={28} />
                 <span className="font-display text-base font-bold">I know exactly what to fix</span>
-                <span className="text-xs text-white/80">Go straight to picking a modification type</span>
+                <span className="text-xs text-white/80">Choose where the BVN was enrolled first</span>
               </button>
               <button
                 onClick={() => setStage('verify')}
@@ -312,9 +320,39 @@ export default function BvnModificationPage() {
                   </div>
                 )}
 
-                <button onClick={() => setStage('select')} className="mt-5 w-full rounded-xl bg-[#0b2f73] py-3 font-display font-semibold text-white sm:w-auto sm:px-8">
-                  Continue to pick a modification type
+                <button onClick={() => setStage('enrollment')} className="mt-5 w-full rounded-xl bg-[#0b2f73] py-3 font-display font-semibold text-white sm:w-auto sm:px-8">
+                  Continue to choose enrollment type
                 </button>
+              </div>
+            )}
+          </section>
+        )}
+
+        {stage === 'enrollment' && (
+          <section className={FORM_SECTION_CLASSES}>
+            <h2 className="font-display text-lg font-bold text-[#0b2f73]">Where was your BVN enrolled?</h2>
+            <p className={`mt-2 ${FORM_HELP_CLASSES}`}>
+              Agency Banking requests usually take 3–4 working days. Bank and NIBSS requests usually take 5–7 working days. Pricing is set separately for each enrollment type.
+            </p>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              <button onClick={() => chooseEnrollment('Agency')} className={`${TILE_CLASSES} ${TILE_UNSELECTED_CLASSES} flex flex-col items-center gap-2 p-6`}>
+                <span className="font-display text-base font-bold">Agency Banking</span>
+                <span className="text-xs text-white/80">3–4 working days</span>
+              </button>
+              <button onClick={() => { setEnrollmentType('Bank'); setBankName(''); }} className={`${TILE_CLASSES} ${TILE_UNSELECTED_CLASSES} flex flex-col items-center gap-2 p-6`}>
+                <span className="font-display text-base font-bold">Bank / NIBSS</span>
+                <span className="text-xs text-white/80">5–7 working days</span>
+              </button>
+            </div>
+            {enrollmentType === 'Bank' && (
+              <div className="mt-4">
+                <label className={FORM_LABEL_CLASSES}>Select bank or enrollment network
+                  <select className={`mt-1 ${FORM_INPUT_CLASSES}`} value={bankName} onChange={(event) => setBankName(event.target.value)}>
+                    <option value="">-- Select --</option>
+                    {['Micro Finance Bank', 'First Bank', 'Access Bank', 'Heritage Bank', 'Enterprise Bank', 'BOA Bank', 'LAPO Bank', 'NIBSS'].map((bank) => <option key={bank} value={bank}>{bank}</option>)}
+                  </select>
+                </label>
+                <button disabled={!bankName} onClick={() => setStage('select')} className="mt-4 w-full rounded-xl bg-[#0b2f73] py-3 font-display font-semibold text-white disabled:opacity-50 sm:w-auto sm:px-8">Continue</button>
               </div>
             )}
           </section>
@@ -332,7 +370,7 @@ export default function BvnModificationPage() {
                 >
                   {suggested && <span className="absolute -top-2 left-1/2 -translate-x-1/2 rounded-full bg-gold-400 px-2 py-0.5 text-[10px] font-bold text-[#4a3505]">Suggested</span>}
                   <span className="font-body text-sm font-semibold">{type.title}</span>
-                  <span className="mt-1 text-xs font-bold text-gold-300">{money(prices[type.id])}</span>
+                  <span className="mt-1 text-xs font-bold text-gold-300">{money(enrollmentType ? prices[`${type.id}:${enrollmentType}`] : undefined)}</span>
                 </button>
               );
             })}
@@ -344,7 +382,7 @@ export default function BvnModificationPage() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-display text-xl font-bold text-[#0b2f73]">{selected.title}</h2>
               <span className="rounded-full bg-gold-500/15 px-4 py-2 font-body text-sm font-bold text-gold-700">
-                Service cost: {money(selectedPrice)}
+                Service cost: {money(selectedPrice)} · {enrollmentType === 'Agency' ? 'Agency Banking' : 'Banks'}
               </span>
             </div>
 

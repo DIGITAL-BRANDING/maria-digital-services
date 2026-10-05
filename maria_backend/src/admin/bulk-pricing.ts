@@ -185,7 +185,7 @@ export function registerBulkPricingRoutes(router: Router) {
     const percent = parseNonNegativeNumber(field(req, 'markupPercent'));
     const naira = parseNonNegativeNumber(field(req, 'markupNaira'));
     const providerRaw = field(req, 'provider');
-    const provider = providerRaw === 'alrahuz' ? 'alrahuz' : providerRaw === 'techhub' ? 'techhub' : null;
+    const provider = providerRaw === 'alrahuz' ? 'alrahuz' : providerRaw === 'bvn_modification_agency' ? 'bvn_modification_agency' : providerRaw === 'bvn_modification_bank' ? 'bvn_modification_bank' : providerRaw === 'techhub' ? 'techhub' : null;
     if (percent === null || naira === null || !provider) {
       return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Markup % and ₦ must both be valid numbers ≥ 0, and a provider must be selected.'));
     }
@@ -199,7 +199,7 @@ export function registerBulkPricingRoutes(router: Router) {
         metadata: { provider, markupPercent: percent, markupNaira: naira, updated: result.updated }
       });
 
-      const label = provider === 'techhub' ? 'NIN/BVN verification services' : 'WAEC/NECO/NABTEB result-pin services';
+      const label = provider === 'techhub' ? 'NIN/BVN verification services' : provider === 'bvn_modification_agency' ? 'Agency BVN modification services' : provider === 'bvn_modification_bank' ? 'Bank BVN modification services' : 'WAEC/NECO/NABTEB result-pin services';
       const skippedNote = result.skipped > 0 ? ` (${result.skipped} skipped - non-positive computed price)` : '';
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Repriced ${result.updated} ${label} at cost + ${percent}% + ₦${naira}.${skippedNote}`));
     } catch (error) {
@@ -381,11 +381,13 @@ function renderPage(params: {
 
   <div class="card">
     <h2>3. Bulk reprice services</h2>
-    <p class="hint">Same idea for the NIN/BVN verification list (Techhub) or the WAEC/NECO/NABTEB result-pin list (Alrahuz).</p>
+    <p class="hint">Reprice NIN/BVN verification (Techhub), WAEC/NECO/NABTEB result pins (Alrahuz), Agency BVN modifications, or Bank BVN modifications. Agency and Bank prices are managed separately.</p>
     <form method="POST" action="/admin/bulk-pricing/services" onsubmit="return confirm('This overwrites the selling price on every matching service. Continue?');">
       <div class="provider-choice">
         <label><input type="radio" name="provider" value="techhub" checked> NIN/BVN (Techhub)</label>
         <label><input type="radio" name="provider" value="alrahuz"> WAEC/NECO/NABTEB (Alrahuz)</label>
+        <label><input type="radio" name="provider" value="bvn_modification_agency"> BVN Modification — Agency Banking</label>
+        <label><input type="radio" name="provider" value="bvn_modification_bank"> BVN Modification — Banks/NIBSS</label>
       </div>
       <div class="row">
         <div>
