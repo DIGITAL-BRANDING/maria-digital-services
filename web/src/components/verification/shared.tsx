@@ -226,20 +226,32 @@ export function TierCardGrid<T extends string>({
 // field named pdf_base64/pdf_url/slip_url is picked up and rendered the
 // same way everywhere, instead of only where someone remembered to wire it.
 function extractPdfFields(source: Record<string, unknown> | null | undefined) {
-  const directPdf = typeof source?.pdf_base64 === 'string' && source.pdf_base64.trim().length > 0 ? source.pdf_base64 : null;
+  const findField = (keys: string[]): string | null => {
+    const seen = new Set<object>();
+    const visit = (value: unknown): string | null => {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || seen.has(value)) return null;
+      seen.add(value);
+      const record = value as Record<string, unknown>;
+      for (const key of keys) {
+        const candidate = record[key];
+        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+      }
+      for (const [key, child] of Object.entries(record)) {
+        if (/pdf|slip|file|document|result|response|data|user_data/i.test(key)) {
+          const found = visit(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    return visit(source);
+  };
+  const directPdf = findField(['pdf_base64', 'certificate_pdf_base64', 'file_base64']);
   // EaseID may return the document as "Pdf Base64" within user_data rather
   // than the usual pdf_base64 field. Accept either spelling without showing
   // the encoded document as a text row.
-  const nestedPdf = source
-    ? Object.entries(source).find(([key, value]) => /pdf|base64/i.test(key) && typeof value === 'string' && value.trim().length > 0)?.[1]
-    : undefined;
-  const pdfBase64 = directPdf ?? (typeof nestedPdf === 'string' ? nestedPdf : null);
-  const pdfUrl =
-    typeof source?.pdf_url === 'string' && source.pdf_url.trim().length > 0
-      ? source.pdf_url
-      : typeof source?.slip_url === 'string' && source.slip_url.trim().length > 0
-        ? source.slip_url
-        : null;
+  const pdfBase64 = directPdf ?? findField(['Pdf Base64', 'PDF Base64']);
+  const pdfUrl = findField(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']);
   return { pdfBase64, pdfUrl };
 }
 
@@ -526,6 +538,8 @@ export type ServiceTicket = {
   tracking_id: string | null;
   nin: string | null;
   email: string | null;
+  pdf_base64: string | null;
+  pdf_url: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -543,20 +557,22 @@ export function useServiceTickets(serviceKey: string | readonly string[]) {
   const [loading, setLoading] = useState(true);
   const key = Array.isArray(serviceKey) ? serviceKey.join(',') : (serviceKey as string);
 
-  async function refresh() {
-    setLoading(true);
+  async function refresh(showLoading = false) {
+    if (showLoading) setLoading(true);
     try {
       const result = await api.get<{ status: boolean; data: ServiceTicket[] }>(`/verification/tickets?service=${encodeURIComponent(key)}`);
       setTickets(result.data ?? []);
     } catch {
       setTickets([]);
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
   }
 
   useEffect(() => {
-    void refresh();
+    void refresh(true);
+    const interval = window.setInterval(() => void refresh(), 15_000);
+    return () => window.clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
@@ -635,7 +651,7 @@ export function TicketTrackingTable({
           <table className="w-full text-left font-body text-xs">
             <thead>
               <tr className="border-b border-blue-100 text-[#0b2f73]/70">
-                {['Check Status', 'Service', 'Tracking ID', 'Message', 'Status', 'Date'].map((h) => (
+                {['Check Status', 'Service', 'Tracking ID', 'Message', 'Status', 'File', 'Date'].map((h) => (
                   <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">
                     {h}
                   </th>
@@ -663,6 +679,17 @@ export function TicketTrackingTable({
                   <td className="px-3 py-2 text-[#0b2f73]/70">{t.message}</td>
                   <td className="whitespace-nowrap px-3 py-2">
                     <StatusBadge status={t.status} />
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2">
+                    {(() => {
+                      const base64 = t.pdf_base64?.replace(/^data:application\/pdf;base64,/i, '');
+                      const href = base64 ? `data:application/pdf;base64,${base64}` : t.pdf_url?.startsWith('https://') ? t.pdf_url : null;
+                      return href ? (
+                        <a href={href} download={`${t.reference}.pdf`} target={base64 ? undefined : '_blank'} rel={base64 ? undefined : 'noreferrer'} className="rounded-lg bg-gold-500 px-2 py-1.5 font-bold text-ink">
+                          <Download size={12} className="mr-1 inline" /> Download
+                        </a>
+                      ) : <span className="text-[#0b2f73]/40">—</span>;
+                    })()}
                   </td>
                   <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{new Date(t.created_at).toLocaleDateString()}</td>
                 </tr>

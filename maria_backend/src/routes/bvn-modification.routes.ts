@@ -160,7 +160,7 @@ for (const type of BVN_MODIFICATION_TYPES) {
     await requirePinConfirmation(req.user!.id, body.pin);
     const { pin, ...values } = body;
     void pin;
-    const enrollmentType = z.enum(['Agency', 'Bank']).parse(body.enrollment_type) as BvnEnrollmentType;
+    const enrollmentType = z.enum(['Agency', 'Bank']).parse((body as Record<string, unknown>).enrollment_type) as BvnEnrollmentType;
     const result = await submitBvnModificationRequest({
       userId: req.user!.id,
       type,

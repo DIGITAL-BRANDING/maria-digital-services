@@ -22,6 +22,28 @@ export async function createUserDelivery(input: { userId: string; adminId: strin
   return delivery;
 }
 
+/** Stores a provider-hosted result URL as an encrypted User Delivery link. */
+export async function createUserDeliveryLink(input: { userId: string; adminId: string; title: string; description?: string; fileName: string; mimeType: string; url: string; reference: string }) {
+  let parsed: URL;
+  try { parsed = new URL(input.url); } catch { throw new Error('Invalid delivery URL'); }
+  if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.hostname === 'localhost' || parsed.hostname.endsWith('.localhost')) {
+    throw new Error('Delivery URL must use a public HTTPS host');
+  }
+  const safeName = input.fileName.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 180) || 'result.pdf';
+  return prisma.userDelivery.create({ data: {
+    userId: input.userId,
+    createdByAdminId: input.adminId,
+    title: input.title,
+    description: input.description,
+    fileName: safeName,
+    mimeType: allowed.has(input.mimeType) ? input.mimeType : 'application/pdf',
+    filePath: `external:${crypto.randomUUID()}`,
+    inlineData: sealPII({ sourceUrl: parsed.toString() }),
+    fileSize: 0,
+    reference: input.reference
+  } });
+}
+
 export async function listUserDeliveries(userId: string) {
   return prisma.userDelivery.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 100 });
 }
@@ -29,7 +51,10 @@ export async function listUserDeliveries(userId: string) {
 export async function signedDeliveryUrl(userId: string, id: string) {
   const row = await prisma.userDelivery.findFirst({ where: { id, userId } });
   if (!row) return null;
-  const inline = openPII<{ base64?: unknown }>(row.inlineData);
+  const inline = openPII<{ base64?: unknown; sourceUrl?: unknown }>(row.inlineData);
+  if (typeof inline?.sourceUrl === 'string' && inline.sourceUrl.startsWith('https://')) {
+    return { row, url: inline.sourceUrl };
+  }
   if (typeof inline?.base64 === 'string' && inline.base64.length > 0) {
     return { row, url: `data:${row.mimeType};base64,${inline.base64}` };
   }

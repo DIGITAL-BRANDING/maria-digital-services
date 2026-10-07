@@ -276,23 +276,38 @@ webhookRoutes.post('/ktech', async (req, res) => {
   }
 
   const ticketId = data.ticket_id ?? data.ticketId ?? payload.ticket_id;
+  // K-Tech's documented transaction.updated webhook uses the original
+  // transaction reference and may omit ticket_id entirely. Match it against
+  // our debit transaction reference so async service outcomes still settle.
+  const reference = data.reference ?? payload.reference;
   const status = normalizeKtechTicketStatus(data.status ?? payload.status);
-  if (typeof ticketId !== 'string' || !status) {
+  if ((typeof ticketId !== 'string' && typeof reference !== 'string') || !status) {
     // Not a ticket outcome we know how to act on. Acknowledge so K-Tech doesn't retry forever.
-    console.warn('[ktech-webhook] acknowledged but not acted on', { event: eventName || null, hasTicketId: typeof ticketId === 'string', status: data.status ?? null });
+    console.warn('[ktech-webhook] acknowledged but not acted on', { event: eventName || null, hasTicketId: typeof ticketId === 'string', hasReference: typeof reference === 'string', status: data.status ?? null });
     return res.status(200).json({ ok: true, ignored: true });
   }
 
   try {
-    const response = data.response && typeof data.response === 'object' && !Array.isArray(data.response) ? data.response : null;
-    const result = await settleKtechTicket({ ticketId, status, response, raw: payload });
+    const nestedResponse = data.response && typeof data.response === 'object' && !Array.isArray(data.response)
+      ? data.response
+      : data.result && typeof data.result === 'object' && !Array.isArray(data.result)
+        ? data.result
+        : {};
+    const response = { ...data, ...(nestedResponse as Record<string, unknown>) };
+    const result = await settleKtechTicket({
+      ...(typeof ticketId === 'string' ? { ticketId } : {}),
+      ...(typeof reference === 'string' ? { reference } : {}),
+      status,
+      response,
+      raw: payload
+    });
     if (!result.handled) {
-      console.warn('[ktech-webhook] ticket not found on our side', { ticketId });
+      console.warn('[ktech-webhook] ticket/reference not found on our side', { ticketId: typeof ticketId === 'string' ? ticketId : null, reference: typeof reference === 'string' ? reference : null });
       return res.status(200).json({ ok: true, ignored: true, reason: 'Unknown ticket' });
     }
     return res.status(200).json({ ok: true, status: result.status });
   } catch (error) {
-    console.error('[ktech-webhook] failed to settle ticket', ticketId, error);
+    console.error('[ktech-webhook] failed to settle ticket', { ticketId, reference }, error);
     return res.status(500).json({ error: 'Webhook processing failed' });
   }
 });

@@ -280,24 +280,27 @@ export class KtechService {
 
     const data = (await response.json().catch(() => ({}))) as KtechResponse;
     const payload = (data.data ?? {}) as Record<string, unknown>;
-    const rawStatus = typeof payload.status === 'string' ? payload.status.toLowerCase() : '';
+    const rawStatus = typeof payload.status === 'string' ? payload.status.trim().toLowerCase() : '';
     if (!response.ok || data.status !== true || !rawStatus) {
       console.error(`[ktech] async status check failed (path=${path}, http=${response.status}):`, JSON.stringify(data));
       throw new ApiError(response.status >= 400 ? response.status : 502, data.message ?? 'Could not check request status', 'KTECH_STATUS_FAILED');
     }
 
-    const status = rawStatus === 'success' || rawStatus === 'successful'
+    const status = ['success', 'successful', 'completed', 'complete', 'done', 'approved'].includes(rawStatus)
       ? 'success'
-      : rawStatus === 'pending' || rawStatus === 'processing'
-        ? 'pending'
-        : 'failed';
-    const responseData = payload.response;
+      : ['failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'].includes(rawStatus)
+        ? 'failed'
+        : 'pending';
+    const nestedResponse = payload.response && typeof payload.response === 'object' && !Array.isArray(payload.response)
+      ? payload.response
+      : payload.result && typeof payload.result === 'object' && !Array.isArray(payload.result)
+        ? payload.result
+        : {};
+    const responseData = { ...payload, ...(nestedResponse as Record<string, unknown>) };
     return {
       ticketId: typeof payload.ticket_id === 'string' ? payload.ticket_id : ticketId,
       status,
-      response: responseData !== null && typeof responseData === 'object' && !Array.isArray(responseData)
-        ? responseData as Record<string, unknown>
-        : null,
+      response: responseData as Record<string, unknown>,
       raw: data
     };
   }

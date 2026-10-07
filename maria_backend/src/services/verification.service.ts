@@ -6,6 +6,7 @@ import { ApiError } from '../middleware/error.js';
 import { debitWallet, refundWallet } from './wallet.service.js';
 import { notifyUser } from './notification.service.js';
 import { recordProviderDebit } from './provider-ledger.service.js';
+import { createUserDelivery, createUserDeliveryLink } from './user-delivery.service.js';
 import {
   techhubService,
   type TechhubBvnTier,
@@ -568,6 +569,61 @@ type AsyncOutcome = {
   raw: unknown;
 };
 
+function findResponseValue(value: unknown, names: string[]): string | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const obj = value as Record<string, unknown>;
+  for (const [key, item] of Object.entries(obj)) {
+    if (names.includes(key.toLowerCase()) && typeof item === 'string' && item.trim()) return item.trim();
+  }
+  for (const item of Object.values(obj)) {
+    const nested = findResponseValue(item, names);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Record<string, never>>, response: Record<string, unknown> | null) {
+  if (!response) return null;
+  const message = findResponseValue(response, ['message', 'description', 'note', 'remarks']);
+  const url = findResponseValue(response, ['pdf_url', 'file_url', 'download_url', 'document_url', 'slip_url', 'url']);
+  const base64 = findResponseValue(response, ['pdf_base64', 'file_base64', 'document_base64', 'base64']);
+  if (!url && !base64) return null;
+
+  const previous = await prisma.userDelivery.findFirst({ where: { userId: transaction.userId, reference: transaction.reference } });
+  if (previous) return { id: previous.id, created: false };
+
+  const admin = await prisma.adminUser.findFirst({ where: { isActive: true }, orderBy: { createdAt: 'asc' }, select: { id: true } });
+  if (!admin) throw new Error('No active admin is available to own the automated delivery');
+  const metadata = transaction.metadata as Record<string, unknown> | null;
+  const service = String(metadata?.service ?? 'Identity service').replaceAll('_', ' ');
+  const title = `${service} result`;
+  const description = message?.slice(0, 2000) || 'Your completed result is ready to download.';
+  const fileName = findResponseValue(response, ['file_name', 'filename', 'name']) || `${transaction.reference}.pdf`;
+  if (url) {
+    const delivery = await createUserDeliveryLink({ userId: transaction.userId, adminId: admin.id, title, description, fileName, mimeType: findResponseValue(response, ['mime_type', 'content_type']) || 'application/pdf', url, reference: transaction.reference });
+    return { id: delivery.id, created: true };
+  }
+  const dataUriMime = base64?.match(/^data:([^;]+);base64,/)?.[1];
+  const mimeType = dataUriMime || findResponseValue(response, ['mime_type', 'content_type']) || 'application/pdf';
+  const delivery = await createUserDelivery({ userId: transaction.userId, adminId: admin.id, title, description, fileName, mimeType, base64: base64!, reference: transaction.reference });
+  return { id: delivery.id, created: true };
+}
+
+async function notifyAsyncResult(transaction: Prisma.TransactionGetPayload<Record<string, never>>, status: 'success' | 'failed', response: Record<string, unknown> | null, deliveryId?: string) {
+  const providerMessage = response ? findResponseValue(response, ['message', 'description', 'note', 'remarks']) : undefined;
+  const service = String((transaction.metadata as Record<string, unknown> | null)?.service ?? 'Request').replaceAll('_', ' ');
+  const body = status === 'success'
+    ? [providerMessage?.slice(0, 400), deliveryId ? 'Your result is ready in My Deliveries.' : 'Your request was completed successfully.'].filter(Boolean).join(' ')
+    : providerMessage?.slice(0, 500) || 'Your request could not be completed. The wallet refund, if applicable, is shown in your transaction history.';
+  await notifyUser({
+    userId: transaction.userId,
+    type: 'SYSTEM',
+    title: status === 'success' ? `${service} completed` : `${service} update`,
+    body,
+    data: { transactionId: transaction.id, reference: transaction.reference, ...(deliveryId ? { delivery_id: deliveryId } : {}) }
+  });
+}
+
 /**
  * Applies a provider-reported outcome to a still-PENDING async transaction.
  * Shared by the polling path (checkAsyncServiceStatus) and the K-Tech webhook
@@ -584,7 +640,14 @@ async function settleAsyncTransaction(
   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
 
   if (transaction.status !== TransactionStatus.PENDING) {
-    // Already settled (redelivered webhook, or a webhook racing a poll) - nothing to do.
+    // Recover a delivery if persistence failed after the transaction settled but
+    // before the webhook was acknowledged. Existing rows are checked by reference.
+    if (transaction.status === TransactionStatus.SUCCESS && provider === 'ktech') {
+      const sealed = (transaction.metadata as Record<string, unknown> | null)?.pii;
+      const saved = openPII<{ response?: Record<string, unknown> | null }>(sealed)?.response ?? result.response;
+      const delivery = await deliverAsyncResult(transaction, saved);
+      if (delivery?.created) await notifyAsyncResult(transaction, 'success', saved, delivery.id);
+    }
     return {
       ticketId: result.ticketId,
       status: transaction.status === TransactionStatus.SUCCESS ? 'success' : 'failed',
@@ -620,6 +683,11 @@ async function settleAsyncTransaction(
       }).catch((error) => {
         console.error('[provider-ledger] failed to record debit for', transaction.id, error);
       });
+    }
+
+    if (provider === 'ktech') {
+      const delivery = await deliverAsyncResult(transaction, result.response);
+      await notifyAsyncResult(transaction, 'success', result.response, delivery?.id);
     }
 
     return { ticketId: result.ticketId, status: 'success', response: result.response };
@@ -662,6 +730,7 @@ async function settleAsyncTransaction(
       data: { transactionId: transaction.id }
     });
   }
+  if (provider === 'ktech') await notifyAsyncResult(transaction, 'failed', result.response);
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
 }
 
@@ -672,17 +741,30 @@ async function settleAsyncTransaction(
  * press "Check status". Returns `handled: false` for a ticket we don't know.
  */
 export async function settleKtechTicket(params: {
-  ticketId: string;
+  ticketId?: string;
+  reference?: string;
   status: 'pending' | 'success' | 'failed';
   response: Record<string, unknown> | null;
   raw: unknown;
 }) {
+  const identifiers = [
+    ...(params.ticketId ? [{ providerRef: params.ticketId }] : []),
+    ...(params.reference ? [{ reference: params.reference }] : [])
+  ];
+  if (identifiers.length === 0) return { handled: false as const };
   const transaction = await prisma.transaction.findFirst({
-    where: { providerRef: params.ticketId, provider: 'ktech' }
+    where: {
+      provider: 'ktech',
+      type: TransactionType.IDENTITY_SERVICE_REQUEST,
+      OR: identifiers
+    }
   });
   if (!transaction) return { handled: false as const };
 
-  const outcome = await settleAsyncTransaction(transaction, params);
+  const outcome = await settleAsyncTransaction(transaction, {
+    ...params,
+    ticketId: params.ticketId ?? transaction.providerRef ?? transaction.reference
+  });
   return { handled: true as const, transactionId: transaction.id, status: outcome.status };
 }
 
@@ -805,9 +887,32 @@ export type ServiceTicketEntry = {
   tracking_id: string | null;
   nin: string | null;
   email: string | null;
+  pdf_base64: string | null;
+  pdf_url: string | null;
   created_at: string;
   updated_at: string;
 };
+
+function asyncArtifact(pii: Record<string, unknown> | null, keys: string[]) {
+  const visited = new Set<object>();
+  const visit = (value: unknown): string | null => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || visited.has(value)) return null;
+    visited.add(value);
+    const record = value as Record<string, unknown>;
+    for (const key of keys) {
+      const candidate = record[key];
+      if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    }
+    for (const [key, child] of Object.entries(record)) {
+      if (/pdf|slip|file|document|result|response|data|user_data/i.test(key)) {
+        const found = visit(child);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return visit(pii);
+}
 
 function friendlyTicketMessage(status: TransactionStatus): string {
   switch (status) {
@@ -851,7 +956,7 @@ export async function listServiceTickets(userId: string, services: string | stri
     .slice(0, 30)
     .map((transaction) => {
       const metadata = transaction.metadata as Record<string, unknown> | null;
-      const pii = openPII<{ tracking_id?: string; nin?: string; email?: string }>(metadata?.pii);
+      const pii = openPII<Record<string, unknown> & { tracking_id?: string; nin?: string; email?: string }>(metadata?.pii);
       return {
         reference: transaction.reference,
         service: String(metadata?.service ?? ''),
@@ -862,6 +967,8 @@ export async function listServiceTickets(userId: string, services: string | stri
         tracking_id: typeof pii?.tracking_id === 'string' ? pii.tracking_id : null,
         nin: typeof pii?.nin === 'string' ? pii.nin : null,
         email: typeof pii?.email === 'string' ? pii.email : null,
+        pdf_base64: asyncArtifact(pii, ['pdf_base64', 'certificate_pdf_base64', 'file_base64']),
+        pdf_url: asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']),
         created_at: transaction.createdAt.toISOString(),
         updated_at: transaction.updatedAt.toISOString()
       };
