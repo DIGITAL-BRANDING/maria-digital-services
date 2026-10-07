@@ -558,6 +558,11 @@ async function checkAsyncServiceStatus(params: {
   }
 
   const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+  // Manual requests at K-Tech receive a MANUAL-* tracking ticket; there is no
+  // upstream provider ticket to poll. Their terminal result arrives by webhook.
+  if (provider === 'ktech' && params.ticketId.startsWith('MANUAL-')) {
+    return { ticketId: params.ticketId, status: 'pending', response: null };
+  }
   const result = await params.call(params.ticketId, provider);
   return settleAsyncTransaction(transaction, result);
 }
