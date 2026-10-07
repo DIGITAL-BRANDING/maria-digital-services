@@ -148,7 +148,7 @@ export function createApp() {
     limit: 120,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    skip: (req) => req.path.startsWith('/api/webhooks')
+    skip: (req) => req.path.startsWith('/api/webhooks') || req.path === '/mld/webooks' || req.path === '/mld/webhooks'
   }));
 
   // `skipSuccessfulRequests: true` - only requests that actually FAIL (wrong
@@ -178,6 +178,14 @@ export function createApp() {
   // here removes that whole failure mode; each handler still does its own JSON.parse
   // and signature check exactly as before.
   app.use('/api/webhooks', express.raw({ type: '*/*' }), webhookRoutes);
+  // The K-Tech partner dashboard was previously configured with the legacy
+  // callback path shown there (`/mld/webooks`). Keep that saved URL working
+  // while the canonical URL remains `/api/webhooks/ktech`. Both paths pass
+  // through the same signature validation and settlement handler.
+  app.use(['/mld/webooks', '/mld/webhooks'], express.raw({ type: '*/*' }), (req, res, next) => {
+    req.url = '/ktech';
+    webhookRoutes(req, res, next);
+  });
 
   // 20mb (previously 8mb, before that 1mb) so an admin can upload a scanned
   // CAC certificate PDF as base64 through admin/cac.ts's manage page
