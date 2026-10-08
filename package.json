@@ -1,0 +1,7 @@
+{
+  "name": "maria-digital-services-deploy",
+  "private": true,
+  "engines": {
+    "node": ">=22 <23"
+  }
+}
