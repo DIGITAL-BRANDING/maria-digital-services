@@ -90,6 +90,50 @@ webhookRoutes.post('/major-data-link', async (req, res) => {
       return res.status(500).json({ status: false, message: 'Webhook processing failed' });
     }
   }
+
+  // Persist every signed MDL event for audit, and also settle async identity
+  // requests immediately. Previously this endpoint only wrote the audit row,
+  // so successful deliveries never updated the matching MariaDigital request.
+  if (event === 'transaction.updated') {
+    const ticketId = typeof data.ticket_id === 'string' ? data.ticket_id : null;
+    const clientReference = typeof data.client_reference === 'string' ? data.client_reference : null;
+    const status = normalizeKtechTicketStatus(data.status);
+    if (status && (ticketId || reference || clientReference)) {
+      const nestedResponse = data.response && typeof data.response === 'object' && !Array.isArray(data.response)
+        ? data.response as Record<string, unknown>
+        : data.result && typeof data.result === 'object' && !Array.isArray(data.result)
+          ? data.result as Record<string, unknown>
+          : data.completion && typeof data.completion === 'object' && !Array.isArray(data.completion)
+            ? data.completion as Record<string, unknown>
+            : {};
+      const response = { ...data, ...nestedResponse };
+      let settled: Awaited<ReturnType<typeof settleKtechTicket>>;
+      try {
+        settled = await settleKtechTicket({
+          ...(ticketId ? { ticketId } : {}),
+          ...(reference ? { reference } : {}),
+          ...(clientReference ? { clientReference } : {}),
+          status,
+          response,
+          raw: payload
+        });
+      } catch (error) {
+        console.error('[mdl-webhook] failed to apply verified async outcome', { eventId, ticketId, reference }, error);
+        return res.status(500).json({ status: false, message: 'Could not apply async outcome' });
+      }
+      if (!settled.handled) {
+        console.warn('[mdl-webhook] valid event has no matching local async request', {
+          eventId,
+          ticketId,
+          reference,
+          clientReference,
+          status
+        });
+        // Ask MDL to retry while the receiver's transaction mapping is repaired.
+        return res.status(503).json({ status: false, message: 'No matching pending async request yet' });
+      }
+    }
+  }
   return res.status(200).json({ status: true, received: true });
 });
 
@@ -280,8 +324,9 @@ webhookRoutes.post('/ktech', async (req, res) => {
   // transaction reference and may omit ticket_id entirely. Match it against
   // our debit transaction reference so async service outcomes still settle.
   const reference = data.reference ?? payload.reference;
+  const clientReference = typeof data.client_reference === 'string' ? data.client_reference : null;
   const status = normalizeKtechTicketStatus(data.status ?? payload.status);
-  if ((typeof ticketId !== 'string' && typeof reference !== 'string') || !status) {
+  if ((typeof ticketId !== 'string' && typeof reference !== 'string' && !clientReference) || !status) {
     // Not a ticket outcome we know how to act on. Acknowledge so K-Tech doesn't retry forever.
     console.warn('[ktech-webhook] acknowledged but not acted on', { event: eventName || null, hasTicketId: typeof ticketId === 'string', hasReference: typeof reference === 'string', status: data.status ?? null });
     return res.status(200).json({ ok: true, ignored: true });
@@ -297,13 +342,17 @@ webhookRoutes.post('/ktech', async (req, res) => {
     const result = await settleKtechTicket({
       ...(typeof ticketId === 'string' ? { ticketId } : {}),
       ...(typeof reference === 'string' ? { reference } : {}),
+      ...(clientReference ? { clientReference } : {}),
       status,
       response,
       raw: payload
     });
     if (!result.handled) {
-      console.warn('[ktech-webhook] ticket/reference not found on our side', { ticketId: typeof ticketId === 'string' ? ticketId : null, reference: typeof reference === 'string' ? reference : null });
-      return res.status(200).json({ ok: true, ignored: true, reason: 'Unknown ticket' });
+      console.warn('[ktech-webhook] ticket/reference not found on our side', { ticketId: typeof ticketId === 'string' ? ticketId : null, reference: typeof reference === 'string' ? reference : null, clientReference });
+      // A verified terminal update must remain retryable while we repair a
+      // delayed local transaction write or an identifier mapping. 200 here
+      // permanently discarded valid completion events.
+      return res.status(503).json({ ok: false, reason: 'Unknown ticket; retry later' });
     }
     return res.status(200).json({ ok: true, status: result.status });
   } catch (error) {

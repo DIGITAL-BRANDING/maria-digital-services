@@ -647,7 +647,7 @@ async function settleAsyncTransaction(
   if (transaction.status !== TransactionStatus.PENDING) {
     // Recover a delivery if persistence failed after the transaction settled but
     // before the webhook was acknowledged. Existing rows are checked by reference.
-    if (transaction.status === TransactionStatus.SUCCESS && provider === 'ktech') {
+    if (transaction.status === TransactionStatus.SUCCESS) {
       const sealed = (transaction.metadata as Record<string, unknown> | null)?.pii;
       const saved = openPII<{ response?: Record<string, unknown> | null }>(sealed)?.response ?? result.response;
       const delivery = await deliverAsyncResult(transaction, saved);
@@ -690,10 +690,8 @@ async function settleAsyncTransaction(
       });
     }
 
-    if (provider === 'ktech') {
-      const delivery = await deliverAsyncResult(transaction, result.response);
-      await notifyAsyncResult(transaction, 'success', result.response, delivery?.id);
-    }
+    const delivery = await deliverAsyncResult(transaction, result.response);
+    await notifyAsyncResult(transaction, 'success', result.response, delivery?.id);
 
     return { ticketId: result.ticketId, status: 'success', response: result.response };
   }
@@ -735,7 +733,7 @@ async function settleAsyncTransaction(
       data: { transactionId: transaction.id }
     });
   }
-  if (provider === 'ktech') await notifyAsyncResult(transaction, 'failed', result.response);
+  await notifyAsyncResult(transaction, 'failed', result.response);
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
 }
 
@@ -748,18 +746,32 @@ async function settleAsyncTransaction(
 export async function settleKtechTicket(params: {
   ticketId?: string;
   reference?: string;
+  clientReference?: string;
   status: 'pending' | 'success' | 'failed';
   response: Record<string, unknown> | null;
   raw: unknown;
 }) {
   const identifiers = [
-    ...(params.ticketId ? [{ providerRef: params.ticketId }] : []),
-    ...(params.reference ? [{ reference: params.reference }] : [])
+    ...(params.ticketId ? [
+      { providerRef: params.ticketId },
+      // Older async rows retained the upstream ticket only in JSON metadata.
+      { metadata: { path: ['ticket_id'], equals: params.ticketId } }
+    ] : []),
+    ...(params.reference ? [{ reference: params.reference }] : []),
+    ...(params.clientReference ? [
+      { id: params.clientReference },
+      { reference: params.clientReference },
+      { metadata: { path: ['client_reference'], equals: params.clientReference } }
+    ] : [])
   ];
   if (identifiers.length === 0) return { handled: false as const };
   const transaction = await prisma.transaction.findFirst({
     where: {
-      provider: 'ktech',
+      // Some existing MariaDigital async rows were created while the provider
+      // was labelled Techhub; MDL callbacks identify the same stored ticket.
+      // Accept both provider labels, while still requiring an identity request
+      // and an exact ticket/reference match.
+      provider: { in: ['ktech', 'techhub'] },
       type: TransactionType.IDENTITY_SERVICE_REQUEST,
       OR: identifiers
     }
