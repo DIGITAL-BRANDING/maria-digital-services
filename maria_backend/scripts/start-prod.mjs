@@ -49,7 +49,9 @@ console.log('[start] Starting production deployment sequence');
 
 if (runMigrationsOnStart) {
   console.log('[start] RUN_MIGRATIONS_ON_START=true, running migrations');
-  await run('npx', ['prisma', 'migrate', 'deploy'], migrationTimeoutMs);
+  // Call the local Prisma CLI through Node directly. The Railpack runtime
+  // image includes Node but may not include npm/npx in PATH.
+  await run(process.execPath, ['node_modules/prisma/build/index.js', 'migrate', 'deploy'], migrationTimeoutMs);
 } else {
   console.log('[start] Skipping migrations on app startup');
   console.log('[start] Set RUN_MIGRATIONS_ON_START=true only for a one-off migration deploy');
