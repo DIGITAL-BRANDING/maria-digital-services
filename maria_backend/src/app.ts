@@ -148,7 +148,7 @@ export function createApp() {
     limit: 120,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    skip: (req) => req.path.startsWith('/api/webhooks') || req.path === '/mld/webooks' || req.path === '/mld/webhooks'
+    skip: (req) => req.path.startsWith('/api/webhooks') || req.path === '/mld/webooks' || req.path === '/mld/webhooks' || req.path === '/webhooks/major-data-link'
   }));
 
   // `skipSuccessfulRequests: true` - only requests that actually FAIL (wrong
@@ -178,6 +178,13 @@ export function createApp() {
   // here removes that whole failure mode; each handler still does its own JSON.parse
   // and signature check exactly as before.
   app.use('/api/webhooks', express.raw({ type: '*/*' }), webhookRoutes);
+  // K-Tech has this legacy callback URL saved. Route it to the K-Tech ticket
+  // handler (not the separate MDL customer-webhook handler), preserving raw-body
+  // signature verification and async ticket settlement.
+  app.use('/webhooks/major-data-link', express.raw({ type: '*/*' }), (req, res, next) => {
+    req.url = '/ktech';
+    webhookRoutes(req, res, next);
+  });
   // The K-Tech partner dashboard was previously configured with the legacy
   // callback path shown there (`/mld/webooks`). Keep that saved URL working
   // while the canonical URL remains `/api/webhooks/ktech`. Both paths pass
