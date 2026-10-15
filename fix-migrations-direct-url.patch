@@ -1,0 +1,15 @@
+diff --git a/maria_backend/prisma/schema.prisma b/maria_backend/prisma/schema.prisma
+index b8d0a45..d8b10d0 100644
+--- a/maria_backend/prisma/schema.prisma
++++ b/maria_backend/prisma/schema.prisma
+@@ -7,6 +7,10 @@ datasource db {
+   // Supabase Session Pooler URL at runtime. This is IPv4-compatible for the
+   // Railway deployment and must include sslmode=require.
+   url      = env("DATABASE_URL")
++  // Used only by the Prisma CLI (migrate deploy / migrate dev), never by the running app.
++  // Migrations need a session-mode connection: the transaction pooler (port 6543) does not
++  // support the advisory locks Prisma takes, so `migrate deploy` hangs there until it times out.
++  directUrl = env("DIRECT_URL")
+ }
+ 
+ enum AccountStatus {
