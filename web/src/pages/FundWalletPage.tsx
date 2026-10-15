@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom';
 import { Copy, Check, Loader2 } from 'lucide-react';
 import AppShell from '../components/AppShell';
 import { api, ApiError } from '../lib/api';
+import { useAuth } from '../lib/auth';
+import KycRequiredNotice from '../components/KycRequiredNotice';
 
 type Dynamic = { account_number: string; account_name: string; bank_name: string; reference: string; expires_at?: string };
 
@@ -10,6 +12,7 @@ const QUICK_AMOUNTS = [500, 1000, 2000, 5000, 10000];
 
 export default function FundWalletPage() {
   const nav = useNavigate();
+  const { user } = useAuth();
   const [method, setMethod] = useState<'static' | 'dynamic' | 'card' | 'coupon'>('static');
   const [amount, setAmount] = useState('');
   const [dynamic, setDynamic] = useState<Dynamic | null>(null);
@@ -108,10 +111,13 @@ export default function FundWalletPage() {
         </div>
 
         {method === 'static' && (
-          <p className="mt-6 rounded-xl bg-cream p-4 text-sm text-ink-600">
-            Your dedicated account number is shown on your dashboard. Transfer any amount there and your wallet is
-            credited automatically.
-          </p>
+          <div className="mt-6 space-y-4">
+            <KycRequiredNotice hasAccount={!!user?.virtual_account_number} />
+            <p className="rounded-xl bg-cream p-4 text-sm text-ink-600">
+              Your dedicated account number is shown on your dashboard. Transfer any amount there and your wallet is
+              credited automatically.
+            </p>
+          </div>
         )}
 
         {method === 'coupon' && !funded && (

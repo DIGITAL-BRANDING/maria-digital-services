@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { ArrowDownCircle, ArrowUpCircle, Landmark, Loader2, Plus, RotateCcw, Wallet, WalletCards } from 'lucide-react';
 import AppShell from '../components/AppShell';
 import { api } from '../lib/api';
+import KycRequiredNotice from '../components/KycRequiredNotice';
 
 type Balance = {
   balance: number;
@@ -144,6 +145,8 @@ export default function WalletSummaryPage() {
                 )}
               </div>
             </section>
+
+            <KycRequiredNotice hasAccount={!!balance?.virtual_account_number} className="mt-4" />
 
             <section className="mt-4 flex flex-wrap items-center justify-between gap-3">
               {balance?.virtual_account_number ? (

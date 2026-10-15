@@ -40,6 +40,7 @@ import PinSetupPage from './pages/PinSetupPage';
 import SupportPage from './pages/SupportPage';
 import SlipsHistoryPage from './pages/SlipsHistoryPage';
 import WalletSummaryPage from './pages/WalletSummaryPage';
+import KycPage from './pages/KycPage';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { user, isLoading, mustChangePassword, requiresLoginPinSetup, requiresTransactionPinSetup } = useAuth();
@@ -105,6 +106,7 @@ export default function App() {
           <Route path="/demo" element={<ProtectedRoute><DemographicVerificationPage /></ProtectedRoute>} />
           <Route path="/terms" element={<PrivacyRedirect page="terms" />} />
           <Route path="/fund-wallet" element={<ProtectedRoute><FundWalletPage /></ProtectedRoute>} />
+          <Route path="/kyc" element={<ProtectedRoute><KycPage /></ProtectedRoute>} />
           <Route path="/deliveries" element={<ProtectedRoute><DeliveriesPage /></ProtectedRoute>} />
           <Route path="/receipt/:id" element={<ProtectedRoute><ReceiptPage /></ProtectedRoute>} />
           <Route path="/referrals" element={<ProtectedRoute><ReferralPage /></ProtectedRoute>} />

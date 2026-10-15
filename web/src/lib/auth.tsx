@@ -9,6 +9,7 @@ export type AppUser = {
   wallet_balance?: number;
   virtual_account_number?: string | null;
   virtual_account_bank?: string | null;
+  kyc_status?: 'unverified' | 'pending' | 'verified' | 'rejected' | string;
   [key: string]: unknown;
 };
 
