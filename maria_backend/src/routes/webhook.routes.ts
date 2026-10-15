@@ -524,7 +524,8 @@ webhookRoutes.post('/katpay', async (req, res) => {
             reference,
             amountKobo,
             accountNumber,
-            channel: 'katpay_virtual_account'
+            channel: 'katpay_virtual_account',
+            provider: 'katpay'
           });
         } catch (creditError) {
           console.error(
@@ -597,6 +598,170 @@ webhookRoutes.post('/katpay', async (req, res) => {
   } catch (error) {
     console.error('[katpay-webhook] failed to process event', eventType, error);
     // Return non-2xx for a genuine processing failure so KatPay retries delivery.
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
+
+  res.sendStatus(200);
+});
+
+webhookRoutes.get('/zenithpay', (_req, res) => {
+  res.json({
+    status: true,
+    webhook: 'zenithpay',
+    ready: Boolean(env.ZENITHPAY_WEBHOOK_SECRET),
+    message: 'POST signed ZenithPay events to this path'
+  });
+});
+
+/**
+ * ZenithPay webhook. Mounted under the same express.raw() as /paystack and /katpay
+ * above (see app.ts) - ZenithPay's own sample verification snippet signs the exact
+ * raw request bytes, so it must be verified before any JSON parsing happens.
+ *
+ * Signature scheme, per ZenithPay's own sample PHP verification code:
+ *   expected = hex_hmac_sha256(secret, "<timestamp>.<rawBody>")
+ * sent as `X-Zenithpay-Timestamp` / `X-Zenithpay-Signature`, with a 300-second
+ * tolerance on the timestamp - identical shape to KatPay's X-Katpay-* headers
+ * above, just with ZenithPay's own header names.
+ *
+ * Only one event matters today: a deposit into a user's permanent dedicated
+ * virtual account (`"Payment_type": "Dedicated Virtual Account"` in the sample
+ * payload ZenithPay sent us). ZenithPay's docs don't expose a GET
+ * status-by-reference endpoint to double-check with (unlike KatPay's
+ * transfer-payments status check below), so - same as KatPay's own
+ * virtual_account.payment_received branch, which has the identical limitation -
+ * a verified-signature webhook is the only confirmation available and is
+ * trusted directly once the signature passes.
+ */
+webhookRoutes.post('/zenithpay', async (req, res) => {
+  console.log('[zenithpay-webhook] received', {
+    contentType: req.header('content-type') ?? null,
+    hasSignature: Boolean(req.header('x-zenithpay-signature')),
+    hasTimestamp: Boolean(req.header('x-zenithpay-timestamp'))
+  });
+  const signature = req.header('x-zenithpay-signature');
+  const timestamp = req.header('x-zenithpay-timestamp');
+  const secret = env.ZENITHPAY_WEBHOOK_SECRET;
+
+  if (!secret) {
+    console.warn('[zenithpay-webhook] rejected - ZENITHPAY_WEBHOOK_SECRET not configured');
+    // Acknowledge so ZenithPay doesn't retry indefinitely while this is unconfigured;
+    // there is no verify-by-reference fallback for this provider (see comment above),
+    // so deposits genuinely won't be credited until the secret is set.
+    return res.status(200).json({ ok: true, ignored: true, reason: 'Webhook secret not configured' });
+  }
+  if (!signature || !timestamp) {
+    console.warn('[zenithpay-webhook] rejected - missing signature/timestamp');
+    return res.status(401).json({ error: 'Missing required headers' });
+  }
+  if (!/^\d+$/.test(timestamp) || Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) {
+    console.warn('[zenithpay-webhook] rejected - stale or invalid timestamp', { rawTimestamp: timestamp });
+    return res.status(401).json({ error: 'Invalid or expired timestamp' });
+  }
+
+  const rawBody = req.body as Buffer;
+  if (!Buffer.isBuffer(rawBody)) {
+    console.error('[zenithpay-webhook] rejected - request body was not captured as a raw Buffer', {
+      bodyType: typeof rawBody,
+      contentType: req.header('content-type') ?? null
+    });
+    return res.status(400).json({ error: 'Could not read request body' });
+  }
+
+  const expectedSignature = crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody.toString('utf8')}`).digest('hex');
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  const signatureValid =
+    signatureBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(signatureBuffer, expectedBuffer);
+
+  if (!signatureValid) {
+    console.error('[zenithpay-webhook] rejected - signature verification failed', {
+      receivedSignatureLength: signatureBuffer.length,
+      expectedSignatureLength: expectedBuffer.length,
+      bodyByteLength: rawBody.length
+    });
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  let event: any;
+  try {
+    event = JSON.parse(rawBody.toString('utf8'));
+  } catch (_parseError) {
+    console.error('[zenithpay-webhook] rejected - body is not valid JSON despite passing signature verification', {
+      bodyPreview: rawBody.toString('utf8').slice(0, 200)
+    });
+    return res.status(400).json({ error: 'Malformed JSON body' });
+  }
+
+  try {
+    const paymentType = String(event.Payment_type ?? event.type ?? '').trim().toLowerCase();
+
+    if (paymentType === 'dedicated virtual account') {
+      const details = event.paymentDetails ?? {};
+      // Prefer the nested paymentDetails.account_number (the one ZenithPay's sample
+      // shows as the full, correct account number) and fall back to the top-level
+      // field only if it's missing - ZenithPay's own sample payload had these two
+      // disagree (one truncated), so the more specific nested one wins.
+      const rawAccountNumber = details.account_number ?? event.accountNumber;
+      const accountNumber = rawAccountNumber == null ? undefined : String(rawAccountNumber).trim();
+      // transaction_id and orderId were identical in ZenithPay's sample payload;
+      // transaction_id is used as the primary idempotency key with orderId as a
+      // fallback in case a future delivery omits one of them.
+      const reference = event.transaction_id ?? event.orderId;
+      const responseCode = String(event.response_code ?? '').trim();
+      const status = String(event.status ?? '').trim().toLowerCase();
+      // Credit the GROSS amount the payer sent (amountPaid), not settlementAmount -
+      // settlementAmount is net of ZenithPay's OWN processing fee, which is a cost to
+      // MDL's settlement, not something the customer's wallet should be short-changed
+      // for. MDL's own funding fee (WALLET_FUNDING_FEE_PERCENT) is applied separately,
+      // same as every other funding channel - see applyFundingFee in wallet.service.ts.
+      const rawAmount = details.amountPaid ?? event.amountPaid;
+      const amountKobo = rawAmount != null ? BigInt(Math.round(Number(rawAmount) * 100)) : undefined;
+
+      console.log(
+        '[zenithpay-webhook] dedicated virtual account deposit',
+        JSON.stringify({ accountNumber, reference, responseCode, status, amountKobo: amountKobo?.toString() ?? null })
+      );
+
+      if (responseCode === '00' && status === 'success' && accountNumber && reference && amountKobo) {
+        try {
+          await creditDirectDepositByAccountNumber({
+            reference: String(reference),
+            amountKobo,
+            accountNumber,
+            channel: 'zenithpay_virtual_account',
+            provider: 'zenithpay'
+          });
+        } catch (creditError) {
+          console.error(
+            '[zenithpay-webhook] FAILED to credit dedicated virtual account deposit',
+            JSON.stringify({ accountNumber, reference, amountKobo: amountKobo.toString() }),
+            creditError
+          );
+          throw creditError;
+        }
+      } else {
+        console.warn(
+          '[zenithpay-webhook] deposit not credited - condition not met',
+          JSON.stringify({
+            accountNumber: accountNumber ?? null,
+            reference: reference ?? null,
+            responseCode: responseCode || null,
+            status: status || null,
+            hasAmount: Boolean(amountKobo)
+          })
+        );
+      }
+    } else {
+      // Logged in full the first time an unrecognized Payment_type/type arrives -
+      // same reasoning as the katpay handler's equivalent branch above: a silent
+      // 200 here with nothing logged would hide a real event this code just
+      // doesn't know how to act on yet.
+      console.warn('[zenithpay-webhook] unrecognized Payment_type - not credited', JSON.stringify({ paymentType, event }));
+    }
+  } catch (error) {
+    console.error('[zenithpay-webhook] failed to process event', error);
+    // Return non-2xx for a genuine processing failure so ZenithPay retries delivery.
     return res.status(500).json({ error: 'Webhook processing failed' });
   }
 

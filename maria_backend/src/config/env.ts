@@ -153,7 +153,7 @@ const EnvSchema = z.object({
     .string()
     .default('paystack')
     .transform((value) => value.toLowerCase())
-    .pipe(z.enum(['paystack', 'katpay'])),
+    .pipe(z.enum(['paystack', 'katpay', 'zenithpay'])),
 
   // --- KatPay (https://katpay.co/docs) - kept side-by-side with Paystack above as a
   // swappable alternative. Same "must never throw / never block signup" philosophy as
@@ -178,6 +178,23 @@ const EnvSchema = z.object({
     .string()
     .default('true')
     .transform((value) => value.toLowerCase() !== 'false' && value !== '0'),
+
+  // --- ZenithPay (https://documenter.getpostman.com/view/13400303/2sB2x9krVa) -
+  // a third virtual-account option, side-by-side with Paystack/KatPay above. Unlike
+  // either of those, ZenithPay's dedicated_account/assign endpoint requires the
+  // customer's BVN up front (no separate "instant, no-BVN" tier) - so it is wired into
+  // the BVN-gated path (verifyBvnAndActivateWallet in kyc.service.ts), never the
+  // instant/no-BVN provisioning path in payment-provider.service.ts.
+  ZENITHPAY_BASE_URL: z.string().url().default('https://zenithpay.ng'),
+  // Bearer token from the XpressVerify/ZenithPay dashboard - sent as
+  // `Authorization: Bearer <token>` on every call. Optional so a deploy with no
+  // ZenithPay account configured doesn't fail startup; assignDedicatedAccount()
+  // throws a clear error if this is missing and PAYMENT_PROVIDER=zenithpay.
+  ZENITHPAY_AUTH_TOKEN: z.string().optional(),
+  // HMAC-SHA256 key used to verify X-Zenithpay-Signature on inbound webhooks (see
+  // webhook.routes.ts) - ZenithPay's own sample verification snippet signs
+  // `${timestamp}.${rawBody}` with this secret, the same scheme KatPay uses above.
+  ZENITHPAY_WEBHOOK_SECRET: z.string().optional(),
 
   // Kill switch for the KatPay virtual-account webhook crediting bug (Aug 2026 -
   // some deposits into a user's permanent VA aren't landing in their wallet

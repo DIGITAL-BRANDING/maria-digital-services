@@ -73,7 +73,8 @@ describe('creditDirectDepositByAccountNumber', () => {
       reference: 'KATPAY-REF-1',
       amountKobo: 500000n,
       accountNumber: '8012345678',
-      channel: 'katpay_virtual_account'
+      channel: 'katpay_virtual_account',
+      provider: 'katpay'
     });
 
     expect(transaction.userId).toBe('user-1');
@@ -95,7 +96,8 @@ describe('creditDirectDepositByAccountNumber', () => {
       reference: 'KATPAY-REF-2',
       amountKobo: 200000n,
       accountNumber: '2222222222',
-      channel: 'katpay_virtual_account'
+      channel: 'katpay_virtual_account',
+      provider: 'katpay'
     });
 
     const userA = await prisma.user.findUniqueOrThrow({ where: { id: 'user-a' } });
@@ -111,7 +113,8 @@ describe('creditDirectDepositByAccountNumber', () => {
         reference: 'KATPAY-REF-3',
         amountKobo: 500000n,
         accountNumber: '0000000000',
-        channel: 'katpay_virtual_account'
+        channel: 'katpay_virtual_account',
+        provider: 'katpay'
       })
     ).rejects.toMatchObject({ statusCode: 404, code: 'USER_NOT_FOUND_FOR_PAYMENT' });
   });
@@ -123,7 +126,8 @@ describe('creditDirectDepositByAccountNumber', () => {
       reference: 'KATPAY-REF-4',
       amountKobo: 150000n,
       accountNumber: '3333333333',
-      channel: 'katpay_virtual_account'
+      channel: 'katpay_virtual_account',
+      provider: 'katpay'
     });
 
     expect(notifyUser).toHaveBeenCalledTimes(1);

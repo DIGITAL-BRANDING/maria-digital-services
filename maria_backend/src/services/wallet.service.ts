@@ -427,6 +427,11 @@ export async function creditDirectDepositByAccountNumber(params: {
   amountKobo: bigint;
   accountNumber: string;
   channel: string;
+  /** Which gateway's virtual account this deposit landed in - tags the ledger
+   * row's `provider`/`providerRef`/`reference` and the idempotency check below,
+   * so KatPay and ZenithPay deposits (or any future provider) never collide with
+   * or mask each other even if they happened to share a webhook reference. */
+  provider: string;
 }) {
   const accountNumber = params.accountNumber.trim();
   const user = await prisma.user.findFirst({ where: { virtualAccountNumber: accountNumber } });
@@ -443,11 +448,11 @@ export async function creditDirectDepositByAccountNumber(params: {
   // an older transaction can legitimately already have the same text (for
   // example a name-and-account narration).  Keep it as the provider reference
   // and give our ledger entry a reference we own instead.
-  const providerRef = `katpay:virtual-account:${params.reference}`;
+  const providerRef = `${params.provider}:virtual-account:${params.reference}`;
   const existing = await prisma.transaction.findFirst({
     where: {
       userId: user.id,
-      provider: 'katpay',
+      provider: params.provider,
       providerRef,
       type: TransactionType.WALLET_FUNDING
     }
@@ -471,9 +476,9 @@ export async function creditDirectDepositByAccountNumber(params: {
           amountKobo: params.amountKobo,
           balanceBeforeKobo: before.walletBalanceKobo,
           balanceAfterKobo: after.walletBalanceKobo,
-          provider: 'katpay',
+          provider: params.provider,
           providerRef,
-          reference: `KATPAY-VA-${nanoid()}`,
+          reference: `${params.provider.toUpperCase()}-VA-${nanoid()}`,
           description: `Wallet funded via direct bank transfer (${params.channel})`,
           metadata: { channel: params.channel, accountNumber: params.accountNumber }
         }
@@ -512,7 +517,7 @@ export async function creditDirectDepositByAccountNumber(params: {
       const redelivered = await prisma.transaction.findFirst({
         where: {
           userId: user.id,
-          provider: 'katpay',
+          provider: params.provider,
           providerRef,
           type: TransactionType.WALLET_FUNDING
         }
