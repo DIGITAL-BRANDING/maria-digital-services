@@ -1,11 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { ShieldCheck, X } from 'lucide-react';
-import { useAuth } from '../lib/auth';
-
-// Set by login() / register() in lib/auth.tsx on every successful sign-in.
-// The popup shows once for each login, then clears the flag.
-export const KYC_PROMPT_PENDING_KEY = 'kyc_prompt_pending';
+import { KYC_PROMPT_PENDING_KEY, useAuth } from '../lib/auth';
 
 export default function KycPromptModal() {
   const { user } = useAuth();
@@ -65,13 +61,12 @@ export default function KycPromptModal() {
         </div>
 
         <h2 id="kyc-prompt-title" className="mt-4 text-xl font-bold text-slate-900">
-          Complete your KYC to get your account number
+          Get your ZenithPay account number
         </h2>
 
         <p className="mt-3 text-sm leading-6 text-slate-600">
-          Hi{user?.full_name ? ` ${user.full_name.split(' ')[0]}` : ''}, welcome back! To receive your permanent
-          virtual account number for wallet funding, please verify your identity with your BVN. It only takes a
-          minute.
+          Hi{user?.full_name ? ` ${user.full_name.split(' ')[0]}` : ''}, complete identity verification with your BVN
+          to activate your dedicated ZenithPay virtual account for wallet funding.
         </p>
 
         <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
@@ -86,7 +81,7 @@ export default function KycPromptModal() {
             autoFocus
             className="rounded-xl bg-blue-700 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-800"
           >
-            Continue
+            Complete KYC
           </button>
         </div>
       </div>

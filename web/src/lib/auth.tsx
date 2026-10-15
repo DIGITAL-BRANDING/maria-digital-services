@@ -1,6 +1,8 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import { ApiError, api, clearTokens, getAccessToken, setTokens } from './api';
 
+export const KYC_PROMPT_PENDING_KEY = 'kyc_prompt_pending';
+
 export type AppUser = {
   id: string;
   full_name: string;
@@ -90,6 +92,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setMustChangePassword(!!res.data.requires_password_change);
       setRequiresLoginPinSetup(!!res.data.requires_login_pin_setup);
       setRequiresTransactionPinSetup(!!res.data.requires_pin_setup);
+      sessionStorage.setItem(KYC_PROMPT_PENDING_KEY, '1');
     } catch (err) {
       // LOGIN_PIN_REQUIRED means the password was correct but this account
       // has a 6-digit login PIN set - the caller (LoginPage) shows a PIN
@@ -115,6 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   function logout() {
     clearTokens();
+    sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
     setUser(null);
     setMustChangePassword(false);
     setRequiresLoginPinSetup(false);

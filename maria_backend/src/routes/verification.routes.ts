@@ -93,7 +93,9 @@ verificationRoutes.post('/bvn/license-onboarding', async (req, res) => {
   }).parse(req.body);
   await requirePinConfirmation(req.user!.id, body.pin);
   const { pin: _pin, ...values } = body;
-  const result = await submitBvnLicense({ userId: req.user!.id, values: values as BvnLicenseInput, idempotencyKey: idempotencyKeyFrom(req) });
+  // Zod has already validated the required fields above; this intermediate
+  // assertion accounts for the optional-property inference of the parsed body.
+  const result = await submitBvnLicense({ userId: req.user!.id, values: values as unknown as BvnLicenseInput, idempotencyKey: idempotencyKeyFrom(req) });
   res.json({ status: true, data: result });
 });
 
@@ -551,7 +553,8 @@ verificationRoutes.post('/cac', async (req, res) => {
     type: cac_type as CacType,
     proposedName1: proposed_name_1,
     proposedName2: proposed_name_2,
-    details: details as CacApplicantDetails,
+    // The request schema validates these required applicant fields before this point.
+    details: details as unknown as CacApplicantDetails,
     idempotencyKey: idempotencyKeyFrom(req)
   });
   res.json({ status: true, data: { reference: result.reference, balance_after: result.balanceAfter } });

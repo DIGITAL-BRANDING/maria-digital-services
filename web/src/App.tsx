@@ -41,6 +41,7 @@ import SupportPage from './pages/SupportPage';
 import SlipsHistoryPage from './pages/SlipsHistoryPage';
 import WalletSummaryPage from './pages/WalletSummaryPage';
 import KycPage from './pages/KycPage';
+import KycPromptModal from './components/KycPromptModal';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { user, isLoading, mustChangePassword, requiresLoginPinSetup, requiresTransactionPinSetup } = useAuth();
@@ -70,6 +71,7 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
+        <KycPromptModal />
         <Routes>
           <Route path="/" element={<LandingPage />} />
           <Route path="/login" element={<LoginPage />} />
