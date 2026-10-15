@@ -292,7 +292,7 @@ webhookRoutes.post('/ktech', async (req, res) => {
   }
 
   const verification = verifyPartnerWebhook({ secret, rawBody, headers: req.headers });
-  if (!verification.valid) {
+  if (verification.valid === false) {
     // Header NAMES only - never values, the secret, or the body.
     console.error('[ktech-webhook] rejected - signature check failed', {
       reason: verification.reason,

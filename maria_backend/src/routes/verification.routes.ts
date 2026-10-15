@@ -2,8 +2,8 @@ import { Router, type Request } from 'express';
 import { z } from 'zod';
 import { TransactionStatus, TransactionType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth.js';
-import { GEO_POLITICAL_ZONES, submitBvnLicense } from '../services/bvn-license-onboarding.service.js';
-import { CAC_TYPES, listCacHistory, listCacPrices, submitCacRequest, type CacType } from '../services/cac.service.js';
+import { GEO_POLITICAL_ZONES, submitBvnLicense, type BvnLicenseInput } from '../services/bvn-license-onboarding.service.js';
+import { CAC_TYPES, listCacHistory, listCacPrices, submitCacRequest, type CacType, type CacApplicantDetails } from '../services/cac.service.js';
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import { prisma } from '../lib/prisma.js';
 import {
@@ -93,7 +93,7 @@ verificationRoutes.post('/bvn/license-onboarding', async (req, res) => {
   }).parse(req.body);
   await requirePinConfirmation(req.user!.id, body.pin);
   const { pin: _pin, ...values } = body;
-  const result = await submitBvnLicense({ userId: req.user!.id, values, idempotencyKey: idempotencyKeyFrom(req) });
+  const result = await submitBvnLicense({ userId: req.user!.id, values: values as BvnLicenseInput, idempotencyKey: idempotencyKeyFrom(req) });
   res.json({ status: true, data: result });
 });
 
@@ -551,7 +551,7 @@ verificationRoutes.post('/cac', async (req, res) => {
     type: cac_type as CacType,
     proposedName1: proposed_name_1,
     proposedName2: proposed_name_2,
-    details,
+    details: details as CacApplicantDetails,
     idempotencyKey: idempotencyKeyFrom(req)
   });
   res.json({ status: true, data: { reference: result.reference, balance_after: result.balanceAfter } });
