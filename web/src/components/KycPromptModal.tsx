@@ -3,9 +3,9 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { ShieldCheck, X } from 'lucide-react';
 import { useAuth } from '../lib/auth';
 
-// Shown once per browser session, so the user isn't interrupted on every page.
-// A new session (closing the tab / logging in again) shows it again.
-const SEEN_KEY = 'kyc_prompt_seen';
+// Set by login() / register() in lib/auth.tsx on every successful sign-in.
+// The popup shows once for each login, then clears the flag.
+export const KYC_PROMPT_PENDING_KEY = 'kyc_prompt_pending';
 
 export default function KycPromptModal() {
   const { user } = useAuth();
@@ -16,11 +16,17 @@ export default function KycPromptModal() {
   const needsKyc = !!user && user.kyc_status !== 'verified';
 
   useEffect(() => {
-    if (!needsKyc || pathname === '/kyc') return;
-    if (sessionStorage.getItem(SEEN_KEY)) return;
-    sessionStorage.setItem(SEEN_KEY, '1');
+    if (!user) return;
+    if (sessionStorage.getItem(KYC_PROMPT_PENDING_KEY) !== '1') return;
+    // Wait until we know the KYC status for this login.
+    if (!needsKyc) {
+      sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
+      return;
+    }
+    if (pathname === '/kyc') return;
+    sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
     setOpen(true);
-  }, [needsKyc, pathname]);
+  }, [user, needsKyc, pathname]);
 
   useEffect(() => {
     if (!open) return;

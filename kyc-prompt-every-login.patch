@@ -1,0 +1,130 @@
+diff --git a/web/src/components/KycPromptModal.tsx b/web/src/components/KycPromptModal.tsx
+new file mode 100644
+index 0000000..239b228
+--- /dev/null
++++ b/web/src/components/KycPromptModal.tsx
+@@ -0,0 +1,95 @@
++import { useEffect, useState } from 'react';
++import { useLocation, useNavigate } from 'react-router-dom';
++import { ShieldCheck, X } from 'lucide-react';
++import { useAuth } from '../lib/auth';
++
++// Set by login() / register() in lib/auth.tsx on every successful sign-in.
++// The popup shows once for each login, then clears the flag.
++export const KYC_PROMPT_PENDING_KEY = 'kyc_prompt_pending';
++
++export default function KycPromptModal() {
++  const { user } = useAuth();
++  const navigate = useNavigate();
++  const { pathname } = useLocation();
++  const [open, setOpen] = useState(false);
++
++  const needsKyc = !!user && user.kyc_status !== 'verified';
++
++  useEffect(() => {
++    if (!user) return;
++    if (sessionStorage.getItem(KYC_PROMPT_PENDING_KEY) !== '1') return;
++    // Wait until we know the KYC status for this login.
++    if (!needsKyc) {
++      sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
++      return;
++    }
++    if (pathname === '/kyc') return;
++    sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
++    setOpen(true);
++  }, [user, needsKyc, pathname]);
++
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (e: KeyboardEvent) => {
++      if (e.key === 'Escape') setOpen(false);
++    };
++    window.addEventListener('keydown', onKey);
++    return () => window.removeEventListener('keydown', onKey);
++  }, [open]);
++
++  if (!open) return null;
++
++  function goToKyc() {
++    setOpen(false);
++    navigate('/kyc');
++  }
++
++  return (
++    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
++      <div
++        role="dialog"
++        aria-modal="true"
++        aria-labelledby="kyc-prompt-title"
++        className="relative w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"
++      >
++        <button
++          onClick={() => setOpen(false)}
++          aria-label="Close"
++          className="absolute right-3 top-3 rounded-lg p-2 text-slate-500 hover:bg-slate-100"
++        >
++          <X size={18} />
++        </button>
++
++        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-blue-50">
++          <ShieldCheck className="text-blue-700" size={26} />
++        </div>
++
++        <h2 id="kyc-prompt-title" className="mt-4 text-xl font-bold text-slate-900">
++          Complete your KYC to get your account number
++        </h2>
++
++        <p className="mt-3 text-sm leading-6 text-slate-600">
++          Hi{user?.full_name ? ` ${user.full_name.split(' ')[0]}` : ''}, welcome back! To receive your permanent
++          virtual account number for wallet funding, please verify your identity with your BVN. It only takes a
++          minute.
++        </p>
++
++        <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
++          <button
++            onClick={() => setOpen(false)}
++            className="rounded-xl border border-slate-300 px-5 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
++          >
++            Remind me later
++          </button>
++          <button
++            onClick={goToKyc}
++            autoFocus
++            className="rounded-xl bg-blue-700 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-800"
++          >
++            Continue
++          </button>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/lib/auth.tsx b/web/src/lib/auth.tsx
+index a983ac9..1258cb4 100644
+--- a/web/src/lib/auth.tsx
++++ b/web/src/lib/auth.tsx
+@@ -9,6 +9,7 @@ export type AppUser = {
+   wallet_balance?: number;
+   virtual_account_number?: string | null;
+   virtual_account_bank?: string | null;
++  kyc_status?: 'unverified' | 'pending' | 'verified' | 'rejected' | string;
+   [key: string]: unknown;
+ };
+ 
+@@ -89,6 +90,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+       setMustChangePassword(!!res.data.requires_password_change);
+       setRequiresLoginPinSetup(!!res.data.requires_login_pin_setup);
+       setRequiresTransactionPinSetup(!!res.data.requires_pin_setup);
++      // Ask the KYC prompt to show once for this login (see KycPromptModal).
++      sessionStorage.setItem('kyc_prompt_pending', '1');
+     } catch (err) {
+       // LOGIN_PIN_REQUIRED means the password was correct but this account
+       // has a 6-digit login PIN set - the caller (LoginPage) shows a PIN
+@@ -110,6 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
+     setMustChangePassword(!!res.data.requires_password_change);
+     setRequiresLoginPinSetup(false);
+     setRequiresTransactionPinSetup(!!res.data.requires_pin_setup);
++    sessionStorage.setItem('kyc_prompt_pending', '1');
+   }
+ 
+   function logout() {
