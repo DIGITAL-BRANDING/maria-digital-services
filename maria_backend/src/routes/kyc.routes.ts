@@ -31,22 +31,29 @@ kycRoutes.get('/status', async (req, res) => {
 });
 
 kycRoutes.get('/banks', async (_req, res) => {
-  const banks = await listSupportedBanks();
+  // ZenithPay verifies by BVN alone - there is no bank to pick, so return an
+  // empty list instead of letting listSupportedBanks() throw.
+  const banks = env.PAYMENT_PROVIDER === 'zenithpay' ? [] : await listSupportedBanks();
   res.json({ status: true, data: banks });
 });
 
-// NOTE: this endpoint (verifyBvnAndActivateWallet) is Paystack-specific - KatPay's
-// virtual-account creation has no BVN/bank-validation step to mirror it. It only
-// matters if PAYMENT_PROVIDER=paystack AND PAYSTACK_INSTANT_DVA_ENABLED=false, so
-// the app falls back to this BVN-gated path instead of the instant one.
+// BVN-gated activation. With PAYMENT_PROVIDER=zenithpay only `bvn` is requested
+// (bank_code/account_number are not needed and are ignored if sent). With
+// Paystack (and PAYSTACK_INSTANT_DVA_ENABLED=false) bank_code + account_number
+// are still required for the BVN/bank-account cross-check. KatPay doesn't use this.
+const bvnSchema = z.object({ bvn: z.string().trim().length(11, 'BVN must be exactly 11 digits') });
+const bvnWithBankSchema = bvnSchema.extend({
+  bank_code: z.string().trim().min(1, 'bank_code is required'),
+  account_number: z.string().trim().length(10, 'Account number must be exactly 10 digits')
+});
+
 kycRoutes.post('/bvn', async (req, res) => {
-  const body = z
-    .object({
-      bvn: z.string().trim().length(11, 'BVN must be exactly 11 digits'),
-      bank_code: z.string().trim().min(1, 'bank_code is required'),
-      account_number: z.string().trim().length(10, 'Account number must be exactly 10 digits')
-    })
-    .parse(req.body);
+  // Cast: with tsconfig `strict: false` zod infers every field as optional.
+  const body = (env.PAYMENT_PROVIDER === 'zenithpay' ? bvnSchema.parse(req.body) : bvnWithBankSchema.parse(req.body)) as {
+    bvn: string;
+    bank_code?: string;
+    account_number?: string;
+  };
 
   const result = await verifyBvnAndActivateWallet({
     userId: req.user!.id,

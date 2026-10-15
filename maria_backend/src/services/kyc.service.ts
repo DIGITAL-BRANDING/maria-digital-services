@@ -29,16 +29,23 @@ function splitFullName(fullName: string) {
 export async function verifyBvnAndActivateWallet(params: {
   userId: string;
   bvn: string;
-  bankCode: string;
-  accountNumber: string;
+  /** Required for Paystack only (BVN + bank account cross-check). ZenithPay needs just the BVN. */
+  bankCode?: string;
+  accountNumber?: string;
 }) {
   const { userId, bvn, bankCode, accountNumber } = params;
+  const bvnOnly = env.PAYMENT_PROVIDER === 'zenithpay';
 
   if (!/^\d{11}$/.test(bvn)) {
     throw new ApiError(422, 'BVN must be exactly 11 digits', 'INVALID_BVN');
   }
-  if (!/^\d{10}$/.test(accountNumber)) {
-    throw new ApiError(422, 'Account number must be exactly 10 digits', 'INVALID_ACCOUNT_NUMBER');
+  if (!bvnOnly) {
+    if (!bankCode) {
+      throw new ApiError(422, 'bank_code is required', 'INVALID_BANK_CODE');
+    }
+    if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
+      throw new ApiError(422, 'Account number must be exactly 10 digits', 'INVALID_ACCOUNT_NUMBER');
+    }
   }
 
   const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
@@ -57,12 +64,11 @@ export async function verifyBvnAndActivateWallet(params: {
   const { firstName, lastName } = splitFullName(user.fullName);
 
   try {
-    if (env.PAYMENT_PROVIDER === 'zenithpay') {
+    if (bvnOnly) {
       // ZenithPay's single dedicated_account/assign call both validates the BVN
       // and issues the account - no separate resolve/customer/validate steps like
-      // Paystack's below, and bankCode/accountNumber (required by this function's
-      // signature for the Paystack path) are simply unused here: ZenithPay's
-      // endpoint doesn't take or need a bank account to cross-check against.
+      // Paystack's below. Only the BVN is collected - bankCode/accountNumber are
+      // neither required nor used: ZenithPay's endpoint doesn't take a bank account.
       const account = await zenithpayService.assignDedicatedAccount({
         bvn,
         accountName: user.fullName,
