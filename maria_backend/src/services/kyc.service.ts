@@ -168,10 +168,18 @@ export async function verifyBvnAndActivateWallet(params: {
     };
   } catch (error) {
     const message = error instanceof ApiError ? error.message : 'Verification failed unexpectedly';
+    // Missing provider credentials are an operator configuration issue, not a
+    // failed identity check. Leave the user eligible to retry after setup.
+    const isConfigError = error instanceof ApiError && error.code === 'ZENITHPAY_NOT_CONFIGURED';
     await prisma.user.update({
       where: { id: userId },
-      data: { kycStatus: KycStatus.REJECTED, kycFailureReason: message }
+      data: {
+        kycStatus: isConfigError ? KycStatus.UNVERIFIED : KycStatus.REJECTED,
+        kycFailureReason: isConfigError ? null : message
+      }
     });
+
+    if (isConfigError) throw error;
 
     await notifyUser({
       userId,
