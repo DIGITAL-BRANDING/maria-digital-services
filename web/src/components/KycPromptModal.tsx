@@ -19,7 +19,9 @@ export default function KycPromptModal() {
       sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
       return;
     }
-    if (pathname === '/kyc') return;
+    // Keep the login flag until navigation reaches the authenticated app.
+    // login() updates auth state before LoginPage navigates to the dashboard.
+    if (pathname === '/login' || pathname === '/kyc' || pathname === '/setup-pins' || pathname === '/set-new-password') return;
     sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
     setOpen(true);
   }, [user, needsKyc, pathname]);
