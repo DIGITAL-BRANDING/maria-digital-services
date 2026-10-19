@@ -247,26 +247,27 @@ export class DataPlanPricingService {
 
     // Sequential for the same reason as applyPricing() above: connection_limit=1
     // in DATABASE_URL means concurrent updates exhaust the pool and time out.
-    for (const row of rows) {
-      const providerCost = koboToNaira(row.providerCostKobo);
-      const sellingPrice = Math.ceil(
-        providerCost + (providerCost * params.markupPercent) / 100 + params.markupNaira
-      );
-      // nairaToKobo() throws on amount <= 0 - a single bad row (e.g. a
-      // providerCost of 0 from a data-entry error) must not abort the whole
-      // bulk update partway through and leave the rest of a ~250-row batch
-      // silently un-updated. Skip it and keep going; the caller sees the
-      // skipped count and can fix that one row by hand.
-      if (sellingPrice <= 0) {
-        skipped += 1;
-        continue;
+    // Keep the batch in one transaction so an unexpected write failure cannot
+    // leave only some plans repriced.
+    await prisma.$transaction(async (tx) => {
+      for (const row of rows) {
+        const providerCost = koboToNaira(row.providerCostKobo);
+        const sellingPrice = Math.ceil(
+          providerCost + (providerCost * params.markupPercent) / 100 + params.markupNaira
+        );
+        // Invalid zero-cost rows are intentionally skipped; nairaToKobo rejects
+        // zero, and one bad row must not prevent the valid rows from updating.
+        if (sellingPrice <= 0) {
+          skipped += 1;
+          continue;
+        }
+        await tx.dataPlanPricing.update({
+          where: { id: row.id },
+          data: { sellingPriceKobo: nairaToKobo(sellingPrice) }
+        });
+        updated += 1;
       }
-      await prisma.dataPlanPricing.update({
-        where: { id: row.id },
-        data: { sellingPriceKobo: nairaToKobo(sellingPrice) }
-      });
-      updated += 1;
-    }
+    }, { maxWait: 10_000, timeout: 120_000 });
 
     return { updated, skipped };
   }

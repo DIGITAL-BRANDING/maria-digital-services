@@ -150,21 +150,22 @@ export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahu
   let updated = 0;
   let skipped = 0;
 
-  for (const row of rows) {
-    const providerCost = koboToNaira(row.providerCostKobo);
-    const sellingPrice = Math.ceil(providerCost + (providerCost * params.markupPercent) / 100 + params.markupNaira);
-    // See the identical guard in DataPlanPricingService.applyMarkup() - a
-    // single bad row must not abort the whole bulk update partway through.
-    if (sellingPrice <= 0) {
-      skipped += 1;
-      continue;
+  await prisma.$transaction(async (tx) => {
+    for (const row of rows) {
+      const providerCost = koboToNaira(row.providerCostKobo);
+      const sellingPrice = Math.ceil(providerCost + (providerCost * params.markupPercent) / 100 + params.markupNaira);
+      // See the identical guard in DataPlanPricingService.applyMarkup().
+      if (sellingPrice <= 0) {
+        skipped += 1;
+        continue;
+      }
+      await tx.servicePricing.update({
+        where: { id: row.id },
+        data: { sellingPriceKobo: priceToKobo(sellingPrice) }
+      });
+      updated += 1;
     }
-    await prisma.servicePricing.update({
-      where: { id: row.id },
-      data: { sellingPriceKobo: priceToKobo(sellingPrice) }
-    });
-    updated += 1;
-  }
+  }, { maxWait: 10_000, timeout: 120_000 });
 
   return { updated, skipped };
 }

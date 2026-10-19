@@ -174,7 +174,7 @@ export function registerBulkPricingRoutes(router: Router) {
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Repriced ${result.updated} data plan(s) (${scope}${providerScope}) at cost + ${percent}% + ₦${naira}.${skippedNote}`));
     } catch (error) {
       console.error('[bulk-pricing] data-plans bulk markup failed:', error);
-      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Something went wrong repricing data plans. Some rows may already be updated - check the server logs.'));
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Data plan prices were not changed because the batch failed. Check the server logs.'));
     }
   });
 
@@ -204,7 +204,7 @@ export function registerBulkPricingRoutes(router: Router) {
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Repriced ${result.updated} ${label} at cost + ${percent}% + ₦${naira}.${skippedNote}`));
     } catch (error) {
       console.error('[bulk-pricing] services bulk markup failed:', error);
-      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Something went wrong repricing services. Some rows may already be updated - check the server logs.'));
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Service prices were not changed because the batch failed. Check the server logs.'));
     }
   });
 }
