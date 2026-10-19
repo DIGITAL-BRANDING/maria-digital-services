@@ -62,11 +62,9 @@ export const servicePricingResource: ResourceWithOptions = {
     properties: {
       providerCostKobo: {
         isDisabled: true,
-        label: 'Provider cost (kobo)',
         description: 'What the provider (Techhub/Alrahuz) charges us, in kobo. Example: 12000 = NGN 120.'
       },
       sellingPriceKobo: {
-        label: 'Selling price (kobo)',
         description:
           'What we charge the user, in kobo. Example: 15000 = NGN 150. Leave empty to sell at provider cost. For multi-service edits, use Bulk Pricing → Set exact service prices.'
       }
