@@ -5,6 +5,7 @@ import { prisma } from '../lib/prisma.js';
 import { dataPlanPricingService } from '../services/data-plan-pricing.service.js';
 import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
 import { applyServiceMarkup } from '../services/result-pin.service.js';
+import { BVN_MODIFICATION_BANKS, BVN_MODIFICATION_CONFIG, listBvnModificationPrices } from '../services/bvn-modification.service.js';
 
 // @adminjs/express stores the logged-in admin as `req.session.adminUser`
 // (see buildAuthenticatedRouter's sessionOptions in setup.ts) but doesn't
@@ -59,16 +60,20 @@ export function registerBulkPricingRoutes(router: Router) {
     const admin = requireFinanceOrSuper(req);
     if (!admin) return res.redirect('/admin/login');
 
-    const [settings, networks] = await Promise.all([
+    // Ensure every BVN Modification option has a distinct editable price row,
+    // including each bank (banks can have different selling prices).
+    await listBvnModificationPrices();
+    const [settings, networks, servicePrices] = await Promise.all([
       getPricingSettings(),
       prisma.dataPlanPricing.findMany({
         distinct: ['network'],
         select: { network: true },
         orderBy: { network: 'asc' }
-      })
+      }),
+      prisma.servicePricing.findMany({ orderBy: [{ provider: 'asc' }, { label: 'asc' }] })
     ]);
 
-    res.type('html').send(renderPage({ admin, settings, networks: networks.map((n: { network: string }) => n.network), flash: flashFromQuery(req.query) }));
+    res.type('html').send(renderPage({ admin, settings, networks: networks.map((n: { network: string }) => n.network), servicePrices, flash: flashFromQuery(req.query) }));
   });
 
   router.post('/bulk-pricing/default-markup', async (req, res) => {
@@ -207,6 +212,44 @@ export function registerBulkPricingRoutes(router: Router) {
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Service prices were not changed because the batch failed. Check the server logs.'));
     }
   });
+
+  router.post('/bulk-pricing/service-prices', async (req, res) => {
+    const admin = requireFinanceOrSuper(req);
+    if (!admin) return res.redirect('/admin/login');
+
+    const rawIds = fields(req).serviceIds;
+    const serviceIds = [...new Set((Array.isArray(rawIds) ? rawIds : rawIds ? [rawIds] : []).filter((id): id is string => typeof id === 'string' && id.length > 0))];
+    if (serviceIds.length === 0) {
+      return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Select at least one service and enter its selling price.'));
+    }
+
+    const prices = serviceIds.map((id) => ({ id, price: parseNonNegativeNumber(field(req, `price_${id}`)) }));
+    if (prices.some(({ price }) => price !== null && !Number.isSafeInteger(Math.round(price * 100)))) {
+      return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Every entered price must be a valid amount of ₦0 or more.'));
+    }
+
+    try {
+      const existing = await prisma.servicePricing.findMany({ where: { id: { in: serviceIds } }, select: { id: true, service: true } });
+      if (existing.length !== serviceIds.length) {
+        return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Some selected services were not found. Refresh the page and try again.'));
+      }
+      await prisma.$transaction(async (tx) => {
+        for (const { id, price } of prices) {
+          await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)) } });
+        }
+      }, { maxWait: 10_000, timeout: 120_000 });
+      await logAdminAction({
+        adminId: admin.id,
+        action: 'BULK_SET_SERVICE_PRICES',
+        targetType: 'ServicePricing',
+        metadata: { services: existing.map(({ id, service }) => ({ id, service, priceNaira: prices.find((price) => price.id === id)?.price ?? null })), updated: serviceIds.length }
+      });
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Saved selling prices for ${serviceIds.length} service(s).`));
+    } catch (error) {
+      console.error('[bulk-pricing] direct service price update failed:', error);
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Prices were not changed because the batch failed. Check the server logs.'));
+    }
+  });
 }
 
 function requireFinanceOrSuper(req: Request): AdminSessionUser | null {
@@ -245,12 +288,28 @@ function renderPage(params: {
     electricityMarkupPercent: number;
   };
   networks: string[];
+  servicePrices: Array<{ id: string; provider: string; service: string; label: string; providerCostKobo: bigint; sellingPriceKobo: bigint | null; isActive: boolean }>;
   flash: { type: 'success' | 'error'; message: string } | null;
 }) {
-  const { admin, settings, networks, flash } = params;
+  const { admin, settings, networks, servicePrices, flash } = params;
   const escape = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
   const networkOptions = networks.map((n) => `<option value="${escape(n)}">${escape(n)}</option>`).join('');
+  const bvnTypeLabels = Object.fromEntries(Object.entries(BVN_MODIFICATION_CONFIG).map(([key, config]) => [key.toUpperCase(), config.title]));
+  const bankKeys = BVN_MODIFICATION_BANKS.map((bank) => bank.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, ''));
+  const serviceRows = servicePrices.map((row) => {
+    const bvnMatch = row.service.match(/^BVN_MODIFICATION_(UPDATE_[A-Z_]+)_(AGENCY|BANK_(.+))$/);
+    let label = row.label;
+    if (bvnMatch) {
+      const modificationType = bvnTypeLabels[bvnMatch[1]] ?? bvnMatch[1].replaceAll('_', ' ');
+      const bankKey = bvnMatch[3];
+      const bankIndex = bankKey ? bankKeys.indexOf(bankKey) : -1;
+      const enrollment = bvnMatch[2] === 'AGENCY' ? 'Agency' : bankIndex >= 0 ? BVN_MODIFICATION_BANKS[bankIndex] : bankKey?.replaceAll('_', ' ') ?? 'Bank';
+      label = `BVN Modification — ${enrollment} — ${modificationType}`;
+    }
+    const sellingPrice = row.sellingPriceKobo === null ? '' : (Number(row.sellingPriceKobo) / 100).toFixed(2);
+    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.provider)} · ${escape(row.service)}</small></td><td>₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
+  }).join('');
 
   const flashHtml = flash
     ? `<div class="flash ${flash.type}">${escape(flash.message)}</div>`
@@ -285,6 +344,13 @@ function renderPage(params: {
   .current { font-size: 13px; color: var(--muted); margin-top: 4px; }
   .provider-choice { display: flex; gap: 16px; margin-top: 12px; }
   .provider-choice label { display: flex; align-items: center; gap: 6px; font-weight: 500; margin: 0; }
+  .wide { max-width: 100%; overflow-x: auto; }
+  .price-table { width: 100%; border-collapse: collapse; min-width: 700px; margin-top: 12px; }
+  .price-table th, .price-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); text-align: left; font-size: 13px; }
+  .price-table th { background: #f6f0dc; }
+  .price-table input[type=checkbox] { width: 18px; height: 18px; }
+  input.price-input { width: 150px; padding: 8px; border: 1px solid var(--border); border-radius: 7px; }
+  small { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -295,6 +361,16 @@ function renderPage(params: {
   </header>
 
   ${flashHtml}
+
+  <div class="card wide">
+    <h2>Set exact service prices</h2>
+    <p class="hint">Select one or more services, enter each selling price in naira, then save once. BVN Modification prices are separate for Agency and every bank, including Access Bank. Leave an input blank to use its provider cost.</p>
+    <form method="POST" action="/admin/bulk-pricing/service-prices" onsubmit="return document.querySelectorAll('input[name=serviceIds]:checked').length > 0 || (alert('Select at least one service.'), false);">
+      <p><label style="display:inline"><input type="checkbox" onclick="document.querySelectorAll('input[name=serviceIds]').forEach((item) => item.checked = this.checked)"> Select all listed services</label></p>
+      <table class="price-table"><thead><tr><th>Select</th><th>Service</th><th>Provider cost</th><th>Selling price (₦)</th><th>Status</th></tr></thead><tbody>${serviceRows || '<tr><td colspan="5">No service prices found yet.</td></tr>'}</tbody></table>
+      <button type="submit">Save selected prices</button>
+    </form>
+  </div>
 
   <div class="card">
     <h2>1. Default markup</h2>

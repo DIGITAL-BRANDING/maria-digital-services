@@ -143,7 +143,9 @@ export async function updateServicePrice(service: string, input: { sellingPrice?
 export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number }) {
   const bvnTier = params.provider === 'bvn_modification_agency' ? 'AGENCY' : params.provider === 'bvn_modification_bank' ? 'BANK' : null;
   const where = bvnTier
-    ? { provider: 'manual', service: { startsWith: 'BVN_MODIFICATION_', endsWith: `_${bvnTier}` } }
+    ? { provider: 'manual', service: bvnTier === 'AGENCY'
+      ? { startsWith: 'BVN_MODIFICATION_', endsWith: '_AGENCY' }
+      : { startsWith: 'BVN_MODIFICATION_', contains: '_BANK_' } }
     : { provider: params.provider };
   const rows = await prisma.servicePricing.findMany({ where });
 
