@@ -1,6 +1,7 @@
 import type { Request, Router } from 'express';
 import { logAdminAction } from './audit.js';
 import type { AdminSessionUser } from './auth.js';
+import { bankKeyFor } from '../lib/bvn-modification-banks.js';
 import { prisma } from '../lib/prisma.js';
 import { dataPlanPricingService } from '../services/data-plan-pricing.service.js';
 import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
@@ -195,16 +196,33 @@ export function registerBulkPricingRoutes(router: Router) {
       return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Markup % and ₦ must both be valid numbers ≥ 0, and a provider must be selected.'));
     }
 
+    // Which banks a "BVN Modification — Banks/NIBSS" bulk reprice touches. Only
+    // known bank keys are accepted; an admin unticks e.g. Access Bank to leave
+    // its own price alone while repricing the remaining banks, or ticks only
+    // Access Bank to reprice it by itself.
+    let bankKeys: string[] | undefined;
+    if (provider === 'bvn_modification_bank') {
+      const rawKeys = fields(req).bankKeys;
+      const known = new Set(BVN_MODIFICATION_BANKS.map(bankKeyFor));
+      bankKeys = [...new Set((Array.isArray(rawKeys) ? rawKeys : rawKeys ? [rawKeys] : []).filter((key): key is string => typeof key === 'string' && known.has(key)))];
+      if (bankKeys.length === 0) {
+        return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Select at least one bank to reprice.'));
+      }
+    }
+
     try {
-      const result = await applyServiceMarkup({ provider, markupNaira: naira, markupPercent: percent });
+      const result = await applyServiceMarkup({ provider, markupNaira: naira, markupPercent: percent, bankKeys });
       await logAdminAction({
         adminId: admin.id,
         action: 'BULK_REPRICE_SERVICES',
         targetType: 'ServicePricing',
-        metadata: { provider, markupPercent: percent, markupNaira: naira, updated: result.updated }
+        metadata: { provider, markupPercent: percent, markupNaira: naira, updated: result.updated, ...(bankKeys ? { banks: bankKeys } : {}) }
       });
 
-      const label = provider === 'techhub' ? 'NIN/BVN verification services' : provider === 'bvn_modification_agency' ? 'Agency BVN modification services' : provider === 'bvn_modification_bank' ? 'Bank BVN modification services' : 'WAEC/NECO/NABTEB result-pin services';
+      const bankScope = bankKeys && bankKeys.length < BVN_MODIFICATION_BANKS.length
+        ? ` (${bankKeys.map((key) => BVN_MODIFICATION_BANKS.find((bank) => bankKeyFor(bank) === key) ?? key).join(', ')})`
+        : '';
+      const label = provider === 'techhub' ? 'NIN/BVN verification services' : provider === 'bvn_modification_agency' ? 'Agency BVN modification services' : provider === 'bvn_modification_bank' ? `Bank BVN modification services${bankScope}` : 'WAEC/NECO/NABTEB result-pin services';
       const skippedNote = result.skipped > 0 ? ` (${result.skipped} skipped - non-positive computed price)` : '';
       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Repriced ${result.updated} ${label} at cost + ${percent}% + ₦${naira}.${skippedNote}`));
     } catch (error) {
@@ -296,7 +314,8 @@ function renderPage(params: {
 
   const networkOptions = networks.map((n) => `<option value="${escape(n)}">${escape(n)}</option>`).join('');
   const bvnTypeLabels = Object.fromEntries(Object.entries(BVN_MODIFICATION_CONFIG).map(([key, config]) => [key.toUpperCase(), config.title]));
-  const bankKeys = BVN_MODIFICATION_BANKS.map((bank) => bank.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, ''));
+  const bankKeys = BVN_MODIFICATION_BANKS.map(bankKeyFor);
+  const bankCheckboxes = BVN_MODIFICATION_BANKS.map((bank) => `<label class="bank-option"><input type="checkbox" name="bankKeys" value="${escape(bankKeyFor(bank))}" checked> ${escape(bank)}</label>`).join('');
   const serviceRows = servicePrices.map((row) => {
     const bvnMatch = row.service.match(/^BVN_MODIFICATION_(UPDATE_[A-Z_]+)_(AGENCY|BANK_(.+))$/);
     let label = row.label;
@@ -326,6 +345,10 @@ function renderPage(params: {
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
   .wrap { max-width: 720px; margin: 0 auto; }
+  .bank-scope { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .bank-scope[hidden] { display: none; }
+  .bank-scope legend { font-weight: 600; padding: 0 6px; }
+  .bank-option { display: inline-flex; align-items: center; gap: 6px; margin: 4px 14px 4px 0; }
   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
   header h1 { font-size: 20px; margin: 0; }
   header a { color: var(--gold-dark); text-decoration: none; font-size: 14px; }
@@ -459,12 +482,17 @@ function renderPage(params: {
     <h2>3. Bulk reprice services</h2>
     <p class="hint">Reprice NIN/BVN verification (Techhub), WAEC/NECO/NABTEB result pins (Alrahuz), Agency BVN modifications, or Bank BVN modifications. Agency and Bank prices are managed separately.</p>
     <form method="POST" action="/admin/bulk-pricing/services" onsubmit="return confirm('This overwrites the selling price on every matching service. Continue?');">
-      <div class="provider-choice">
+      <div class="provider-choice" onchange="document.getElementById('bank-scope').hidden = !document.querySelector('input[name=provider][value=bvn_modification_bank]').checked;">
         <label><input type="radio" name="provider" value="techhub" checked> NIN/BVN (Techhub)</label>
         <label><input type="radio" name="provider" value="alrahuz"> WAEC/NECO/NABTEB (Alrahuz)</label>
         <label><input type="radio" name="provider" value="bvn_modification_agency"> BVN Modification — Agency Banking</label>
         <label><input type="radio" name="provider" value="bvn_modification_bank"> BVN Modification — Banks/NIBSS</label>
       </div>
+      <fieldset id="bank-scope" class="bank-scope" hidden>
+        <legend>Banks to reprice</legend>
+        <p class="hint">Every bank has its own price. Untick a bank (e.g. Access Bank) to leave its price untouched, or tick only Access Bank to reprice it alone.</p>
+        ${bankCheckboxes}
+      </fieldset>
       <div class="row">
         <div>
           <label>Markup %</label>

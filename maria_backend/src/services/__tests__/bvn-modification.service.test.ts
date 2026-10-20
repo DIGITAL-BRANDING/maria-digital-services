@@ -39,6 +39,7 @@ const { prisma, __resetFakePrisma } = (await import('../../lib/prisma.js')) as u
   __resetFakePrisma: () => void;
 };
 const {
+  BVN_MODIFICATION_BANKS,
   getBvnModificationPrice,
   listBvnModificationPrices,
   submitBvnModificationRequest,
@@ -79,11 +80,29 @@ describe('getBvnModificationPrice / listBvnModificationPrices', () => {
     expect((await getBvnModificationPrice('update_name_dob')).unitPrice).toBe(8000);
   });
 
-  it('lists all eight types with separate Agency and Bank prices', async () => {
+  it('lists all eight types with an Agency price and one price per bank', async () => {
     const prices = await listBvnModificationPrices();
-    expect(prices).toHaveLength(16);
+    expect(prices).toHaveLength(8 * (1 + BVN_MODIFICATION_BANKS.length));
     expect(prices.filter((p) => p.enrollmentType === 'Agency')).toHaveLength(8);
-    expect(prices.filter((p) => p.enrollmentType === 'Bank')).toHaveLength(8);
+    const bankRows = prices.filter((p) => p.enrollmentType === 'Bank');
+    expect(bankRows).toHaveLength(8 * BVN_MODIFICATION_BANKS.length);
+    expect(new Set(bankRows.map((p) => p.bankName))).toEqual(new Set(BVN_MODIFICATION_BANKS));
+  });
+
+  it('prices each bank separately - a custom Access Bank price does not leak to other banks', async () => {
+    await listBvnModificationPrices(); // creates every row, as the admin bulk-pricing page does
+    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_ACCESS_BANK' }, data: { sellingPriceKobo: 1_200_000n } });
+    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_FIRST_BANK' }, data: { sellingPriceKobo: 1_000_000n } });
+    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_NIBSS' }, data: { sellingPriceKobo: 1_000_000n } });
+
+    const prices = await listBvnModificationPrices();
+    const priceOf = (bankName: string) => prices.find((p) => p.type === 'update_name' && p.enrollmentType === 'Bank' && p.bankName === bankName)?.unitPrice;
+    expect(priceOf('Access Bank')).toBe(12000);
+    expect(priceOf('First Bank')).toBe(10000);
+    expect(priceOf('NIBSS')).toBe(10000);
+    expect(priceOf('Heritage Bank')).toBe(5000); // untouched bank keeps its default
+    expect((await getBvnModificationPrice('update_name', 'Bank', 'Access Bank')).unitPrice).toBe(12000);
+    expect((await getBvnModificationPrice('update_name', 'Bank', 'First Bank')).unitPrice).toBe(10000);
   });
 });
 
@@ -99,6 +118,20 @@ describe('submitBvnModificationRequest', () => {
 
     const tx = await prisma.transaction.findUnique({ where: { reference: result.reference } });
     expect(tx?.status).toBe('PENDING');
+  });
+
+  it('charges the selected bank\'s own price, not another bank\'s', async () => {
+    await listBvnModificationPrices();
+    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_PHONE_BANK_ACCESS_BANK' }, data: { sellingPriceKobo: 900_000n } });
+    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_PHONE_BANK_FIRST_BANK' }, data: { sellingPriceKobo: 600_000n } });
+
+    const accessUser = await seedUser(20000);
+    await submitBvnModificationRequest({ userId: accessUser, type: 'update_phone', values: { ...values, bank_name: 'Access Bank' } });
+    expect(await balanceOf(accessUser)).toBe(20000 - 9000);
+
+    const firstUser = await seedUser(20000);
+    await submitBvnModificationRequest({ userId: firstUser, type: 'update_phone', values: { ...values, bank_name: 'First Bank' } });
+    expect(await balanceOf(firstUser)).toBe(20000 - 6000);
   });
 
   it('generates a real, downloadable submission PDF', async () => {

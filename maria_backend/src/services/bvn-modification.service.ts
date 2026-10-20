@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
+import { bankKeyFor } from '../lib/bvn-modification-banks.js';
 import { koboToNaira } from '../lib/money.js';
 import { sealPII, openPII } from '../lib/pii.js';
 import { prisma } from '../lib/prisma.js';
@@ -139,7 +140,7 @@ function serviceKeyFor(type: BvnModificationType) {
 
 function pricingServiceKey(type: BvnModificationType, enrollmentType: BvnEnrollmentType, bankName?: string) {
   if (enrollmentType === 'Agency') return `${serviceKeyFor(type)}_AGENCY`;
-  const bankKey = bankName?.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+  const bankKey = bankName ? bankKeyFor(bankName) : '';
   return `${serviceKeyFor(type)}_BANK_${bankKey || 'DEFAULT'}`;
 }
 

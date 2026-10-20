@@ -1,5 +1,6 @@
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { env } from '../config/env.js';
+import { serviceMatchesBankKeys } from '../lib/bvn-modification-banks.js';
 import { koboToNaira } from '../lib/money.js';
 import { prisma } from '../lib/prisma.js';
 import { ApiError } from '../middleware/error.js';
@@ -140,14 +141,21 @@ export async function updateServicePrice(service: string, input: { sellingPrice?
  * data-plan-pricing.service.ts - see that function's comment for why the
  * loop is sequential (DATABASE_URL's connection_limit=1).
  */
-export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number }) {
+/**
+ * `bankKeys` only applies to `bvn_modification_bank`: when given, just those
+ * banks' rows are repriced (so one bank - e.g. ACCESS_BANK - can keep its own
+ * price while the rest are bulk-updated, or be repriced on its own). Omitted
+ * or empty means every bank, the previous behaviour.
+ */
+export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number; bankKeys?: string[] }) {
   const bvnTier = params.provider === 'bvn_modification_agency' ? 'AGENCY' : params.provider === 'bvn_modification_bank' ? 'BANK' : null;
   const where = bvnTier
     ? { provider: 'manual', service: bvnTier === 'AGENCY'
       ? { startsWith: 'BVN_MODIFICATION_', endsWith: '_AGENCY' }
       : { startsWith: 'BVN_MODIFICATION_', contains: '_BANK_' } }
     : { provider: params.provider };
-  const rows = await prisma.servicePricing.findMany({ where });
+  const allRows = await prisma.servicePricing.findMany({ where });
+  const rows = bvnTier === 'BANK' ? allRows.filter((row) => serviceMatchesBankKeys(row.service, params.bankKeys)) : allRows;
 
   let updated = 0;
   let skipped = 0;

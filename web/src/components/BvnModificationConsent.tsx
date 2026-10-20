@@ -1,147 +1,177 @@
-import { AlertCircle, CheckCircle2, ShieldAlert, X } from 'lucide-react';
+import { useEffect } from 'react';
+import { AlertTriangle, CheckCircle2, FileText, Scale, ShieldCheck, Wallet, X, type LucideIcon } from 'lucide-react';
 
-export function BvnModificationConsent({
-  open,
-  onAgree,
-  onClose
-}: {
-  open: boolean;
-  onAgree: () => void;
-  onClose: () => void
-}) {
+/**
+ * Consent & Authorization modal for BVN Modification.
+ *
+ * Styling note: every colour that carries meaning here (header, text, borders,
+ * buttons) is an explicit hex value rather than a default-palette utility such
+ * as `bg-blue-600` / `text-slate-700`. Some customers' phones render the
+ * default Tailwind palette (oklch based) as nothing at all - the header went
+ * white-on-white and the "I Agree" button vanished - while explicit hex values
+ * always render. The overlay colour is an inline rgba for the same reason.
+ *
+ * Layout: a bottom sheet on phones (full width, footer always reachable,
+ * stacked full-width buttons) and a centred card from `sm` up. It sits above
+ * the floating WhatsApp / AI Help buttons (z-[60]) so they can't cover the
+ * Decline / Agree buttons.
+ */
+
+type TermGroup = {
+  title: string;
+  icon: LucideIcon;
+  /** Explicit hex colours: card background, border, and icon/bullet accent. */
+  bg: string;
+  border: string;
+  accent: string;
+  items: string[];
+};
+
+const TERM_GROUPS: TermGroup[] = [
+  {
+    title: 'Authorization & data use',
+    icon: ShieldCheck,
+    bg: 'bg-[#eff6ff]',
+    border: 'border-[#bfdbfe]',
+    accent: 'text-[#1d4ed8]',
+    items: [
+      'I authorize this platform and its agents to access and use my personal data, including my BVN, to process and modify my BVN record as requested.',
+      'I understand this platform is not affiliated with NIBSS or any bank, but I voluntarily authorize this platform and its trusted agents to help modify my BVN details on my behalf.'
+    ]
+  },
+  {
+    title: 'Official guidance & ownership',
+    icon: Scale,
+    bg: 'bg-[#fffbeb]',
+    border: 'border-[#fde68a]',
+    accent: 'text-[#b45309]',
+    items: [
+      'Banks and NIBSS recommend modifications be done personally through an official channel. By using this platform, I voluntarily authorize the request to proceed on my behalf.',
+      'I confirm that I am the BVN owner or have full consent and authorization from the BVN owner to act on their behalf.'
+    ]
+  },
+  {
+    title: 'Payment & processing',
+    icon: Wallet,
+    bg: 'bg-[#ecfdf5]',
+    border: 'border-[#a7f3d0]',
+    accent: 'text-[#047857]',
+    items: [
+      'I agree to pay the fixed service fee and authorize the platform to use lawful methods necessary to complete the requested modification.',
+      'Updates may reflect immediately in NIBSS records, but individual banks may delay synchronizing their own copy of your details.',
+      'Wallet funds are non-withdrawable. Failed services are refunded to the wallet only.'
+    ]
+  },
+  {
+    title: 'Other terms',
+    icon: FileText,
+    bg: 'bg-[#f1f5f9]',
+    border: 'border-[#cbd5e1]',
+    accent: 'text-[#334155]',
+    items: [
+      'I will not submit the same request on another platform while it is being processed here.',
+      'This agreement applies to all past, current, and future BVN modification requests submitted through this platform.',
+      'If there is a delay, issue, or network failure on the bank/NIBSS side, I agree to wait until it is resolved and not submit duplicate requests.'
+    ]
+  }
+];
+
+export function BvnModificationConsent({ open, onAgree, onClose }: { open: boolean; onAgree: () => void; onClose: () => void }) {
+  // Hooks run before the early return so their order never changes between renders.
+  useEffect(() => {
+    if (!open) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open, onClose]);
+
   if (!open) return null;
 
-  const termsGroups = [
-    {
-      title: "Authorization & Data Usage",
-      icon: ShieldAlert,
-      color: "from-blue-50 to-blue-100",
-      borderColor: "border-blue-200",
-      items: [
-        "I authorize this platform and its agents to access and use my personal data, including my BVN, to process and modify my BVN record as requested.",
-        "I understand this platform is not affiliated with NIBSS or any bank, but I voluntarily authorize this platform and its trusted agents to help modify my BVN details on my behalf."
-      ]
-    },
-    {
-      title: "Regulatory & Official Guidance",
-      icon: AlertCircle,
-      color: "from-amber-50 to-amber-100",
-      borderColor: "border-amber-200",
-      items: [
-        "Banks and NIBSS recommend modifications be done personally through an official channel. By using this platform, I voluntarily authorize the request to proceed on my behalf.",
-        "I confirm that I am the BVN owner or have full consent and authorization from the BVN owner to act on their behalf."
-      ]
-    },
-    {
-      title: "Payment & Processing",
-      icon: CheckCircle2,
-      color: "from-emerald-50 to-emerald-100",
-      borderColor: "border-emerald-200",
-      items: [
-        "I agree to pay the fixed service fee and authorize the platform to use lawful methods necessary to complete the requested modification.",
-        "Updates may reflect immediately in NIBSS records, but individual banks may delay synchronizing their own copy of your details."
-      ]
-    },
-    {
-      title: "Terms & Conditions",
-      icon: ShieldAlert,
-      color: "from-slate-50 to-slate-100",
-      borderColor: "border-slate-200",
-      items: [
-        "Wallet funds are non-withdrawable. Failed services are refunded to the wallet only.",
-        "I will not submit the same request on another platform while it is being processed here.",
-        "This agreement applies to all past, current, and future BVN modification requests submitted through this platform.",
-        "If there is a delay, issue, or network failure on the bank/NIBSS side, I agree to wait until it is resolved and not submit duplicate requests."
-      ]
-    }
-  ];
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
-      <section className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
-        {/* Header */}
-        <header className="relative bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-8 sm:px-8">
-          <button
-            onClick={onClose}
-            className="absolute right-4 top-4 sm:right-6 sm:top-6 p-2 hover:bg-blue-500/30 rounded-lg transition-colors"
-          >
-            <X size={24} className="text-white" />
-          </button>
-
-          <div className="flex items-start gap-3">
-            <ShieldAlert size={32} className="text-blue-200 shrink-0 mt-1" />
-            <div>
-              <h1 className="text-2xl sm:text-3xl font-bold text-white">
-                Consent & Authorization
-              </h1>
-              <p className="text-blue-100 text-sm sm:text-base mt-2">
-                Please review and accept the terms before proceeding
-              </p>
-            </div>
+    <div
+      className="fixed inset-0 z-[70] flex items-end justify-center sm:items-center sm:p-4"
+      style={{ backgroundColor: 'rgba(7, 26, 61, 0.72)' }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="bvn-consent-title"
+    >
+      <section className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl supports-[height:1dvh]:max-h-[92dvh] sm:rounded-3xl">
+        <header className="flex shrink-0 items-start gap-3 bg-[#0b2f73] px-4 py-4 sm:px-6 sm:py-5">
+          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#1d4287]">
+            <ShieldCheck size={22} className="text-[#f7c948]" aria-hidden="true" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h2 id="bvn-consent-title" className="text-lg font-bold leading-tight text-white sm:text-2xl">
+              Consent &amp; Authorization
+            </h2>
+            <p className="mt-1 text-sm leading-snug text-[#dbeafe]">Please review and accept the terms before proceeding.</p>
           </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="-mr-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-white hover:bg-[#1d4287]"
+          >
+            <X size={22} aria-hidden="true" />
+          </button>
         </header>
 
-        {/* Scrollable Content */}
-        <div className="overflow-y-auto flex-1">
-          <div className="p-6 sm:p-8 space-y-8">
-            {/* Important Notice */}
-            <div className="bg-gradient-to-r from-red-50 to-rose-50 border-l-4 border-rose-500 rounded-lg p-4 sm:p-5">
-              <p className="text-sm sm:text-base text-slate-700 leading-relaxed">
-                <span className="font-bold text-rose-700">⚠️ Important:</span> Read this carefully before requesting a BVN modification. This is a binding agreement.
-              </p>
-            </div>
-
-            {/* Terms Groups */}
-            {termsGroups.map((group, groupIdx) => {
-              const Icon = group.icon;
-              return (
-                <div key={groupIdx} className="space-y-3">
-                  <div className={`bg-gradient-to-r ${group.color} border ${group.borderColor} rounded-xl p-4`}>
-                    <div className="flex items-center gap-3 mb-3">
-                      <Icon size={20} className="shrink-0 text-slate-700" />
-                      <h2 className="font-bold text-slate-900 text-base sm:text-lg">
-                        {group.title}
-                      </h2>
-                    </div>
-                    <ul className="space-y-2 ml-7">
-                      {group.items.map((item, idx) => (
-                        <li key={idx} className="flex gap-3">
-                          <span className="text-slate-400 font-semibold text-sm shrink-0 mt-0.5">•</span>
-                          <p className="text-slate-700 text-sm sm:text-base leading-relaxed">
-                            {item}
-                          </p>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-              );
-            })}
-
-            {/* Confirmation Message */}
-            <div className="bg-gradient-to-r from-blue-50 to-cyan-50 border border-blue-200 rounded-xl p-4 sm:p-5">
-              <p className="text-slate-800 font-semibold text-sm sm:text-base text-center">
-                ✓ I understand and accept all terms and conditions above
-              </p>
-            </div>
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-4 py-4 sm:space-y-4 sm:px-6">
+          <div className="flex items-start gap-3 rounded-xl border border-[#fecdd3] border-l-4 border-l-[#e11d48] bg-[#fff1f2] p-3 sm:p-4">
+            <AlertTriangle size={20} className="mt-0.5 shrink-0 text-[#e11d48]" aria-hidden="true" />
+            <p className="text-sm leading-relaxed text-[#881337]">
+              <b>Important:</b> read this carefully before requesting a BVN modification. This is a binding agreement.
+            </p>
           </div>
+
+          {TERM_GROUPS.map(({ title, icon: Icon, bg, border, accent, items }) => (
+            <section key={title} className={`rounded-2xl border p-3 sm:p-4 ${bg} ${border}`}>
+              <h3 className="flex items-center gap-2 text-sm font-bold text-[#0f172a] sm:text-base">
+                <Icon size={18} className={`shrink-0 ${accent}`} aria-hidden="true" />
+                {title}
+              </h3>
+              <ul className="mt-2 space-y-2">
+                {items.map((item) => (
+                  <li key={item} className="flex gap-2 text-sm leading-relaxed text-[#1e293b]">
+                    <span className={`mt-[0.55rem] h-1.5 w-1.5 shrink-0 rounded-full bg-current ${accent}`} aria-hidden="true" />
+                    <span className="min-w-0 break-words">{item}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+
+          <p className="pb-1 text-center text-xs text-[#475569]">By tapping &ldquo;I Agree&rdquo; you accept all the terms above.</p>
         </div>
 
-        {/* Footer Buttons */}
-        <footer className="border-t border-slate-200 bg-gradient-to-r from-slate-50 to-slate-100 p-4 sm:p-6 flex gap-3 justify-center sm:justify-end">
-          <button
-            onClick={onClose}
-            className="px-6 py-3 sm:px-8 rounded-lg font-semibold text-slate-700 bg-white border-2 border-slate-300 hover:bg-slate-50 transition-all duration-200 text-sm sm:text-base"
-          >
-            ← Decline
-          </button>
-          <button
-            onClick={onAgree}
-            className="px-6 py-3 sm:px-8 rounded-lg font-semibold text-white bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 shadow-lg hover:shadow-xl transition-all duration-200 flex items-center gap-2 text-sm sm:text-base"
-          >
-            <CheckCircle2 size={20} />
-            I Agree & Continue
-          </button>
+        <footer
+          className="shrink-0 border-t border-[#dbe5f5] bg-white px-4 pt-3 sm:px-6"
+          style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}
+        >
+          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full rounded-xl border-2 border-[#0b2f73] bg-white px-6 py-3 text-sm font-semibold text-[#0b2f73] hover:bg-[#eff6ff] sm:w-auto"
+            >
+              Not Agreed
+            </button>
+            <button
+              type="button"
+              onClick={onAgree}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#059669] px-6 py-3 text-sm font-bold text-white shadow-md hover:bg-[#047857] sm:w-auto"
+            >
+              <CheckCircle2 size={18} aria-hidden="true" />
+              I Agree &amp; Continue
+            </button>
+          </div>
         </footer>
       </section>
     </div>

@@ -20,7 +20,7 @@ import {
 type FieldInput = 'text' | 'date' | 'phone' | 'email' | 'bvn' | 'nin' | 'image' | 'select';
 type Field = { key: string; label: string; required: boolean; input: FieldInput; options?: string[]; dependsOn?: { key: string; value: string } };
 type TypeConfig = { id: string; title: string; fields: Field[] };
-type PriceRow = { type: string; enrollmentType: 'Agency' | 'Bank'; title: string; unitPrice: number; isActive: boolean };
+type PriceRow = { type: string; enrollmentType: 'Agency' | 'Bank'; bankName: string | null; title: string; unitPrice: number; isActive: boolean };
 type HistoryEntry = { reference: string; status: string; created_at: string; pdf_base64: string | null; modification_type: string | null };
 type MatchResult = {
   bvn_date_of_birth: string | null;
@@ -29,6 +29,13 @@ type MatchResult = {
   dob_matches: boolean | null;
   suggested_types: string[];
 };
+
+// Every bank has its own price row on the backend (set per bank from the admin
+// bulk-pricing page), so a price is looked up by type + enrollment + bank. Keying
+// by enrollment alone made every bank share whichever bank row was written last.
+function priceKey(type: string, enrollmentType: 'Agency' | 'Bank', bankName?: string | null) {
+  return enrollmentType === 'Bank' ? `${type}:Bank:${bankName ?? ''}` : `${type}:Agency`;
+}
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB raw file - keeps the base64'd body comfortably under the backend's 8mb JSON limit
 
@@ -61,6 +68,7 @@ export default function BvnModificationPage() {
 
   const [types, setTypes] = useState<TypeConfig[]>([]);
   const [prices, setPrices] = useState<Record<string, number>>({});
+  const [banks, setBanks] = useState<string[]>([]);
   const [enrollmentType, setEnrollmentType] = useState<'Agency' | 'Bank' | null>(null);
   const [bankName, setBankName] = useState('');
   const [selectedType, setSelectedType] = useState<string | null>(null);
@@ -89,13 +97,16 @@ export default function BvnModificationPage() {
       .then(([typesRes, pricesRes]) => {
         const ordered = [...typesRes.data].sort((a, b) => TYPE_ORDER.indexOf(a.id) - TYPE_ORDER.indexOf(b.id));
         setTypes(ordered);
-        setPrices(Object.fromEntries(pricesRes.data.map((row) => [`${row.type}:${row.enrollmentType}`, row.unitPrice])));
+        setPrices(Object.fromEntries(pricesRes.data.map((row) => [priceKey(row.type, row.enrollmentType, row.bankName), row.unitPrice])));
+        // The bank list comes from the server, so it can never drift from the banks that actually have a price row.
+        setBanks([...new Set(pricesRes.data.filter((row) => row.enrollmentType === 'Bank' && row.bankName).map((row) => row.bankName as string))]);
       })
       .catch(() => setMessage('Unable to load modification types. Please refresh and try again.'));
   }, []);
 
   const selected = useMemo(() => types.find((t) => t.id === selectedType) ?? null, [types, selectedType]);
-  const selectedPrice = selectedType && enrollmentType ? prices[`${selectedType}:${enrollmentType}`] : undefined;
+  const priceFor = (type: string) => (enrollmentType ? prices[priceKey(type, enrollmentType, bankName)] : undefined);
+  const selectedPrice = selectedType ? priceFor(selectedType) : undefined;
 
   function chooseEnrollment(value: 'Agency' | 'Bank') {
     setEnrollmentType(value);
@@ -349,7 +360,7 @@ export default function BvnModificationPage() {
                 <label className={FORM_LABEL_CLASSES}>Select bank or enrollment network
                   <select className={`mt-1 ${FORM_INPUT_CLASSES}`} value={bankName} onChange={(event) => setBankName(event.target.value)}>
                     <option value="">-- Select --</option>
-                    {['Micro Finance Bank', 'First Bank', 'Access Bank', 'Heritage Bank', 'Enterprise Bank', 'BOA Bank', 'LAPO Bank', 'NIBSS'].map((bank) => <option key={bank} value={bank}>{bank}</option>)}
+                    {banks.map((bank) => <option key={bank} value={bank}>{bank}</option>)}
                   </select>
                 </label>
                 <button disabled={!bankName} onClick={() => setStage('select')} className="mt-4 w-full rounded-xl bg-[#0b2f73] py-3 font-display font-semibold text-white disabled:opacity-50 sm:w-auto sm:px-8">Continue</button>
@@ -370,7 +381,7 @@ export default function BvnModificationPage() {
                 >
                   {suggested && <span className="absolute -top-2 left-1/2 -translate-x-1/2 rounded-full bg-gold-400 px-2 py-0.5 text-[10px] font-bold text-[#4a3505]">Suggested</span>}
                   <span className="font-body text-sm font-semibold">{type.title}</span>
-                  <span className="mt-1 text-xs font-bold text-gold-300">{money(enrollmentType ? prices[`${type.id}:${enrollmentType}`] : undefined)}</span>
+                  <span className="mt-1 text-xs font-bold text-gold-300">{money(priceFor(type.id))}</span>
                 </button>
               );
             })}
@@ -382,7 +393,7 @@ export default function BvnModificationPage() {
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h2 className="font-display text-xl font-bold text-[#0b2f73]">{selected.title}</h2>
               <span className="rounded-full bg-gold-500/15 px-4 py-2 font-body text-sm font-bold text-gold-700">
-                Service cost: {money(selectedPrice)} · {enrollmentType === 'Agency' ? 'Agency Banking' : 'Banks'}
+                Service cost: {money(selectedPrice)} · {enrollmentType === 'Agency' ? 'Agency Banking' : bankName || 'Banks'}
               </span>
             </div>
 
