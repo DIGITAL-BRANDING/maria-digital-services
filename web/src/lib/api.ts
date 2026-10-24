@@ -2,7 +2,7 @@
 // In dev, requests to /api/* are proxied to VITE_API_PROXY_TARGET (see vite.config.ts).
 // In production, set VITE_API_BASE_URL to the deployed backend origin
 // (leave empty if this app is served from the same origin as the API).
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
 
 const TOKEN_KEY = 'mdl_access_token';
 const REFRESH_KEY = 'mdl_refresh_token';

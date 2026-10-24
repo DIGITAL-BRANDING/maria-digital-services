@@ -1,0 +1,14 @@
+working_directory: /maria_backend
+
+build:
+  system: auto
+  command: npm ci --include=dev --no-audit --no-fund && npm run prisma:generate && npm run build
+  min_memory: 512
+  max_memory: 2048
+
+start_command: npm run start:prod
+
+health_check:
+  type: http
+  http_path: /health
+  interval_in_seconds: 30

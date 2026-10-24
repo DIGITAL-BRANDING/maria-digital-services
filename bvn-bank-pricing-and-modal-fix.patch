@@ -1,0 +1,918 @@
+From ad1e4d08d0d80f18793050e5753e596d9c413e46 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 07:47:21 +0100
+Subject: [PATCH] Fix per-bank BVN modification prices and consent modal on
+ older phones
+
+Prices: BvnModificationPage keyed prices by enrollment type only, so every
+bank showed whichever bank row came last (NIBSS) and Access Bank's own price
+never appeared, even though the backend already stores and charges a price per
+bank. Key by type + bank, take the bank list from the API, and show the bank
+name next to the service cost.
+
+Bulk pricing: the "BVN Modification - Banks/NIBSS" bulk reprice always
+overwrote every bank row, wiping a bank's custom price. Add a bank checklist so
+a bank can be left out (or repriced alone); bank-key logic is now shared in
+lib/bvn-modification-banks.ts. Fix the stale price-list test and add per-bank
+price/charge tests.
+
+Mobile styling: Tailwind v4 emits its default palette as oklch(), which some
+phones drop entirely, leaving white-on-white headers, black borders and
+missing buttons. Pin the default palette to hex in index.css and define the
+tokens components used but the theme never declared (gold-100/300, brand-100/
+500, ink-400). Rebuild the consent modal as a bottom sheet with explicit hex
+colours, stacked full-width buttons, and a z-index above the floating
+WhatsApp/AI Help buttons. Remove a stray committed backup file.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015YoLAo63RFk6PcWruuMD9h
+---
+ maria_backend/src/admin/bulk-pricing.ts       |  38 ++-
+ .../__tests__/bvn-modification-banks.test.ts  |  37 +++
+ .../src/lib/bvn-modification-banks.ts         |  31 ++
+ .../bvn-modification.service.test.ts          |  39 ++-
+ .../src/services/bvn-modification.service.ts  |   3 +-
+ .../src/services/result-pin.service.ts        |  12 +-
+ web/src/components/BvnModificationConsent.tsx | 290 ++++++++++--------
+ ...ficationConsent.tsx.backup.20261012_205947 |  34 --
+ web/src/index.css                             | 115 +++++++
+ web/src/pages/BvnModificationPage.tsx         |  23 +-
+ 10 files changed, 441 insertions(+), 181 deletions(-)
+ create mode 100644 maria_backend/src/lib/__tests__/bvn-modification-banks.test.ts
+ create mode 100644 maria_backend/src/lib/bvn-modification-banks.ts
+ delete mode 100644 web/src/components/BvnModificationConsent.tsx.backup.20261012_205947
+
+diff --git a/maria_backend/src/admin/bulk-pricing.ts b/maria_backend/src/admin/bulk-pricing.ts
+index e1d8cc5..340f0bb 100644
+--- a/maria_backend/src/admin/bulk-pricing.ts
++++ b/maria_backend/src/admin/bulk-pricing.ts
+@@ -1,6 +1,7 @@
+ import type { Request, Router } from 'express';
+ import { logAdminAction } from './audit.js';
+ import type { AdminSessionUser } from './auth.js';
++import { bankKeyFor } from '../lib/bvn-modification-banks.js';
+ import { prisma } from '../lib/prisma.js';
+ import { dataPlanPricingService } from '../services/data-plan-pricing.service.js';
+ import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
+@@ -195,16 +196,33 @@ export function registerBulkPricingRoutes(router: Router) {
+       return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Markup % and ₦ must both be valid numbers ≥ 0, and a provider must be selected.'));
+     }
+ 
++    // Which banks a "BVN Modification — Banks/NIBSS" bulk reprice touches. Only
++    // known bank keys are accepted; an admin unticks e.g. Access Bank to leave
++    // its own price alone while repricing the remaining banks, or ticks only
++    // Access Bank to reprice it by itself.
++    let bankKeys: string[] | undefined;
++    if (provider === 'bvn_modification_bank') {
++      const rawKeys = fields(req).bankKeys;
++      const known = new Set(BVN_MODIFICATION_BANKS.map(bankKeyFor));
++      bankKeys = [...new Set((Array.isArray(rawKeys) ? rawKeys : rawKeys ? [rawKeys] : []).filter((key): key is string => typeof key === 'string' && known.has(key)))];
++      if (bankKeys.length === 0) {
++        return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Select at least one bank to reprice.'));
++      }
++    }
++
+     try {
+-      const result = await applyServiceMarkup({ provider, markupNaira: naira, markupPercent: percent });
++      const result = await applyServiceMarkup({ provider, markupNaira: naira, markupPercent: percent, bankKeys });
+       await logAdminAction({
+         adminId: admin.id,
+         action: 'BULK_REPRICE_SERVICES',
+         targetType: 'ServicePricing',
+-        metadata: { provider, markupPercent: percent, markupNaira: naira, updated: result.updated }
++        metadata: { provider, markupPercent: percent, markupNaira: naira, updated: result.updated, ...(bankKeys ? { banks: bankKeys } : {}) }
+       });
+ 
+-      const label = provider === 'techhub' ? 'NIN/BVN verification services' : provider === 'bvn_modification_agency' ? 'Agency BVN modification services' : provider === 'bvn_modification_bank' ? 'Bank BVN modification services' : 'WAEC/NECO/NABTEB result-pin services';
++      const bankScope = bankKeys && bankKeys.length < BVN_MODIFICATION_BANKS.length
++        ? ` (${bankKeys.map((key) => BVN_MODIFICATION_BANKS.find((bank) => bankKeyFor(bank) === key) ?? key).join(', ')})`
++        : '';
++      const label = provider === 'techhub' ? 'NIN/BVN verification services' : provider === 'bvn_modification_agency' ? 'Agency BVN modification services' : provider === 'bvn_modification_bank' ? `Bank BVN modification services${bankScope}` : 'WAEC/NECO/NABTEB result-pin services';
+       const skippedNote = result.skipped > 0 ? ` (${result.skipped} skipped - non-positive computed price)` : '';
+       res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Repriced ${result.updated} ${label} at cost + ${percent}% + ₦${naira}.${skippedNote}`));
+     } catch (error) {
+@@ -296,7 +314,8 @@ function renderPage(params: {
+ 
+   const networkOptions = networks.map((n) => `<option value="${escape(n)}">${escape(n)}</option>`).join('');
+   const bvnTypeLabels = Object.fromEntries(Object.entries(BVN_MODIFICATION_CONFIG).map(([key, config]) => [key.toUpperCase(), config.title]));
+-  const bankKeys = BVN_MODIFICATION_BANKS.map((bank) => bank.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, ''));
++  const bankKeys = BVN_MODIFICATION_BANKS.map(bankKeyFor);
++  const bankCheckboxes = BVN_MODIFICATION_BANKS.map((bank) => `<label class="bank-option"><input type="checkbox" name="bankKeys" value="${escape(bankKeyFor(bank))}" checked> ${escape(bank)}</label>`).join('');
+   const serviceRows = servicePrices.map((row) => {
+     const bvnMatch = row.service.match(/^BVN_MODIFICATION_(UPDATE_[A-Z_]+)_(AGENCY|BANK_(.+))$/);
+     let label = row.label;
+@@ -326,6 +345,10 @@ function renderPage(params: {
+   * { box-sizing: border-box; }
+   body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+   .wrap { max-width: 720px; margin: 0 auto; }
++  .bank-scope { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
++  .bank-scope[hidden] { display: none; }
++  .bank-scope legend { font-weight: 600; padding: 0 6px; }
++  .bank-option { display: inline-flex; align-items: center; gap: 6px; margin: 4px 14px 4px 0; }
+   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+   header h1 { font-size: 20px; margin: 0; }
+   header a { color: var(--gold-dark); text-decoration: none; font-size: 14px; }
+@@ -459,12 +482,17 @@ function renderPage(params: {
+     <h2>3. Bulk reprice services</h2>
+     <p class="hint">Reprice NIN/BVN verification (Techhub), WAEC/NECO/NABTEB result pins (Alrahuz), Agency BVN modifications, or Bank BVN modifications. Agency and Bank prices are managed separately.</p>
+     <form method="POST" action="/admin/bulk-pricing/services" onsubmit="return confirm('This overwrites the selling price on every matching service. Continue?');">
+-      <div class="provider-choice">
++      <div class="provider-choice" onchange="document.getElementById('bank-scope').hidden = !document.querySelector('input[name=provider][value=bvn_modification_bank]').checked;">
+         <label><input type="radio" name="provider" value="techhub" checked> NIN/BVN (Techhub)</label>
+         <label><input type="radio" name="provider" value="alrahuz"> WAEC/NECO/NABTEB (Alrahuz)</label>
+         <label><input type="radio" name="provider" value="bvn_modification_agency"> BVN Modification — Agency Banking</label>
+         <label><input type="radio" name="provider" value="bvn_modification_bank"> BVN Modification — Banks/NIBSS</label>
+       </div>
++      <fieldset id="bank-scope" class="bank-scope" hidden>
++        <legend>Banks to reprice</legend>
++        <p class="hint">Every bank has its own price. Untick a bank (e.g. Access Bank) to leave its price untouched, or tick only Access Bank to reprice it alone.</p>
++        ${bankCheckboxes}
++      </fieldset>
+       <div class="row">
+         <div>
+           <label>Markup %</label>
+diff --git a/maria_backend/src/lib/__tests__/bvn-modification-banks.test.ts b/maria_backend/src/lib/__tests__/bvn-modification-banks.test.ts
+new file mode 100644
+index 0000000..9296314
+--- /dev/null
++++ b/maria_backend/src/lib/__tests__/bvn-modification-banks.test.ts
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from 'vitest';
++import { bankKeyFor, serviceMatchesBankKeys } from '../bvn-modification-banks.js';
++
++describe('bankKeyFor', () => {
++  it('normalises bank names into service-key segments', () => {
++    expect(bankKeyFor('Access Bank')).toBe('ACCESS_BANK');
++    expect(bankKeyFor('Micro Finance Bank')).toBe('MICRO_FINANCE_BANK');
++    expect(bankKeyFor('NIBSS')).toBe('NIBSS');
++    expect(bankKeyFor(' First  Bank ')).toBe('FIRST_BANK');
++  });
++});
++
++describe('serviceMatchesBankKeys', () => {
++  const access = 'BVN_MODIFICATION_UPDATE_NAME_BANK_ACCESS_BANK';
++  const first = 'BVN_MODIFICATION_UPDATE_NAME_BANK_FIRST_BANK';
++  const agency = 'BVN_MODIFICATION_UPDATE_NAME_AGENCY';
++  const legacyBank = 'BVN_MODIFICATION_UPDATE_NAME_BANK';
++
++  it('matches every bank row when no banks are specified', () => {
++    expect(serviceMatchesBankKeys(access)).toBe(true);
++    expect(serviceMatchesBankKeys(first, [])).toBe(true);
++  });
++
++  it('never matches agency, legacy un-suffixed, or unrelated services', () => {
++    expect(serviceMatchesBankKeys(agency)).toBe(false);
++    expect(serviceMatchesBankKeys(legacyBank)).toBe(false);
++    expect(serviceMatchesBankKeys('NIN_SLIP_BANK_ACCESS_BANK')).toBe(false);
++  });
++
++  it('limits to the requested banks, so one bank can be left out of a bulk reprice', () => {
++    const everyoneButAccess = ['FIRST_BANK', 'NIBSS'];
++    expect(serviceMatchesBankKeys(access, everyoneButAccess)).toBe(false);
++    expect(serviceMatchesBankKeys(first, everyoneButAccess)).toBe(true);
++    expect(serviceMatchesBankKeys(access, ['ACCESS_BANK'])).toBe(true);
++    expect(serviceMatchesBankKeys(first, ['ACCESS_BANK'])).toBe(false);
++  });
++});
+diff --git a/maria_backend/src/lib/bvn-modification-banks.ts b/maria_backend/src/lib/bvn-modification-banks.ts
+new file mode 100644
+index 0000000..f94143c
+--- /dev/null
++++ b/maria_backend/src/lib/bvn-modification-banks.ts
+@@ -0,0 +1,31 @@
++/**
++ * Pure helpers for the per-bank BVN Modification price rows.
++ *
++ * Each bank has its own ServicePricing row, keyed
++ * `BVN_MODIFICATION_<TYPE>_BANK_<BANK_KEY>` (e.g.
++ * `BVN_MODIFICATION_UPDATE_NAME_BANK_ACCESS_BANK`). Kept free of any imports
++ * so the service, the admin bulk-pricing page and result-pin.service.ts's
++ * bulk markup can all share one definition of "bank key" without creating an
++ * import cycle between those modules.
++ */
++
++/** "Access Bank" -> "ACCESS_BANK", "Micro Finance Bank" -> "MICRO_FINANCE_BANK". */
++export function bankKeyFor(bankName: string): string {
++  return bankName
++    .toUpperCase()
++    .replace(/[^A-Z0-9]+/g, '_')
++    .replace(/^_|_$/g, '');
++}
++
++/**
++ * True when `service` is a per-bank BVN Modification row belonging to one of
++ * `bankKeys`. An empty/undefined `bankKeys` means "every bank".
++ *
++ * The match is on the exact `_BANK_<KEY>` suffix, so "ACCESS_BANK" never
++ * matches a different bank whose key merely contains it.
++ */
++export function serviceMatchesBankKeys(service: string, bankKeys?: readonly string[]): boolean {
++  if (!service.startsWith('BVN_MODIFICATION_') || !service.includes('_BANK_')) return false;
++  if (!bankKeys || bankKeys.length === 0) return true;
++  return bankKeys.some((key) => service.endsWith(`_BANK_${key}`));
++}
+diff --git a/maria_backend/src/services/__tests__/bvn-modification.service.test.ts b/maria_backend/src/services/__tests__/bvn-modification.service.test.ts
+index 5f9182e..42cc0f4 100644
+--- a/maria_backend/src/services/__tests__/bvn-modification.service.test.ts
++++ b/maria_backend/src/services/__tests__/bvn-modification.service.test.ts
+@@ -39,6 +39,7 @@ const { prisma, __resetFakePrisma } = (await import('../../lib/prisma.js')) as u
+   __resetFakePrisma: () => void;
+ };
+ const {
++  BVN_MODIFICATION_BANKS,
+   getBvnModificationPrice,
+   listBvnModificationPrices,
+   submitBvnModificationRequest,
+@@ -79,11 +80,29 @@ describe('getBvnModificationPrice / listBvnModificationPrices', () => {
+     expect((await getBvnModificationPrice('update_name_dob')).unitPrice).toBe(8000);
+   });
+ 
+-  it('lists all eight types with separate Agency and Bank prices', async () => {
++  it('lists all eight types with an Agency price and one price per bank', async () => {
+     const prices = await listBvnModificationPrices();
+-    expect(prices).toHaveLength(16);
++    expect(prices).toHaveLength(8 * (1 + BVN_MODIFICATION_BANKS.length));
+     expect(prices.filter((p) => p.enrollmentType === 'Agency')).toHaveLength(8);
+-    expect(prices.filter((p) => p.enrollmentType === 'Bank')).toHaveLength(8);
++    const bankRows = prices.filter((p) => p.enrollmentType === 'Bank');
++    expect(bankRows).toHaveLength(8 * BVN_MODIFICATION_BANKS.length);
++    expect(new Set(bankRows.map((p) => p.bankName))).toEqual(new Set(BVN_MODIFICATION_BANKS));
++  });
++
++  it('prices each bank separately - a custom Access Bank price does not leak to other banks', async () => {
++    await listBvnModificationPrices(); // creates every row, as the admin bulk-pricing page does
++    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_ACCESS_BANK' }, data: { sellingPriceKobo: 1_200_000n } });
++    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_FIRST_BANK' }, data: { sellingPriceKobo: 1_000_000n } });
++    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_NAME_BANK_NIBSS' }, data: { sellingPriceKobo: 1_000_000n } });
++
++    const prices = await listBvnModificationPrices();
++    const priceOf = (bankName: string) => prices.find((p) => p.type === 'update_name' && p.enrollmentType === 'Bank' && p.bankName === bankName)?.unitPrice;
++    expect(priceOf('Access Bank')).toBe(12000);
++    expect(priceOf('First Bank')).toBe(10000);
++    expect(priceOf('NIBSS')).toBe(10000);
++    expect(priceOf('Heritage Bank')).toBe(5000); // untouched bank keeps its default
++    expect((await getBvnModificationPrice('update_name', 'Bank', 'Access Bank')).unitPrice).toBe(12000);
++    expect((await getBvnModificationPrice('update_name', 'Bank', 'First Bank')).unitPrice).toBe(10000);
+   });
+ });
+ 
+@@ -101,6 +120,20 @@ describe('submitBvnModificationRequest', () => {
+     expect(tx?.status).toBe('PENDING');
+   });
+ 
++  it('charges the selected bank\'s own price, not another bank\'s', async () => {
++    await listBvnModificationPrices();
++    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_PHONE_BANK_ACCESS_BANK' }, data: { sellingPriceKobo: 900_000n } });
++    await prisma.servicePricing.update({ where: { service: 'BVN_MODIFICATION_UPDATE_PHONE_BANK_FIRST_BANK' }, data: { sellingPriceKobo: 600_000n } });
++
++    const accessUser = await seedUser(20000);
++    await submitBvnModificationRequest({ userId: accessUser, type: 'update_phone', values: { ...values, bank_name: 'Access Bank' } });
++    expect(await balanceOf(accessUser)).toBe(20000 - 9000);
++
++    const firstUser = await seedUser(20000);
++    await submitBvnModificationRequest({ userId: firstUser, type: 'update_phone', values: { ...values, bank_name: 'First Bank' } });
++    expect(await balanceOf(firstUser)).toBe(20000 - 6000);
++  });
++
+   it('generates a real, downloadable submission PDF', async () => {
+     const userId = await seedUser(20000);
+     await submitBvnModificationRequest({ userId, type: 'update_phone', values });
+diff --git a/maria_backend/src/services/bvn-modification.service.ts b/maria_backend/src/services/bvn-modification.service.ts
+index e79334b..24c7787 100644
+--- a/maria_backend/src/services/bvn-modification.service.ts
++++ b/maria_backend/src/services/bvn-modification.service.ts
+@@ -1,5 +1,6 @@
+ import PDFDocument from 'pdfkit';
+ import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
++import { bankKeyFor } from '../lib/bvn-modification-banks.js';
+ import { koboToNaira } from '../lib/money.js';
+ import { sealPII, openPII } from '../lib/pii.js';
+ import { prisma } from '../lib/prisma.js';
+@@ -139,7 +140,7 @@ function serviceKeyFor(type: BvnModificationType) {
+ 
+ function pricingServiceKey(type: BvnModificationType, enrollmentType: BvnEnrollmentType, bankName?: string) {
+   if (enrollmentType === 'Agency') return `${serviceKeyFor(type)}_AGENCY`;
+-  const bankKey = bankName?.toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '');
++  const bankKey = bankName ? bankKeyFor(bankName) : '';
+   return `${serviceKeyFor(type)}_BANK_${bankKey || 'DEFAULT'}`;
+ }
+ 
+diff --git a/maria_backend/src/services/result-pin.service.ts b/maria_backend/src/services/result-pin.service.ts
+index a644a1c..44ba478 100644
+--- a/maria_backend/src/services/result-pin.service.ts
++++ b/maria_backend/src/services/result-pin.service.ts
+@@ -1,5 +1,6 @@
+ import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
+ import { env } from '../config/env.js';
++import { serviceMatchesBankKeys } from '../lib/bvn-modification-banks.js';
+ import { koboToNaira } from '../lib/money.js';
+ import { prisma } from '../lib/prisma.js';
+ import { ApiError } from '../middleware/error.js';
+@@ -140,14 +141,21 @@ export async function updateServicePrice(service: string, input: { sellingPrice?
+  * data-plan-pricing.service.ts - see that function's comment for why the
+  * loop is sequential (DATABASE_URL's connection_limit=1).
+  */
+-export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number }) {
++/**
++ * `bankKeys` only applies to `bvn_modification_bank`: when given, just those
++ * banks' rows are repriced (so one bank - e.g. ACCESS_BANK - can keep its own
++ * price while the rest are bulk-updated, or be repriced on its own). Omitted
++ * or empty means every bank, the previous behaviour.
++ */
++export async function applyServiceMarkup(params: { provider: 'techhub' | 'alrahuz' | 'bvn_modification_agency' | 'bvn_modification_bank'; markupNaira: number; markupPercent: number; bankKeys?: string[] }) {
+   const bvnTier = params.provider === 'bvn_modification_agency' ? 'AGENCY' : params.provider === 'bvn_modification_bank' ? 'BANK' : null;
+   const where = bvnTier
+     ? { provider: 'manual', service: bvnTier === 'AGENCY'
+       ? { startsWith: 'BVN_MODIFICATION_', endsWith: '_AGENCY' }
+       : { startsWith: 'BVN_MODIFICATION_', contains: '_BANK_' } }
+     : { provider: params.provider };
+-  const rows = await prisma.servicePricing.findMany({ where });
++  const allRows = await prisma.servicePricing.findMany({ where });
++  const rows = bvnTier === 'BANK' ? allRows.filter((row) => serviceMatchesBankKeys(row.service, params.bankKeys)) : allRows;
+ 
+   let updated = 0;
+   let skipped = 0;
+diff --git a/web/src/components/BvnModificationConsent.tsx b/web/src/components/BvnModificationConsent.tsx
+index 5c0fdf8..6d81836 100644
+--- a/web/src/components/BvnModificationConsent.tsx
++++ b/web/src/components/BvnModificationConsent.tsx
+@@ -1,147 +1,177 @@
+-import { AlertCircle, CheckCircle2, ShieldAlert, X } from 'lucide-react';
++import { useEffect } from 'react';
++import { AlertTriangle, CheckCircle2, FileText, Scale, ShieldCheck, Wallet, X, type LucideIcon } from 'lucide-react';
+ 
+-export function BvnModificationConsent({
+-  open,
+-  onAgree,
+-  onClose
+-}: {
+-  open: boolean;
+-  onAgree: () => void;
+-  onClose: () => void
+-}) {
+-  if (!open) return null;
++/**
++ * Consent & Authorization modal for BVN Modification.
++ *
++ * Styling note: every colour that carries meaning here (header, text, borders,
++ * buttons) is an explicit hex value rather than a default-palette utility such
++ * as `bg-blue-600` / `text-slate-700`. Some customers' phones render the
++ * default Tailwind palette (oklch based) as nothing at all - the header went
++ * white-on-white and the "I Agree" button vanished - while explicit hex values
++ * always render. The overlay colour is an inline rgba for the same reason.
++ *
++ * Layout: a bottom sheet on phones (full width, footer always reachable,
++ * stacked full-width buttons) and a centred card from `sm` up. It sits above
++ * the floating WhatsApp / AI Help buttons (z-[60]) so they can't cover the
++ * Decline / Agree buttons.
++ */
++
++type TermGroup = {
++  title: string;
++  icon: LucideIcon;
++  /** Explicit hex colours: card background, border, and icon/bullet accent. */
++  bg: string;
++  border: string;
++  accent: string;
++  items: string[];
++};
++
++const TERM_GROUPS: TermGroup[] = [
++  {
++    title: 'Authorization & data use',
++    icon: ShieldCheck,
++    bg: 'bg-[#eff6ff]',
++    border: 'border-[#bfdbfe]',
++    accent: 'text-[#1d4ed8]',
++    items: [
++      'I authorize this platform and its agents to access and use my personal data, including my BVN, to process and modify my BVN record as requested.',
++      'I understand this platform is not affiliated with NIBSS or any bank, but I voluntarily authorize this platform and its trusted agents to help modify my BVN details on my behalf.'
++    ]
++  },
++  {
++    title: 'Official guidance & ownership',
++    icon: Scale,
++    bg: 'bg-[#fffbeb]',
++    border: 'border-[#fde68a]',
++    accent: 'text-[#b45309]',
++    items: [
++      'Banks and NIBSS recommend modifications be done personally through an official channel. By using this platform, I voluntarily authorize the request to proceed on my behalf.',
++      'I confirm that I am the BVN owner or have full consent and authorization from the BVN owner to act on their behalf.'
++    ]
++  },
++  {
++    title: 'Payment & processing',
++    icon: Wallet,
++    bg: 'bg-[#ecfdf5]',
++    border: 'border-[#a7f3d0]',
++    accent: 'text-[#047857]',
++    items: [
++      'I agree to pay the fixed service fee and authorize the platform to use lawful methods necessary to complete the requested modification.',
++      'Updates may reflect immediately in NIBSS records, but individual banks may delay synchronizing their own copy of your details.',
++      'Wallet funds are non-withdrawable. Failed services are refunded to the wallet only.'
++    ]
++  },
++  {
++    title: 'Other terms',
++    icon: FileText,
++    bg: 'bg-[#f1f5f9]',
++    border: 'border-[#cbd5e1]',
++    accent: 'text-[#334155]',
++    items: [
++      'I will not submit the same request on another platform while it is being processed here.',
++      'This agreement applies to all past, current, and future BVN modification requests submitted through this platform.',
++      'If there is a delay, issue, or network failure on the bank/NIBSS side, I agree to wait until it is resolved and not submit duplicate requests.'
++    ]
++  }
++];
+ 
+-  const termsGroups = [
+-    {
+-      title: "Authorization & Data Usage",
+-      icon: ShieldAlert,
+-      color: "from-blue-50 to-blue-100",
+-      borderColor: "border-blue-200",
+-      items: [
+-        "I authorize this platform and its agents to access and use my personal data, including my BVN, to process and modify my BVN record as requested.",
+-        "I understand this platform is not affiliated with NIBSS or any bank, but I voluntarily authorize this platform and its trusted agents to help modify my BVN details on my behalf."
+-      ]
+-    },
+-    {
+-      title: "Regulatory & Official Guidance",
+-      icon: AlertCircle,
+-      color: "from-amber-50 to-amber-100",
+-      borderColor: "border-amber-200",
+-      items: [
+-        "Banks and NIBSS recommend modifications be done personally through an official channel. By using this platform, I voluntarily authorize the request to proceed on my behalf.",
+-        "I confirm that I am the BVN owner or have full consent and authorization from the BVN owner to act on their behalf."
+-      ]
+-    },
+-    {
+-      title: "Payment & Processing",
+-      icon: CheckCircle2,
+-      color: "from-emerald-50 to-emerald-100",
+-      borderColor: "border-emerald-200",
+-      items: [
+-        "I agree to pay the fixed service fee and authorize the platform to use lawful methods necessary to complete the requested modification.",
+-        "Updates may reflect immediately in NIBSS records, but individual banks may delay synchronizing their own copy of your details."
+-      ]
+-    },
+-    {
+-      title: "Terms & Conditions",
+-      icon: ShieldAlert,
+-      color: "from-slate-50 to-slate-100",
+-      borderColor: "border-slate-200",
+-      items: [
+-        "Wallet funds are non-withdrawable. Failed services are refunded to the wallet only.",
+-        "I will not submit the same request on another platform while it is being processed here.",
+-        "This agreement applies to all past, current, and future BVN modification requests submitted through this platform.",
+-        "If there is a delay, issue, or network failure on the bank/NIBSS side, I agree to wait until it is resolved and not submit duplicate requests."
+-      ]
+-    }
+-  ];
++export function BvnModificationConsent({ open, onAgree, onClose }: { open: boolean; onAgree: () => void; onClose: () => void }) {
++  // Hooks run before the early return so their order never changes between renders.
++  useEffect(() => {
++    if (!open) return;
++    const previousOverflow = document.body.style.overflow;
++    document.body.style.overflow = 'hidden';
++    const onKey = (event: KeyboardEvent) => {
++      if (event.key === 'Escape') onClose();
++    };
++    window.addEventListener('keydown', onKey);
++    return () => {
++      document.body.style.overflow = previousOverflow;
++      window.removeEventListener('keydown', onKey);
++    };
++  }, [open, onClose]);
++
++  if (!open) return null;
+ 
+   return (
+-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
+-      <section className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
+-        {/* Header */}
+-        <header className="relative bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-8 sm:px-8">
++    <div
++      className="fixed inset-0 z-[70] flex items-end justify-center sm:items-center sm:p-4"
++      style={{ backgroundColor: 'rgba(7, 26, 61, 0.72)' }}
++      role="dialog"
++      aria-modal="true"
++      aria-labelledby="bvn-consent-title"
++    >
++      <section className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl supports-[height:1dvh]:max-h-[92dvh] sm:rounded-3xl">
++        <header className="flex shrink-0 items-start gap-3 bg-[#0b2f73] px-4 py-4 sm:px-6 sm:py-5">
++          <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#1d4287]">
++            <ShieldCheck size={22} className="text-[#f7c948]" aria-hidden="true" />
++          </span>
++          <div className="min-w-0 flex-1">
++            <h2 id="bvn-consent-title" className="text-lg font-bold leading-tight text-white sm:text-2xl">
++              Consent &amp; Authorization
++            </h2>
++            <p className="mt-1 text-sm leading-snug text-[#dbeafe]">Please review and accept the terms before proceeding.</p>
++          </div>
+           <button
++            type="button"
+             onClick={onClose}
+-            className="absolute right-4 top-4 sm:right-6 sm:top-6 p-2 hover:bg-blue-500/30 rounded-lg transition-colors"
++            aria-label="Close"
++            className="-mr-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-white hover:bg-[#1d4287]"
+           >
+-            <X size={24} className="text-white" />
++            <X size={22} aria-hidden="true" />
+           </button>
+-
+-          <div className="flex items-start gap-3">
+-            <ShieldAlert size={32} className="text-blue-200 shrink-0 mt-1" />
+-            <div>
+-              <h1 className="text-2xl sm:text-3xl font-bold text-white">
+-                Consent & Authorization
+-              </h1>
+-              <p className="text-blue-100 text-sm sm:text-base mt-2">
+-                Please review and accept the terms before proceeding
+-              </p>
+-            </div>
+-          </div>
+         </header>
+ 
+-        {/* Scrollable Content */}
+-        <div className="overflow-y-auto flex-1">
+-          <div className="p-6 sm:p-8 space-y-8">
+-            {/* Important Notice */}
+-            <div className="bg-gradient-to-r from-red-50 to-rose-50 border-l-4 border-rose-500 rounded-lg p-4 sm:p-5">
+-              <p className="text-sm sm:text-base text-slate-700 leading-relaxed">
+-                <span className="font-bold text-rose-700">⚠️ Important:</span> Read this carefully before requesting a BVN modification. This is a binding agreement.
+-              </p>
+-            </div>
++        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-4 py-4 sm:space-y-4 sm:px-6">
++          <div className="flex items-start gap-3 rounded-xl border border-[#fecdd3] border-l-4 border-l-[#e11d48] bg-[#fff1f2] p-3 sm:p-4">
++            <AlertTriangle size={20} className="mt-0.5 shrink-0 text-[#e11d48]" aria-hidden="true" />
++            <p className="text-sm leading-relaxed text-[#881337]">
++              <b>Important:</b> read this carefully before requesting a BVN modification. This is a binding agreement.
++            </p>
++          </div>
+ 
+-            {/* Terms Groups */}
+-            {termsGroups.map((group, groupIdx) => {
+-              const Icon = group.icon;
+-              return (
+-                <div key={groupIdx} className="space-y-3">
+-                  <div className={`bg-gradient-to-r ${group.color} border ${group.borderColor} rounded-xl p-4`}>
+-                    <div className="flex items-center gap-3 mb-3">
+-                      <Icon size={20} className="shrink-0 text-slate-700" />
+-                      <h2 className="font-bold text-slate-900 text-base sm:text-lg">
+-                        {group.title}
+-                      </h2>
+-                    </div>
+-                    <ul className="space-y-2 ml-7">
+-                      {group.items.map((item, idx) => (
+-                        <li key={idx} className="flex gap-3">
+-                          <span className="text-slate-400 font-semibold text-sm shrink-0 mt-0.5">•</span>
+-                          <p className="text-slate-700 text-sm sm:text-base leading-relaxed">
+-                            {item}
+-                          </p>
+-                        </li>
+-                      ))}
+-                    </ul>
+-                  </div>
+-                </div>
+-              );
+-            })}
++          {TERM_GROUPS.map(({ title, icon: Icon, bg, border, accent, items }) => (
++            <section key={title} className={`rounded-2xl border p-3 sm:p-4 ${bg} ${border}`}>
++              <h3 className="flex items-center gap-2 text-sm font-bold text-[#0f172a] sm:text-base">
++                <Icon size={18} className={`shrink-0 ${accent}`} aria-hidden="true" />
++                {title}
++              </h3>
++              <ul className="mt-2 space-y-2">
++                {items.map((item) => (
++                  <li key={item} className="flex gap-2 text-sm leading-relaxed text-[#1e293b]">
++                    <span className={`mt-[0.55rem] h-1.5 w-1.5 shrink-0 rounded-full bg-current ${accent}`} aria-hidden="true" />
++                    <span className="min-w-0 break-words">{item}</span>
++                  </li>
++                ))}
++              </ul>
++            </section>
++          ))}
+ 
+-            {/* Confirmation Message */}
+-            <div className="bg-gradient-to-r from-blue-50 to-cyan-50 border border-blue-200 rounded-xl p-4 sm:p-5">
+-              <p className="text-slate-800 font-semibold text-sm sm:text-base text-center">
+-                ✓ I understand and accept all terms and conditions above
+-              </p>
+-            </div>
+-          </div>
++          <p className="pb-1 text-center text-xs text-[#475569]">By tapping &ldquo;I Agree&rdquo; you accept all the terms above.</p>
+         </div>
+ 
+-        {/* Footer Buttons */}
+-        <footer className="border-t border-slate-200 bg-gradient-to-r from-slate-50 to-slate-100 p-4 sm:p-6 flex gap-3 justify-center sm:justify-end">
+-          <button
+-            onClick={onClose}
+-            className="px-6 py-3 sm:px-8 rounded-lg font-semibold text-slate-700 bg-white border-2 border-slate-300 hover:bg-slate-50 transition-all duration-200 text-sm sm:text-base"
+-          >
+-            ← Decline
+-          </button>
+-          <button
+-            onClick={onAgree}
+-            className="px-6 py-3 sm:px-8 rounded-lg font-semibold text-white bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 shadow-lg hover:shadow-xl transition-all duration-200 flex items-center gap-2 text-sm sm:text-base"
+-          >
+-            <CheckCircle2 size={20} />
+-            I Agree & Continue
+-          </button>
++        <footer
++          className="shrink-0 border-t border-[#dbe5f5] bg-white px-4 pt-3 sm:px-6"
++          style={{ paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom))' }}
++        >
++          <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3">
++            <button
++              type="button"
++              onClick={onClose}
++              className="w-full rounded-xl border-2 border-[#0b2f73] bg-white px-6 py-3 text-sm font-semibold text-[#0b2f73] hover:bg-[#eff6ff] sm:w-auto"
++            >
++              Not Agreed
++            </button>
++            <button
++              type="button"
++              onClick={onAgree}
++              className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#059669] px-6 py-3 text-sm font-bold text-white shadow-md hover:bg-[#047857] sm:w-auto"
++            >
++              <CheckCircle2 size={18} aria-hidden="true" />
++              I Agree &amp; Continue
++            </button>
++          </div>
+         </footer>
+       </section>
+     </div>
+diff --git a/web/src/components/BvnModificationConsent.tsx.backup.20261012_205947 b/web/src/components/BvnModificationConsent.tsx.backup.20261012_205947
+deleted file mode 100644
+index c353208..0000000
+--- a/web/src/components/BvnModificationConsent.tsx.backup.20261012_205947
++++ /dev/null
+@@ -1,34 +0,0 @@
+-export function BvnModificationConsent({ open, onAgree, onClose }: { open: boolean; onAgree: () => void; onClose: () => void }) {
+-  if (!open) return null;
+-  return (
+-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/60 p-4">
+-      <section className="flex max-h-[88vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+-        <header className="bg-sky-700 px-6 py-5 text-center text-xl font-bold text-white">Consent &amp; Authorization Agreement</header>
+-        <div className="overflow-y-auto p-6 text-sm leading-6 text-slate-700">
+-          <p>Read this carefully before requesting a BVN modification; if you can abide by these terms, click "I Agreed." If not, click "Not Agreed."</p>
+-          <ol className="mt-4 list-decimal space-y-3 pl-5">
+-            <li>I authorize this platform and its agents to access and use my personal data, including my BVN, to process and modify my BVN record as requested.</li>
+-            <li>I understand this platform is not affiliated with NIBSS or any bank, but I voluntarily authorize this platform and its trusted agents to help modify my BVN details on my behalf.</li>
+-            <li>Banks and NIBSS recommend modifications be done personally through an official channel. By using this platform, I voluntarily authorize the request to proceed on my behalf.</li>
+-            <li>I confirm that I am the BVN owner or have full consent and authorization from the BVN owner to act on their behalf.</li>
+-            <li>I agree to pay the fixed service fee and authorize the platform to use lawful methods necessary to complete the requested modification.</li>
+-            <li>Updates may reflect immediately in NIBSS records, but individual banks may delay synchronizing their own copy of your details.</li>
+-            <li>Wallet funds are non-withdrawable. Failed services are refunded to the wallet only.</li>
+-            <li>I will not submit the same request on another platform while it is being processed here.</li>
+-            <li>This agreement applies to all past, current, and future BVN modification requests submitted through this platform.</li>
+-            <li>If there is a delay, issue, or network failure on the bank/NIBSS side, I agree to wait until it is resolved and not submit duplicate requests.</li>
+-          </ol>
+-          <p className="mt-4 font-semibold">I agree to the terms above and authorize this platform to proceed with my BVN modification.</p>
+-        </div>
+-        <footer className="flex justify-center gap-3 border-t p-4">
+-          <button onClick={onClose} className="rounded-xl bg-rose-600 px-5 py-2.5 font-semibold text-white">
+-            Not Agreed
+-          </button>
+-          <button onClick={onAgree} className="rounded-xl bg-emerald-600 px-5 py-2.5 font-semibold text-white">
+-            I Agreed
+-          </button>
+-        </footer>
+-      </section>
+-    </div>
+-  );
+-}
+diff --git a/web/src/index.css b/web/src/index.css
+index 55db2db..2fe1293 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -11,7 +11,9 @@
+   --color-parchment-line: #eaddb8;
+ 
+   --color-gold-50: #fffbeb;
++  --color-gold-100: #fdf1c0;
+   --color-gold-200: #fce588;
++  --color-gold-300: #fad968;
+   --color-gold-400: #f7c948;
+   --color-gold-500: #d7ad38;
+   --color-gold-600: #b8941f;
+@@ -30,13 +32,16 @@
+   /* Assistant blue palette. Keep these explicit so Tailwind utilities such
+      as bg-brand-600/text-brand-800 always have a real, high-contrast color. */
+   --color-brand-50: #eff6ff;
++  --color-brand-100: #dbeafe;
+   --color-brand-200: #bfdbfe;
++  --color-brand-500: #3b82f6;
+   --color-brand-600: #2563eb;
+   --color-brand-700: #1d4ed8;
+   --color-brand-800: #1e3a8a;
+   --color-brand-900: #172554;
+ 
+   --color-ink-900: #1c140b;
++  --color-ink-400: #8c7b62;
+   --color-ink-600: #5c4d38;
+ 
+   --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+@@ -44,6 +49,116 @@
+   --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+ }
+ 
++/* Default Tailwind palette, pinned to plain hex.
++   Tailwind v4 ships these colours as oklch(). Browsers/WebViews without oklch
++   support (common on older budget Android phones) silently drop every utility
++   built on them - bg-blue-*, text-slate-*, border-emerald-* ... - so headers
++   rendered white-on-white, borders turned black and buttons disappeared.
++   Redefining the same variables as hex makes those utilities render
++   everywhere. Values are the sRGB equivalents of Tailwind's own oklch ones, so
++   colours look unchanged on modern browsers. */
++@theme {
++  --color-red-50: #fef2f2;
++  --color-red-100: #ffe2e2;
++  --color-red-200: #ffc9c9;
++  --color-red-300: #ffa2a2;
++  --color-red-400: #ff6467;
++  --color-red-500: #fb2c36;
++  --color-red-600: #e7000b;
++  --color-red-700: #c10007;
++  --color-red-800: #9f0712;
++  --color-red-900: #82181a;
++  --color-red-950: #460809;
++  --color-amber-50: #fffbeb;
++  --color-amber-100: #fef3c6;
++  --color-amber-200: #fee685;
++  --color-amber-300: #ffd230;
++  --color-amber-400: #ffb900;
++  --color-amber-500: #fe9a00;
++  --color-amber-600: #e17100;
++  --color-amber-700: #bb4d00;
++  --color-amber-800: #973c00;
++  --color-amber-900: #7b3306;
++  --color-amber-950: #461901;
++  --color-yellow-50: #fefce8;
++  --color-yellow-100: #fef9c2;
++  --color-yellow-200: #fff085;
++  --color-yellow-300: #ffdf20;
++  --color-yellow-400: #fdc700;
++  --color-yellow-500: #f0b100;
++  --color-yellow-600: #d08700;
++  --color-yellow-700: #a65f00;
++  --color-yellow-800: #894b00;
++  --color-yellow-900: #733e0a;
++  --color-yellow-950: #432004;
++  --color-emerald-50: #ecfdf5;
++  --color-emerald-100: #d0fae5;
++  --color-emerald-200: #a4f4cf;
++  --color-emerald-300: #5ee9b5;
++  --color-emerald-400: #00d492;
++  --color-emerald-500: #00bc7d;
++  --color-emerald-600: #009966;
++  --color-emerald-700: #007a55;
++  --color-emerald-800: #006045;
++  --color-emerald-900: #004f3b;
++  --color-emerald-950: #002c22;
++  --color-cyan-50: #ecfeff;
++  --color-cyan-100: #cefafe;
++  --color-cyan-200: #a2f4fd;
++  --color-cyan-300: #53eafd;
++  --color-cyan-400: #00d3f2;
++  --color-cyan-500: #00b8db;
++  --color-cyan-600: #0092b8;
++  --color-cyan-700: #007595;
++  --color-cyan-800: #005f78;
++  --color-cyan-900: #104e64;
++  --color-cyan-950: #053345;
++  --color-sky-50: #f0f9ff;
++  --color-sky-100: #dff2fe;
++  --color-sky-200: #b8e6fe;
++  --color-sky-300: #74d4ff;
++  --color-sky-400: #00bcff;
++  --color-sky-500: #00a6f4;
++  --color-sky-600: #0084d1;
++  --color-sky-700: #0069a8;
++  --color-sky-800: #00598a;
++  --color-sky-900: #024a70;
++  --color-sky-950: #052f4a;
++  --color-blue-50: #eff6ff;
++  --color-blue-100: #dbeafe;
++  --color-blue-200: #bedbff;
++  --color-blue-300: #8ec5ff;
++  --color-blue-400: #51a2ff;
++  --color-blue-500: #2b7fff;
++  --color-blue-600: #155dfc;
++  --color-blue-700: #1447e6;
++  --color-blue-800: #193cb8;
++  --color-blue-900: #1c398e;
++  --color-blue-950: #162456;
++  --color-rose-50: #fff1f2;
++  --color-rose-100: #ffe4e6;
++  --color-rose-200: #ffccd3;
++  --color-rose-300: #ffa1ad;
++  --color-rose-400: #ff637e;
++  --color-rose-500: #ff2056;
++  --color-rose-600: #ec003f;
++  --color-rose-700: #c70036;
++  --color-rose-800: #a50036;
++  --color-rose-900: #8b0836;
++  --color-rose-950: #4d0218;
++  --color-slate-50: #f8fafc;
++  --color-slate-100: #f1f5f9;
++  --color-slate-200: #e2e8f0;
++  --color-slate-300: #cad5e2;
++  --color-slate-400: #90a1b9;
++  --color-slate-500: #62748e;
++  --color-slate-600: #45556c;
++  --color-slate-700: #314158;
++  --color-slate-800: #1d293d;
++  --color-slate-900: #0f172b;
++  --color-slate-950: #020618;
++}
++
+ * { box-sizing: border-box; }
+ html { scroll-behavior: smooth; }
+ body {
+diff --git a/web/src/pages/BvnModificationPage.tsx b/web/src/pages/BvnModificationPage.tsx
+index 7ce1e44..2e5a612 100644
+--- a/web/src/pages/BvnModificationPage.tsx
++++ b/web/src/pages/BvnModificationPage.tsx
+@@ -20,7 +20,7 @@ import {
+ type FieldInput = 'text' | 'date' | 'phone' | 'email' | 'bvn' | 'nin' | 'image' | 'select';
+ type Field = { key: string; label: string; required: boolean; input: FieldInput; options?: string[]; dependsOn?: { key: string; value: string } };
+ type TypeConfig = { id: string; title: string; fields: Field[] };
+-type PriceRow = { type: string; enrollmentType: 'Agency' | 'Bank'; title: string; unitPrice: number; isActive: boolean };
++type PriceRow = { type: string; enrollmentType: 'Agency' | 'Bank'; bankName: string | null; title: string; unitPrice: number; isActive: boolean };
+ type HistoryEntry = { reference: string; status: string; created_at: string; pdf_base64: string | null; modification_type: string | null };
+ type MatchResult = {
+   bvn_date_of_birth: string | null;
+@@ -30,6 +30,13 @@ type MatchResult = {
+   suggested_types: string[];
+ };
+ 
++// Every bank has its own price row on the backend (set per bank from the admin
++// bulk-pricing page), so a price is looked up by type + enrollment + bank. Keying
++// by enrollment alone made every bank share whichever bank row was written last.
++function priceKey(type: string, enrollmentType: 'Agency' | 'Bank', bankName?: string | null) {
++  return enrollmentType === 'Bank' ? `${type}:Bank:${bankName ?? ''}` : `${type}:Agency`;
++}
++
+ const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // 4MB raw file - keeps the base64'd body comfortably under the backend's 8mb JSON limit
+ 
+ function readImageAsDataUrl(file: File): Promise<string> {
+@@ -61,6 +68,7 @@ export default function BvnModificationPage() {
+ 
+   const [types, setTypes] = useState<TypeConfig[]>([]);
+   const [prices, setPrices] = useState<Record<string, number>>({});
++  const [banks, setBanks] = useState<string[]>([]);
+   const [enrollmentType, setEnrollmentType] = useState<'Agency' | 'Bank' | null>(null);
+   const [bankName, setBankName] = useState('');
+   const [selectedType, setSelectedType] = useState<string | null>(null);
+@@ -89,13 +97,16 @@ export default function BvnModificationPage() {
+       .then(([typesRes, pricesRes]) => {
+         const ordered = [...typesRes.data].sort((a, b) => TYPE_ORDER.indexOf(a.id) - TYPE_ORDER.indexOf(b.id));
+         setTypes(ordered);
+-        setPrices(Object.fromEntries(pricesRes.data.map((row) => [`${row.type}:${row.enrollmentType}`, row.unitPrice])));
++        setPrices(Object.fromEntries(pricesRes.data.map((row) => [priceKey(row.type, row.enrollmentType, row.bankName), row.unitPrice])));
++        // The bank list comes from the server, so it can never drift from the banks that actually have a price row.
++        setBanks([...new Set(pricesRes.data.filter((row) => row.enrollmentType === 'Bank' && row.bankName).map((row) => row.bankName as string))]);
+       })
+       .catch(() => setMessage('Unable to load modification types. Please refresh and try again.'));
+   }, []);
+ 
+   const selected = useMemo(() => types.find((t) => t.id === selectedType) ?? null, [types, selectedType]);
+-  const selectedPrice = selectedType && enrollmentType ? prices[`${selectedType}:${enrollmentType}`] : undefined;
++  const priceFor = (type: string) => (enrollmentType ? prices[priceKey(type, enrollmentType, bankName)] : undefined);
++  const selectedPrice = selectedType ? priceFor(selectedType) : undefined;
+ 
+   function chooseEnrollment(value: 'Agency' | 'Bank') {
+     setEnrollmentType(value);
+@@ -349,7 +360,7 @@ export default function BvnModificationPage() {
+                 <label className={FORM_LABEL_CLASSES}>Select bank or enrollment network
+                   <select className={`mt-1 ${FORM_INPUT_CLASSES}`} value={bankName} onChange={(event) => setBankName(event.target.value)}>
+                     <option value="">-- Select --</option>
+-                    {['Micro Finance Bank', 'First Bank', 'Access Bank', 'Heritage Bank', 'Enterprise Bank', 'BOA Bank', 'LAPO Bank', 'NIBSS'].map((bank) => <option key={bank} value={bank}>{bank}</option>)}
++                    {banks.map((bank) => <option key={bank} value={bank}>{bank}</option>)}
+                   </select>
+                 </label>
+                 <button disabled={!bankName} onClick={() => setStage('select')} className="mt-4 w-full rounded-xl bg-[#0b2f73] py-3 font-display font-semibold text-white disabled:opacity-50 sm:w-auto sm:px-8">Continue</button>
+@@ -370,7 +381,7 @@ export default function BvnModificationPage() {
+                 >
+                   {suggested && <span className="absolute -top-2 left-1/2 -translate-x-1/2 rounded-full bg-gold-400 px-2 py-0.5 text-[10px] font-bold text-[#4a3505]">Suggested</span>}
+                   <span className="font-body text-sm font-semibold">{type.title}</span>
+-                  <span className="mt-1 text-xs font-bold text-gold-300">{money(enrollmentType ? prices[`${type.id}:${enrollmentType}`] : undefined)}</span>
++                  <span className="mt-1 text-xs font-bold text-gold-300">{money(priceFor(type.id))}</span>
+                 </button>
+               );
+             })}
+@@ -382,7 +393,7 @@ export default function BvnModificationPage() {
+             <div className="flex flex-wrap items-center justify-between gap-3">
+               <h2 className="font-display text-xl font-bold text-[#0b2f73]">{selected.title}</h2>
+               <span className="rounded-full bg-gold-500/15 px-4 py-2 font-body text-sm font-bold text-gold-700">
+-                Service cost: {money(selectedPrice)} · {enrollmentType === 'Agency' ? 'Agency Banking' : 'Banks'}
++                Service cost: {money(selectedPrice)} · {enrollmentType === 'Agency' ? 'Agency Banking' : bankName || 'Banks'}
+               </span>
+             </div>
+ 
+-- 
+2.43.0
+
