@@ -1,4 +1,5 @@
 working_directory: /maria_backend
+build_context_directory: /maria_backend
 
 build:
   system: auto
