@@ -90,9 +90,11 @@ export function createApp() {
     }
     return helmet()(req, res, next);
   });
-  const allowedOrigins = new Set(
-    env.WEB_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
-  );
+  const allowedOrigins = new Set([
+    'https://www.mariadigital.com.ng',
+    'https://mariadigital.com.ng',
+    ...env.WEB_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+  ]);
   // The browser dashboard is served by this same Express application. Its
   // Origin header must always be accepted even when no separate web domain
   // is configured, while callers from any other domain stay allow-listed.

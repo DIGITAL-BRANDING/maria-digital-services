@@ -1,4 +1,4 @@
-import { type ReactNode } from 'react';
+import { type ReactNode, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './lib/auth';
 import { SERVICES } from './lib/services';
@@ -67,12 +67,27 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
+function AdminRedirect() {
+  const location = useLocation();
+  const backendOrigin = (import.meta.env.VITE_API_BASE_URL ?? 'https://mariadigital.hostless.app')
+    .trim()
+    .replace(/\/+$/, '');
+
+  useEffect(() => {
+    window.location.replace(`${backendOrigin}${location.pathname}${location.search}${location.hash}`);
+  }, [backendOrigin, location.pathname, location.search, location.hash]);
+
+  return <div className="p-6 text-center">Opening admin panel…</div>;
+}
+
 export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
         <KycPromptModal />
         <Routes>
+          <Route path="/admin" element={<AdminRedirect />} />
+          <Route path="/admin/*" element={<AdminRedirect />} />
           <Route path="/" element={<LandingPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage />} />
