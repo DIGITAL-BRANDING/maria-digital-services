@@ -4,6 +4,12 @@ import { z } from 'zod';
 const EnvSchema = z.object({
   NODE_ENV: z.string().default('development'),
   WEB_ALLOWED_ORIGINS: z.string().default(''),
+  // Keep the API deployment independent from the Cloudflare-hosted SPA.
+  // Set true only when deliberately serving the web build from Express.
+  SERVE_WEB_APP: z
+    .string()
+    .default('false')
+    .transform((value) => value.toLowerCase() === 'true' || value === '1'),
   PORT: z.coerce.number().default(8787),
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid PostgreSQL URL').refine(
     (value) => value.startsWith('postgresql://') || value.startsWith('postgres://'),

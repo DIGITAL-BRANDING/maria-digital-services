@@ -272,37 +272,23 @@ export function createApp() {
     }
   });
 
-  // The web app (landing page + browser dashboard, built from ../web via
-  // Vite - see railway.json/nixpacks.toml, which copy `web/dist` here at
-  // build time). Mounted LAST, after every API/admin/legal route above, so
-  // none of those can ever be shadowed by it.
-  //
-  // Two-step static serve:
-  //  1. express.static first - serves real files (JS/CSS bundles, images)
-  //     directly, with long-lived caching since Vite fingerprints filenames.
-  //  2. For anything NOT a real file (e.g. /dashboard, /buy-airtime - React
-  //     Router client-side routes that don't exist as files on disk), fall
-  //     back to index.html so the React app boots and its own router takes
-  //     over. Without this, refreshing the browser on /dashboard would 404
-  //     instead of reloading the app.
-  const webAppDir = path.join(process.cwd(), 'public', 'app');
-  const webStatic = express.static(webAppDir, { maxAge: '1y', immutable: true, index: false });
-  // Older deployments emitted /app/assets/... paths. Keep this alias so a browser
-  // holding that HTML cache still receives JavaScript/CSS rather than index.html.
-  app.use('/app', webStatic);
-  app.use(webStatic);
-  app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api') || req.path.startsWith(ADMIN_ROOT_PATH)) return next();
-    // Do not serve the HTML shell for missing JS/CSS/image files. A stale
-    // mobile browser cache would otherwise receive index.html as a stylesheet
-    // or script, producing the completely unstyled page users reported.
-    if (path.extname(req.path)) return next();
-    // Never cache the HTML shell: a stale index can reference a bundle removed by a newer deploy.
-    res.setHeader('Cache-Control', 'no-store');
-    res.sendFile(path.join(webAppDir, 'index.html'), (err) => {
-      if (err) next(err);
+  if (env.SERVE_WEB_APP) {
+    // Optional same-origin mode for deployments that intentionally package the
+    // Vite app with the API. The normal Hostless + Cloudflare setup leaves this
+    // disabled and deploys the frontend independently.
+    const webAppDir = path.join(process.cwd(), 'public', 'app');
+    const webStatic = express.static(webAppDir, { maxAge: '1y', immutable: true, index: false });
+    app.use('/app', webStatic);
+    app.use(webStatic);
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api') || req.path.startsWith(ADMIN_ROOT_PATH)) return next();
+      if (path.extname(req.path)) return next();
+      res.setHeader('Cache-Control', 'no-store');
+      res.sendFile(path.join(webAppDir, 'index.html'), (err) => {
+        if (err) next(err);
+      });
     });
-  });
+  }
 
   app.use(errorHandler);
   return app;
