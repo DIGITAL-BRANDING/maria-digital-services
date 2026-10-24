@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
 
 // Privacy Policy and Terms are already rendered server-side by the backend
 // (see major_data_link_backend/src/routes/legal.routes.ts) so there's a

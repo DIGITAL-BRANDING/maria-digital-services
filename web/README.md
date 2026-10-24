@@ -19,14 +19,24 @@ If your backend runs elsewhere, set `VITE_API_PROXY_TARGET` before starting:
 VITE_API_PROXY_TARGET=http://localhost:5000 npm run dev
 ```
 
-## Production
+## Production: Cloudflare Workers
 
-This app is built and copied into `major_data_link_backend/public/app` as
-part of the Railway build (see `../nixpacks.toml` / `../railway.json`), and
-served by the same Express server that serves the API - so in production,
-`VITE_API_BASE_URL` should stay unset (relative `/api/...` calls hit the same
-origin). Only set `VITE_API_BASE_URL` if this is ever deployed to a
-**different** origin than the backend.
+This project deploys as a static-assets Worker at its `workers.dev` domain.
+`wrangler.jsonc` publishes Vite's `dist/` assets and enables SPA fallback for
+React Router routes. From the `web` directory, use:
+
+```bash
+npm ci
+npm run deploy:worker
+```
+
+Configure the Worker build with root directory `web`, build command
+`npm run build`, and deploy command `npx wrangler deploy` (or run
+`npm run deploy:worker` as one command). Set `VITE_API_BASE_URL` as a
+build-time variable to the Hostless backend origin, without `/api` or a
+trailing slash. Also allow the Worker origin in the backend's
+`WEB_ALLOWED_ORIGINS` environment variable. Never put backend secrets in this
+frontend project.
 
 ## What's here (current scope)
 

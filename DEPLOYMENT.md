@@ -1,4 +1,4 @@
-# Deployment: Hostless API + Cloudflare Pages frontend
+# Deployment: Hostless API + Cloudflare frontend
 
 The backend and browser app deploy independently. The backend still serves the
 AdminJS panel, health check, API, webhooks, and legal pages. It no longer tries
@@ -17,7 +17,7 @@ Set these variables in the Hostless app environment:
 - `NODE_ENV=production`
 - `SERVE_WEB_APP=false`
 - `DATABASE_URL` with the production PostgreSQL connection string
-- `WEB_ALLOWED_ORIGINS` with the exact Cloudflare Pages site origin, without a
+- `WEB_ALLOWED_ORIGINS` with the exact Cloudflare site origin, without a
   trailing slash (add other approved origins as comma-separated values)
 - `RUN_MIGRATIONS_ON_START=true` for the first deployment or when applying
   pending Prisma migrations; Hostless starts the migration before the API
@@ -31,32 +31,35 @@ migrations have been applied, `RUN_MIGRATIONS_ON_START` can be set to `false`
 to avoid running the migration command on every restart. The AdminJS panel is
 available at `/admin` on the Hostless backend domain.
 
-## Cloudflare Pages frontend
+## Cloudflare Workers frontend (`workers.dev`)
 
-Create a Pages project from the same repository with:
+The frontend can run as a static-assets Worker. The checked-in
+`web/wrangler.jsonc` points Workers to Vite's `dist/` directory and enables
+SPA fallback for React Router routes. Configure the Worker build with:
 
 - Root directory: `web`
 - Build command: `npm run build`
-- Build output directory: `dist`
+- Deploy command: `npx wrangler deploy`
 - Build environment variable `VITE_API_BASE_URL`: the Hostless backend origin,
   such as `https://your-api.hostless.app`, without `/api` or a trailing slash
 
-Add the Pages production origin (for example,
-`https://your-site.pages.dev`) to the backend's `WEB_ALLOWED_ORIGINS`. If you
-use a custom frontend domain, allow that exact origin too. Add preview origins
-only when they should be allowed to call the production API. Cloudflare Pages
-automatically serves this React single-page app's root document for client
-routes; do not add a `404.html` file that would disable its SPA fallback.
+Add the Worker production origin (for example,
+`https://maria-digital.<account>.workers.dev`) to the backend's
+`WEB_ALLOWED_ORIGINS`. If you use a custom frontend domain, allow that exact
+origin too. Add preview origins only when they should be allowed to call the
+production API.
 
-The checked-in `web/public/_headers` sets conservative caching for the HTML
-shell and long-lived caching for Vite's fingerprinted assets.
+If deploying as Cloudflare Pages instead, use root directory `web`, build
+command `npm run build`, and output directory `dist`; Pages supplies SPA
+fallback automatically while the project has no top-level `404.html`.
 
 ## First deployment order
 
 1. Set Hostless environment variables and deploy the backend.
 2. Confirm `https://<backend-domain>/health` returns `{"status":true,...}`.
-3. Set Cloudflare's `VITE_API_BASE_URL` to that backend origin and deploy Pages.
-4. Add the final Pages origin to `WEB_ALLOWED_ORIGINS` and redeploy/restart the
+3. Set Cloudflare's `VITE_API_BASE_URL` to that backend origin and deploy the
+   Worker (or Pages site).
+4. Add the final Cloudflare origin to `WEB_ALLOWED_ORIGINS` and redeploy/restart the
    backend if you changed it.
 5. Update payment-provider callback URLs and partner webhook URLs to the
    Hostless backend domain. The API webhook paths are unchanged.
