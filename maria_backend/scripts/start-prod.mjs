@@ -58,4 +58,8 @@ if (runMigrationsOnStart) {
 }
 
 console.log('[start] Starting API server');
+// Hostless mounts the application filesystem read-only. AdminJS generates its
+// custom frontend entry and bundle during initialize(), so keep those files in
+// the writable temporary directory instead of the app's working directory.
+process.env.ADMIN_JS_TMP_DIR ??= '/tmp/adminjs';
 await import('../dist/server.js');
