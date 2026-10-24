@@ -7,7 +7,7 @@ build:
   min_memory: 512
   max_memory: 2048
 
-start_command: npm run start:prod
+start_command: node scripts/start-prod.mjs
 
 health_check:
   type: http
