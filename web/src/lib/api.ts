@@ -1,8 +1,9 @@
 // Thin fetch wrapper for the MARIA Digital Solutions backend API.
 // In dev, requests to /api/* are proxied to VITE_API_PROXY_TARGET (see vite.config.ts).
-// In production, set VITE_API_BASE_URL to the deployed backend origin
-// (leave empty if this app is served from the same origin as the API).
-const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '').trim().replace(/\/+$/, '');
+// In production, use the Railway backend on the primary domain by default.
+// VITE_API_BASE_URL can override this for previews or another backend host.
+const DEFAULT_API_BASE = import.meta.env.PROD ? 'https://mariadigital.com.ng' : '';
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE).trim().replace(/\/+$/, '');
 
 const TOKEN_KEY = 'mdl_access_token';
 const REFRESH_KEY = 'mdl_refresh_token';

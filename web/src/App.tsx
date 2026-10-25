@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './lib/auth';
+import { API_BASE } from './lib/api';
 import { SERVICES } from './lib/services';
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
@@ -69,9 +70,7 @@ function ProtectedRoute({ children }: { children: ReactNode }) {
 
 function AdminRedirect() {
   const location = useLocation();
-  const backendOrigin = (import.meta.env.VITE_API_BASE_URL ?? 'https://mariadigital.hostless.app')
-    .trim()
-    .replace(/\/+$/, '');
+  const backendOrigin = API_BASE || window.location.origin;
 
   useEffect(() => {
     window.location.replace(`${backendOrigin}${location.pathname}${location.search}${location.hash}`);
