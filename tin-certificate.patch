@@ -1,0 +1,1116 @@
+From 40d851997c826379c7162c0cdbeab88bab130cdc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 12:58:02 +0100
+Subject: [PATCH] Activate TIN Certificate service with manual admin processing
+
+Individual (NIN) and Corporate (RC) requests debit the wallet, stay PENDING,
+and are fulfilled by an admin from a manage page (progress notes, certificate
+PDF, optional TIN), mirroring CAC. Reject/refund via existing reverse action.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015YoLAo63RFk6PcWruuMD9h
+---
+ .../migration.sql                             |   1 +
+ maria_backend/prisma/schema.prisma            |   5 +
+ maria_backend/src/admin/bulk-pricing.ts       |   3 +
+ .../admin/components/redirect-to-manage.tsx   |   1 +
+ maria_backend/src/admin/customer-activity.ts  |   2 +-
+ maria_backend/src/admin/pending-summary.ts    |   3 +-
+ .../admin/resources/transaction.resource.ts   |  16 +-
+ maria_backend/src/admin/setup.ts              |   2 +
+ maria_backend/src/admin/tin-certificate.ts    | 223 ++++++++++++++++
+ .../src/routes/verification.routes.ts         |  53 +++-
+ .../__tests__/tin-certificate.service.test.ts | 114 ++++++++
+ .../src/services/tin-certificate.service.ts   | 245 ++++++++++++++++++
+ maria_backend/src/types/prisma-enums.ts       |   1 +
+ web/src/App.tsx                               |   2 +
+ web/src/lib/services.ts                       |   2 +-
+ .../pages/verification/TinCertificatePage.tsx | 215 +++++++++++++++
+ 16 files changed, 883 insertions(+), 5 deletions(-)
+ create mode 100644 maria_backend/prisma/migrations/20261025230000_add_tin_certificate/migration.sql
+ create mode 100644 maria_backend/src/admin/tin-certificate.ts
+ create mode 100644 maria_backend/src/services/__tests__/tin-certificate.service.test.ts
+ create mode 100644 maria_backend/src/services/tin-certificate.service.ts
+ create mode 100644 web/src/pages/verification/TinCertificatePage.tsx
+
+diff --git a/maria_backend/prisma/migrations/20261025230000_add_tin_certificate/migration.sql b/maria_backend/prisma/migrations/20261025230000_add_tin_certificate/migration.sql
+new file mode 100644
+index 0000000..bee6e65
+--- /dev/null
++++ b/maria_backend/prisma/migrations/20261025230000_add_tin_certificate/migration.sql
+@@ -0,0 +1 @@
++ALTER TYPE "TransactionType" ADD VALUE IF NOT EXISTS 'TIN_CERTIFICATE';
+diff --git a/maria_backend/prisma/schema.prisma b/maria_backend/prisma/schema.prisma
+index d8b10d0..af1ac8c 100644
+--- a/maria_backend/prisma/schema.prisma
++++ b/maria_backend/prisma/schema.prisma
+@@ -93,6 +93,11 @@ enum TransactionType {
+   /// ticket by hand and marks it complete, or reverses it to refund. See
+   /// bvn-crm.service.ts.
+   BVN_CRM
++  /// A submitted TIN Certificate request (Individual by NIN, or Corporate by
++  /// RC number). No provider API - same manual pattern as CAC: debit now, an
++  /// admin obtains the TIN/certificate by hand and marks it complete, or
++  /// reverses it to refund. See tin-certificate.service.ts.
++  TIN_CERTIFICATE
+   /// The credit-back entry refundWallet() creates - distinct from the
+   /// original debit's own type (e.g. a reversed DATA_PURCHASE gets a REFUND
+   /// entry, not a second DATA_PURCHASE). See relatedTransactionId above.
+diff --git a/maria_backend/src/admin/bulk-pricing.ts b/maria_backend/src/admin/bulk-pricing.ts
+index 340f0bb..9306249 100644
+--- a/maria_backend/src/admin/bulk-pricing.ts
++++ b/maria_backend/src/admin/bulk-pricing.ts
+@@ -6,6 +6,7 @@ import { prisma } from '../lib/prisma.js';
+ import { dataPlanPricingService } from '../services/data-plan-pricing.service.js';
+ import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
+ import { applyServiceMarkup } from '../services/result-pin.service.js';
++import { listTinPrices } from '../services/tin-certificate.service.js';
+ import { BVN_MODIFICATION_BANKS, BVN_MODIFICATION_CONFIG, listBvnModificationPrices } from '../services/bvn-modification.service.js';
+ 
+ // @adminjs/express stores the logged-in admin as `req.session.adminUser`
+@@ -64,6 +65,8 @@ export function registerBulkPricingRoutes(router: Router) {
+     // Ensure every BVN Modification option has a distinct editable price row,
+     // including each bank (banks can have different selling prices).
+     await listBvnModificationPrices();
++    // Same for TIN Certificate, so its Individual/Corporate prices are editable from first load.
++    await listTinPrices();
+     const [settings, networks, servicePrices] = await Promise.all([
+       getPricingSettings(),
+       prisma.dataPlanPricing.findMany({
+diff --git a/maria_backend/src/admin/components/redirect-to-manage.tsx b/maria_backend/src/admin/components/redirect-to-manage.tsx
+index c94e6d1..049facd 100644
+--- a/maria_backend/src/admin/components/redirect-to-manage.tsx
++++ b/maria_backend/src/admin/components/redirect-to-manage.tsx
+@@ -29,6 +29,7 @@ type RedirectToManageProps = {
+ 
+ const TARGET_PATH_BY_TYPE: Record<string, (id: string) => string> = {
+   CAC_SERVICE_REQUEST: (id) => `/admin/cac/${id}/manage`,
++  TIN_CERTIFICATE: (id) => `/admin/tin/${id}/manage`,
+   NIN_MODIFICATION: (id) => `/admin/nin-modification/${id}/pdf`,
+   BVN_LICENSE_ONBOARDING: (id) => `/admin/bvn-license/${id}/manage`,
+   BVN_MODIFICATION: (id) => `/admin/bvn-modification/${id}/pdf`,
+diff --git a/maria_backend/src/admin/customer-activity.ts b/maria_backend/src/admin/customer-activity.ts
+index 4eaa34c..0830ec9 100644
+--- a/maria_backend/src/admin/customer-activity.ts
++++ b/maria_backend/src/admin/customer-activity.ts
+@@ -15,7 +15,7 @@ const usageTypes = [
+   TransactionType.NIN_MODIFICATION, TransactionType.BVN_LICENSE_ONBOARDING,
+   TransactionType.CAC_SERVICE_REQUEST, TransactionType.BVN_MODIFICATION,
+   TransactionType.BIRTH_ATTESTATION, TransactionType.NEWSPAPER_PUBLICATION,
+-  TransactionType.BVN_CRM
++  TransactionType.BVN_CRM, TransactionType.TIN_CERTIFICATE
+ ] as const;
+ 
+ const money = (kobo: bigint) => `₦${(Number(kobo) / 100).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+diff --git a/maria_backend/src/admin/pending-summary.ts b/maria_backend/src/admin/pending-summary.ts
+index 3728eac..737a859 100644
+--- a/maria_backend/src/admin/pending-summary.ts
++++ b/maria_backend/src/admin/pending-summary.ts
+@@ -32,7 +32,8 @@ const PENDING_SUMMARY_TYPES: { type: TransactionType; label: string }[] = [
+   { type: TransactionType.BVN_CRM, label: 'BVN CRM Follow-up' },
+   { type: TransactionType.NIN_MODIFICATION, label: 'NIN Modification' },
+   { type: TransactionType.BIRTH_ATTESTATION, label: 'Birth Attestation' },
+-  { type: TransactionType.NEWSPAPER_PUBLICATION, label: 'Newspaper Publication' }
++  { type: TransactionType.NEWSPAPER_PUBLICATION, label: 'Newspaper Publication' },
++  { type: TransactionType.TIN_CERTIFICATE, label: 'TIN Certificate' }
+ ];
+ 
+ export function registerPendingSummaryRoutes(router: Router) {
+diff --git a/maria_backend/src/admin/resources/transaction.resource.ts b/maria_backend/src/admin/resources/transaction.resource.ts
+index d32653c..809df59 100644
+--- a/maria_backend/src/admin/resources/transaction.resource.ts
++++ b/maria_backend/src/admin/resources/transaction.resource.ts
+@@ -68,7 +68,7 @@ export const transactionResource: ResourceWithOptions = {
+           // other transaction type, where PENDING means "still in flight,
+           // don't touch it", so this is the one type reverse() also allows
+           // from PENDING.
+-          if (status === 'PENDING') return ['NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST', 'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM'].includes(record?.params?.type as string);
++          if (status === 'PENDING') return ['NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST', 'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM', 'TIN_CERTIFICATE'].includes(record?.params?.type as string);
+           return status === 'SUCCESS' || status === 'FAILED';
+         },
+         handler: async (request, response, context) => {
+@@ -425,6 +425,20 @@ export const transactionResource: ResourceWithOptions = {
+           const { record, currentAdmin } = context; if (!record) throw new Error('Missing record');
+           return { record: record.toJSON(currentAdmin) };
+         }
++      },
++      // Same shape as manageCacRequest, for TIN_CERTIFICATE rows - opens
++      // admin/tin-certificate.ts's manage page (details, progress note,
++      // attach the TIN certificate to complete).
++      manageTinRequest: {
++        actionType: 'record', icon: 'Edit', component: Components.RedirectToManage,
++        isAccessible: ({ currentAdmin, record }) => {
++          const admin = currentAdmin as unknown as AdminSessionUser | undefined;
++          return !!admin && admin.role !== 'SUPPORT' && record?.params?.type === 'TIN_CERTIFICATE';
++        },
++        handler: async (_request, _response, context) => {
++          const { record, currentAdmin } = context; if (!record) throw new Error('Missing record');
++          return { record: record.toJSON(currentAdmin) };
++        }
+       }
+     }
+   }
+diff --git a/maria_backend/src/admin/setup.ts b/maria_backend/src/admin/setup.ts
+index 7d18b29..e43bce4 100644
+--- a/maria_backend/src/admin/setup.ts
++++ b/maria_backend/src/admin/setup.ts
+@@ -19,6 +19,7 @@ import { registerNewspaperPublicationRoutes } from './newspaper-publication.js';
+ import { registerBvnCrmRoutes } from './bvn-crm.js';
+ import { registerBvnLicenseRoutes } from './bvn-license-onboarding.js';
+ import { registerCacRoutes } from './cac.js';
++import { registerTinCertificateRoutes } from './tin-certificate.js';
+ import { componentLoader, Components } from './component-loader.js';
+ import { userResource } from './resources/user.resource.js';
+ import { transactionResource } from './resources/transaction.resource.js';
+@@ -171,6 +172,7 @@ export async function buildAdminRouter() {
+   registerBvnCrmRoutes(router);
+   registerBvnLicenseRoutes(router);
+   registerCacRoutes(router);
++  registerTinCertificateRoutes(router);
+   registerUserDeliveryRoutes(router);
+   registerSupportInboxRoutes(router);
+   registerPendingSummaryRoutes(router);
+diff --git a/maria_backend/src/admin/tin-certificate.ts b/maria_backend/src/admin/tin-certificate.ts
+new file mode 100644
+index 0000000..cc51395
+--- /dev/null
++++ b/maria_backend/src/admin/tin-certificate.ts
+@@ -0,0 +1,223 @@
++import type { Request, Router } from 'express';
++import { TransactionType } from '@prisma/client';
++import { prisma } from '../lib/prisma.js';
++import { completeTinRequest, decryptTinPII, updateTinProgressNotes } from '../services/tin-certificate.service.js';
++import { logAdminAction } from './audit.js';
++import type { AdminSessionUser } from './auth.js';
++
++declare module 'express-session' {
++  interface SessionData {
++    adminUser?: AdminSessionUser;
++  }
++}
++
++function escapeHtml(value: string) {
++  return value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
++}
++
++function paramId(req: Request) {
++  return Array.isArray(req.params.transactionId) ? req.params.transactionId[0] : req.params.transactionId;
++}
++
++/**
++ * Custom admin page for handling a TIN Certificate request while it's PENDING
++ * - reached from the Transaction resource's "manageTinRequest" action (see
++ * components/redirect-to-manage.tsx). Same shape as admin/cac.ts: the admin
++ * sees everything the customer submitted, can leave a customer-visible
++ * progress note, and finally attaches the TIN certificate PDF (and the issued
++ * TIN, optionally), which marks the request SUCCESS. The file is read
++ * client-side with FileReader and posted as base64 in a normal JSON body, so
++ * no file-upload middleware is needed. Rejecting (and refunding) is the
++ * existing generic "reverse" action on the Transaction.
++ */
++export function registerTinCertificateRoutes(router: Router) {
++  router.get('/tin/:transactionId/certificate-pdf', async (req: Request, res) => {
++    const admin = req.session?.adminUser;
++    if (!admin) return res.redirect('/admin/login');
++    if (admin.role === 'SUPPORT') return res.status(403).send('Support admins cannot download TIN certificates.');
++    const tx = await prisma.transaction.findUnique({ where: { id: paramId(req) } });
++    if (!tx || tx.type !== TransactionType.TIN_CERTIFICATE) return res.status(404).send('TIN request not found.');
++    const pii = decryptTinPII(tx);
++    if (!pii?.certificate_pdf_base64) return res.status(404).send('No certificate has been attached to this request yet.');
++    await logAdminAction({ adminId: admin.id, action: 'DOWNLOAD_TIN_CERTIFICATE_PDF', targetType: 'Transaction', targetId: tx.id, metadata: { reference: tx.reference } });
++    res
++      .type('application/pdf')
++      .setHeader('Content-Disposition', `attachment; filename="${tx.reference}-tin-certificate.pdf"`)
++      .send(Buffer.from(pii.certificate_pdf_base64.replace(/^data:[^;]+;base64,/, ''), 'base64'));
++  });
++
++  router.get('/tin/:transactionId/manage', async (req: Request, res) => {
++    const admin = req.session?.adminUser;
++    if (!admin) return res.redirect('/admin/login');
++    if (admin.role === 'SUPPORT') return res.status(403).type('html').send('<p>Support admins cannot manage TIN requests.</p>');
++
++    const tx = await prisma.transaction.findUnique({ where: { id: paramId(req) } });
++    if (!tx || tx.type !== TransactionType.TIN_CERTIFICATE) {
++      return res.status(404).type('html').send('<p>TIN request not found.</p>');
++    }
++
++    await logAdminAction({ adminId: admin.id, action: 'VIEW_TRANSACTION_PII', targetType: 'Transaction', targetId: tx.id, metadata: { reference: tx.reference, via: 'tin_manage' } });
++
++    const metadata = tx.metadata as Record<string, unknown> | null;
++    const pii = decryptTinPII(tx);
++    const tinType = String(metadata?.tin_type ?? '');
++    const progressNotes = typeof metadata?.progress_notes === 'string' ? metadata.progress_notes : '';
++    const isPending = tx.status === 'PENDING';
++    const hasCertificate = typeof pii?.certificate_pdf_base64 === 'string' && pii.certificate_pdf_base64.length > 0;
++
++    const detailRows: [string, string | undefined][] =
++      tinType === 'corporate'
++        ? [
++            ['RC number', pii?.rc_number],
++            ['Company name', pii?.company_name],
++            ['Organization type', pii?.organization_type]
++          ]
++        : [
++            ['NIN', pii?.nin],
++            ['First name', pii?.first_name],
++            ['Surname', pii?.surname],
++            ['Date of birth', pii?.date_of_birth]
++          ];
++
++    res.type('html').send(`<!doctype html>
++<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Manage TIN request ${escapeHtml(tx.reference)}</title>
++<style>
++  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }
++  h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 32px; }
++  .field { margin-top: 8px; }
++  textarea, input[type=file], input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; font: inherit; }
++  textarea { min-height: 90px; }
++  button, .btn { margin-top: 12px; padding: 10px 18px; font: inherit; cursor: pointer; border: 0; border-radius: 6px; background: #6b4f0b; color: #fff; display: inline-block; text-decoration: none; }
++  button:disabled { opacity: .5; cursor: not-allowed; }
++  .meta { color: #666; font-size: 13px; }
++  .status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
++  .status.PENDING { background: #fff3cd; color: #7a5b00; }
++  .status.SUCCESS { background: #d4edda; color: #155724; }
++  .status.REVERSED, .status.FAILED { background: #f8d7da; color: #721c24; }
++  #msg { margin-top: 12px; font-size: 14px; }
++  table.details { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
++  table.details td { padding: 7px 4px; border-bottom: 1px solid #eee; vertical-align: top; }
++  table.details td:first-child { color: #666; width: 42%; }
++</style></head>
++<body>
++  <p><a href="/admin/resources/Transaction/records/${tx.id}/show">&larr; Back to transaction</a></p>
++  <h1>TIN request — ${escapeHtml(tx.reference)}</h1>
++  <p class="meta">Status: <span class="status ${tx.status}">${tx.status}</span> · Type: ${escapeHtml(tinType === 'corporate' ? 'Corporate (RC)' : 'Individual (NIN)')}</p>
++
++  <h2>Details to use when obtaining the TIN</h2>
++  <table class="details">
++    ${detailRows.map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(value ?? '—')}</td></tr>`).join('')}
++  </table>
++
++  ${hasCertificate ? `<p class="meta" style="margin-top:16px">A TIN certificate is already attached${pii?.tin_number ? ` (TIN ${escapeHtml(pii.tin_number)})` : ''}. <a href="/admin/tin/${tx.id}/certificate-pdf">Download it</a>.</p>` : ''}
++
++  <h2>Progress note</h2>
++  <p class="meta">Visible to the customer on their TIN request table. Save this any time while the request is pending.</p>
++  <div class="field"><textarea id="notes" placeholder="e.g. Submitted to FIRS, awaiting TIN issuance">${escapeHtml(progressNotes)}</textarea></div>
++  <button id="saveNotes" ${isPending ? '' : 'disabled'}>Save progress note</button>
++
++  <h2>Complete request</h2>
++  <p class="meta">Upload the TIN certificate once it has been issued. This marks the request SUCCESS and lets the customer download it immediately. To reject and refund instead, use the "Reverse" action on the transaction.</p>
++  <div class="field"><label class="meta">Issued TIN (optional, shown to the customer)</label><input type="text" id="tinNumber" maxlength="40" placeholder="e.g. 12345678-0001" ${isPending ? '' : 'disabled'} /></div>
++  <div class="field"><input type="file" id="certFile" accept="application/pdf" ${isPending ? '' : 'disabled'} /></div>
++  <button id="complete" ${isPending ? '' : 'disabled'}>Mark complete &amp; attach certificate</button>
++
++  <p id="msg"></p>
++
++<script>
++  const txId = ${JSON.stringify(tx.id)};
++  const msg = document.getElementById('msg');
++
++  document.getElementById('saveNotes').addEventListener('click', async () => {
++    msg.textContent = 'Saving…';
++    const res = await fetch('/admin/tin/' + txId + '/manage', {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ action: 'notes', progress_notes: document.getElementById('notes').value })
++    });
++    const data = await res.json().catch(() => ({}));
++    msg.textContent = res.ok ? 'Saved.' : (data.error || data.message || 'Failed to save.');
++  });
++
++  document.getElementById('complete').addEventListener('click', async () => {
++    const input = document.getElementById('certFile');
++    const file = input.files && input.files[0];
++    if (!file) { msg.textContent = 'Choose a PDF file first.'; return; }
++    if (file.type !== 'application/pdf') { msg.textContent = 'Please choose a PDF file.'; return; }
++    // Base64 adds ~33%, and the server accepts bodies up to 20mb (see app.ts),
++    // so 14mb raw is the largest file that still fits after conversion.
++    const MAX_RAW_BYTES = 14 * 1024 * 1024;
++    if (file.size > MAX_RAW_BYTES) {
++      msg.textContent = 'That PDF is too large (' + (file.size / (1024 * 1024)).toFixed(1) + 'MB). Please compress it to under 14MB and try again.';
++      return;
++    }
++    msg.textContent = 'Uploading…';
++    const reader = new FileReader();
++    reader.onload = async () => {
++      const base64 = reader.result.split(',')[1];
++      const res = await fetch('/admin/tin/' + txId + '/manage', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ action: 'complete', certificate_pdf_base64: base64, tin_number: document.getElementById('tinNumber').value })
++      });
++      const data = await res.json().catch(() => ({}));
++      if (res.ok) {
++        msg.textContent = 'Marked complete. Reloading…';
++        setTimeout(() => window.location.reload(), 800);
++      } else if (res.status === 413) {
++        msg.textContent = 'That PDF is too large for the server to accept. Please compress it and try again.';
++      } else {
++        msg.textContent = data.error || data.message || ('Failed to complete (HTTP ' + res.status + ').');
++      }
++    };
++    reader.readAsDataURL(file);
++  });
++</script>
++</body></html>`);
++  });
++
++  router.post('/tin/:transactionId/manage', async (req: Request, res) => {
++    const admin = req.session?.adminUser;
++    if (!admin) return res.status(401).json({ error: 'Not signed in' });
++    if (admin.role === 'SUPPORT') return res.status(403).json({ error: 'Support admins cannot manage TIN requests.' });
++
++    const tx = await prisma.transaction.findUnique({ where: { id: paramId(req) } });
++    if (!tx || tx.type !== TransactionType.TIN_CERTIFICATE) {
++      return res.status(404).json({ error: 'TIN request not found' });
++    }
++
++    // AdminJS's express-formidable parser exposes normal form/JSON payloads
++    // through `fields` and may leave `req.body` undefined.
++    const body = (req.body ?? (req as Request & { fields?: unknown }).fields ?? {}) as {
++      action?: string;
++      progress_notes?: string;
++      certificate_pdf_base64?: string;
++      tin_number?: string;
++    };
++
++    try {
++      if (body.action === 'notes') {
++        await updateTinProgressNotes({ transactionId: tx.id, notes: String(body.progress_notes ?? '').slice(0, 2000) });
++        await logAdminAction({ adminId: admin.id, action: 'UPDATE_TIN_PROGRESS', targetType: 'Transaction', targetId: tx.id, metadata: { reference: tx.reference } });
++        return res.json({ ok: true });
++      }
++
++      if (body.action === 'complete') {
++        if (!body.certificate_pdf_base64 || typeof body.certificate_pdf_base64 !== 'string') {
++          return res.status(400).json({ error: 'A certificate PDF is required.' });
++        }
++        await completeTinRequest({
++          transactionId: tx.id,
++          certificatePdfBase64: body.certificate_pdf_base64,
++          tinNumber: typeof body.tin_number === 'string' ? body.tin_number.slice(0, 40) : undefined
++        });
++        await logAdminAction({ adminId: admin.id, action: 'COMPLETE_TIN_REQUEST', targetType: 'Transaction', targetId: tx.id, metadata: { reference: tx.reference } });
++        return res.json({ ok: true });
++      }
++
++      return res.status(400).json({ error: 'Unknown action' });
++    } catch (error) {
++      return res.status(422).json({ error: error instanceof Error ? error.message : 'Request failed' });
++    }
++  });
++}
+diff --git a/maria_backend/src/routes/verification.routes.ts b/maria_backend/src/routes/verification.routes.ts
+index a6284aa..bb7dfd4 100644
+--- a/maria_backend/src/routes/verification.routes.ts
++++ b/maria_backend/src/routes/verification.routes.ts
+@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
+ import { GEO_POLITICAL_ZONES, submitBvnLicense, type BvnLicenseInput } from '../services/bvn-license-onboarding.service.js';
+ import { CAC_TYPES, listCacHistory, listCacPrices, submitCacRequest, type CacType, type CacApplicantDetails } from '../services/cac.service.js';
+ import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
++import { TIN_ORGANIZATION_TYPES, listTinHistory, listTinPrices, submitTinRequest, type TinDetails } from '../services/tin-certificate.service.js';
+ import { prisma } from '../lib/prisma.js';
+ import {
+   checkBvnRetrievalStatus,
+@@ -309,7 +310,7 @@ verificationRoutes.get('/service-history', async (req, res) => {
+   const serviceTypes = new Set([
+     'NIN_VERIFICATION', 'BVN_VERIFICATION', 'IDENTITY_SERVICE_REQUEST',
+     'NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST',
+-    'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM'
++    'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM', 'TIN_CERTIFICATE'
+   ]);
+   const data = transactions.filter((tx) => serviceTypes.has(tx.type)).map((tx) => {
+     const metadata = tx.metadata as Record<string, unknown> | null;
+@@ -565,3 +566,53 @@ verificationRoutes.get('/cac/history', async (req, res) => {
+   const data = await listCacHistory(req.user!.id);
+   res.json({ status: true, data });
+ });
++
++// ── TIN Certificate (manual - no provider API) ────────────────────
++
++const isRealPastDate = (value: string) => {
++  const parsed = new Date(`${value}T00:00:00Z`);
++  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().startsWith(value) && parsed.getTime() < Date.now();
++};
++
++const tinRequestSchema = z.discriminatedUnion('tin_type', [
++  z.object({
++    tin_type: z.literal('individual'),
++    nin: z.string().trim().regex(/^\d{11}$/, 'NIN must be 11 digits'),
++    first_name: z.string().trim().min(1).max(100),
++    surname: z.string().trim().min(1).max(100),
++    date_of_birth: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a valid date of birth').refine(isRealPastDate, 'Use a valid date of birth'),
++    ...pinField
++  }),
++  z.object({
++    tin_type: z.literal('corporate'),
++    rc_number: z.string().trim().regex(/^[A-Za-z0-9-]{3,20}$/, 'Enter a valid RC number'),
++    company_name: z.string().trim().min(2).max(200),
++    organization_type: z.enum(TIN_ORGANIZATION_TYPES),
++    ...pinField
++  })
++]);
++
++verificationRoutes.get('/tin/prices', async (_req, res) => {
++  const prices = await listTinPrices();
++  res.json({ status: true, data: prices });
++});
++
++verificationRoutes.post('/tin', async (req, res) => {
++  const body = tinRequestSchema.parse(req.body);
++  await requirePinConfirmation(req.user!.id, body.pin);
++  const { pin: _pin, tin_type, ...details } = body;
++  const result = await submitTinRequest({
++    userId: req.user!.id,
++    type: tin_type,
++    // The discriminated schema above guarantees the fields for the chosen type are present.
++    details: details as unknown as TinDetails,
++    idempotencyKey: idempotencyKeyFrom(req)
++  });
++  res.json({ status: true, data: { reference: result.reference, balance_after: result.balanceAfter } });
++});
++
++verificationRoutes.get('/tin/history', async (req, res) => {
++  res.set('Cache-Control', 'no-store');
++  const data = await listTinHistory(req.user!.id);
++  res.json({ status: true, data });
++});
+diff --git a/maria_backend/src/services/__tests__/tin-certificate.service.test.ts b/maria_backend/src/services/__tests__/tin-certificate.service.test.ts
+new file mode 100644
+index 0000000..02c2445
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/tin-certificate.service.test.ts
+@@ -0,0 +1,114 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest';
++
++/** TIN Certificate: manual-processing flow (pricing, submit, history, notes, complete). */
++
++vi.mock('@prisma/client', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('@prisma/client')>();
++  const echoEnum = new Proxy({}, { get: (_target, prop) => prop });
++  class PrismaClientKnownRequestError extends Error {
++    code: string;
++    constructor(message: string, opts: { code: string }) {
++      super(message);
++      this.code = opts.code;
++    }
++  }
++  return {
++    ...actual,
++    TransactionStatus: echoEnum,
++    TransactionType: echoEnum,
++    Prisma: { ...((actual as Record<string, unknown>).Prisma as Record<string, unknown>), PrismaClientKnownRequestError }
++  };
++});
++
++vi.mock('../../lib/prisma.js', async () => {
++  const { createFakePrisma } = await import('../../test-utils/fake-prisma.js');
++  const fake = createFakePrisma();
++  return { prisma: fake.api, __resetFakePrisma: () => fake.reset() };
++});
++
++vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedValue(undefined) }));
++
++const { prisma, __resetFakePrisma } = (await import('../../lib/prisma.js')) as unknown as {
++  prisma: Awaited<ReturnType<typeof import('../../test-utils/fake-prisma.js').createFakePrisma>>['api'];
++  __resetFakePrisma: () => void;
++};
++const { getTinPrice, listTinPrices, submitTinRequest, listTinHistory, updateTinProgressNotes, completeTinRequest, decryptTinPII } =
++  await import('../tin-certificate.service.js');
++
++const INDIVIDUAL = { nin: '62021151655', first_name: 'Sunusi', surname: 'Usama', date_of_birth: '1994-05-01' };
++const CORPORATE = { rc_number: 'RC1234567', company_name: 'Amana Ltd', organization_type: 'Company' as const };
++
++let n = 0;
++async function seedUser(balanceNaira: number) {
++  n += 1;
++  const id = `user-${n}`;
++  await prisma.user.create({
++    data: { id, walletBalanceKobo: BigInt(Math.round(balanceNaira * 100)), fullName: `T ${n}`, email: `t${n}@example.test`, phone: `+23480000${String(n).padStart(4, '0')}`, referralCode: `REF${n}` }
++  });
++  return id;
++}
++async function balanceOf(id: string) {
++  return Number((await prisma.user.findUniqueOrThrow({ where: { id } })).walletBalanceKobo) / 100;
++}
++
++beforeEach(() => __resetFakePrisma());
++
++describe('TIN pricing', () => {
++  it('defaults to 400 / 500', async () => {
++    expect((await getTinPrice('individual')).unitPrice).toBe(400);
++    expect((await getTinPrice('corporate')).unitPrice).toBe(500);
++  });
++  it('honours admin override and rejects when inactive', async () => {
++    await getTinPrice('individual');
++    await prisma.servicePricing.update({ where: { service: 'TIN_INDIVIDUAL' }, data: { sellingPriceKobo: 650_00n } });
++    expect((await getTinPrice('individual')).unitPrice).toBe(650);
++    await prisma.servicePricing.update({ where: { service: 'TIN_INDIVIDUAL' }, data: { isActive: false } });
++    await expect(getTinPrice('individual')).rejects.toThrow(/unavailable/i);
++    expect((await listTinPrices()).map((p) => p.type).sort()).toEqual(['corporate', 'individual']);
++  });
++});
++
++describe('TIN request lifecycle', () => {
++  it('debits, stays PENDING, seals PII and exposes only a masked identifier', async () => {
++    const userId = await seedUser(1000);
++    const r = await submitTinRequest({ userId, type: 'individual', details: INDIVIDUAL });
++    expect(await balanceOf(userId)).toBe(600);
++    const tx = await prisma.transaction.findUnique({ where: { reference: r.reference } });
++    expect(tx?.status).toBe('PENDING');
++    expect(JSON.stringify(tx?.metadata)).not.toContain('62021151655');
++    expect(decryptTinPII(tx!)?.nin).toBe('62021151655');
++    const [row] = await listTinHistory(userId);
++    expect(row.identifier).toBe('NIN ••••1655');
++    expect(row.subject).toBe('Sunusi Usama');
++    expect(row.status).toBe('pending');
++  });
++
++  it('corporate uses 500 and RC mask', async () => {
++    const userId = await seedUser(1000);
++    await submitTinRequest({ userId, type: 'corporate', details: CORPORATE });
++    expect(await balanceOf(userId)).toBe(500);
++    expect((await listTinHistory(userId))[0].identifier).toBe('RC ••••4567');
++  });
++
++  it('rejects when balance is insufficient', async () => {
++    const userId = await seedUser(100);
++    await expect(submitTinRequest({ userId, type: 'individual', details: INDIVIDUAL })).rejects.toThrow();
++    expect(await balanceOf(userId)).toBe(100);
++  });
++
++  it('saves notes, completes with certificate and TIN, and refuses a second completion', async () => {
++    const userId = await seedUser(1000);
++    const r = await submitTinRequest({ userId, type: 'individual', details: INDIVIDUAL });
++    const tx = await prisma.transaction.findUniqueOrThrow({ where: { reference: r.reference } });
++    await updateTinProgressNotes({ transactionId: tx.id, notes: 'Submitted to FIRS' });
++    expect((await listTinHistory(userId))[0].progress_notes).toBe('Submitted to FIRS');
++
++    await completeTinRequest({ transactionId: tx.id, certificatePdfBase64: 'JVBERi0=', tinNumber: ' 1234-0001 ' });
++    const [row] = await listTinHistory(userId);
++    expect(row.status).toBe('success');
++    expect(row.tin_number).toBe('1234-0001');
++    expect(row.certificate_pdf_base64).toBe('JVBERi0=');
++    expect(decryptTinPII(await prisma.transaction.findUniqueOrThrow({ where: { id: tx.id } }))?.nin).toBe('62021151655');
++    await expect(completeTinRequest({ transactionId: tx.id, certificatePdfBase64: 'x' })).rejects.toThrow(/pending/i);
++  });
++});
+diff --git a/maria_backend/src/services/tin-certificate.service.ts b/maria_backend/src/services/tin-certificate.service.ts
+new file mode 100644
+index 0000000..3471012
+--- /dev/null
++++ b/maria_backend/src/services/tin-certificate.service.ts
+@@ -0,0 +1,245 @@
++import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
++import { koboToNaira } from '../lib/money.js';
++import { sealPII, openPII, mergeSealedPII } from '../lib/pii.js';
++import { prisma } from '../lib/prisma.js';
++import { ApiError } from '../middleware/error.js';
++import { debitWallet } from './wallet.service.js';
++
++/**
++ * TIN Certificate - Tax Identification Number for an individual (by NIN) or a
++ * registered organisation (by RC number).
++ *
++ * No provider API exists for this, so it follows the same manual pattern as
++ * CAC registration (cac.service.ts): the customer is debited at submission,
++ * the transaction sits PENDING, and an admin obtains the TIN by hand. From
++ * the "manage" page (admin/tin-certificate.ts) the admin can:
++ *   - save a progress note, shown to the customer on their request table;
++ *   - mark the request complete, attaching the TIN certificate PDF (and,
++ *     optionally, the issued TIN) which the customer can then download.
++ * A request that can't be fulfilled is rejected with the existing generic
++ * "reverse" admin action, which refunds the wallet.
++ *
++ * Everything the customer supplies (NIN, date of birth, RC number, company
++ * name...) is sealed with sealPII, never stored in plain metadata.
++ */
++export const TIN_TYPES = ['individual', 'corporate'] as const;
++export type TinType = (typeof TIN_TYPES)[number];
++
++export const TIN_ORGANIZATION_TYPES = [
++  'Business Name',
++  'Company',
++  'Incorporated Trustee',
++  'Limited Partnership',
++  'Limited Liability Partnership'
++] as const;
++export type TinOrganizationType = (typeof TIN_ORGANIZATION_TYPES)[number];
++
++/** Default selling prices - only used to create a price row the first time it's looked up.
++ *  Admins change the real price from /admin/bulk-pricing ("Set exact service prices"). */
++const TIN_CONFIG: Record<TinType, { title: string; price: number }> = {
++  individual: { title: 'TIN Certificate — Individual (NIN)', price: 400 },
++  corporate: { title: 'TIN Certificate — Corporate (RC)', price: 500 }
++};
++
++export type TinIndividualDetails = { nin: string; first_name: string; surname: string; date_of_birth: string };
++export type TinCorporateDetails = { rc_number: string; company_name: string; organization_type: TinOrganizationType };
++export type TinDetails = TinIndividualDetails | TinCorporateDetails;
++
++function serviceKeyFor(type: TinType) {
++  return `TIN_${type.toUpperCase()}`;
++}
++
++function priceToKobo(amount: number) {
++  return BigInt(Math.round(amount * 100));
++}
++
++/** Same plain-findUnique-then-conditional-create shape as every other pricing
++ *  lookup here - never resets an admin's already-configured price. */
++async function getOrCreatePricingRow(type: TinType) {
++  const config = TIN_CONFIG[type];
++  const service = serviceKeyFor(type);
++  const existing = await prisma.servicePricing.findUnique({ where: { service } });
++  if (existing) return existing;
++
++  try {
++    return await prisma.servicePricing.create({
++      data: { service, provider: 'manual', label: config.title, providerCostKobo: priceToKobo(config.price) }
++    });
++  } catch (error) {
++    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
++      return prisma.servicePricing.findUniqueOrThrow({ where: { service } });
++    }
++    throw error;
++  }
++}
++
++export async function getTinPrice(type: TinType) {
++  const row = await getOrCreatePricingRow(type);
++  if (!row.isActive) {
++    throw new ApiError(422, `${row.label} is currently unavailable`, 'SERVICE_INACTIVE');
++  }
++  const unitKobo = row.sellingPriceKobo ?? row.providerCostKobo;
++  return { unitPrice: koboToNaira(unitKobo), providerCostKobo: row.providerCostKobo };
++}
++
++/** Public price list - never throws on a disabled service. */
++export async function listTinPrices() {
++  const rows = await Promise.all(TIN_TYPES.map((type) => getOrCreatePricingRow(type)));
++  return rows.map((row, index) => ({
++    type: TIN_TYPES[index],
++    title: TIN_CONFIG[TIN_TYPES[index]].title,
++    unitPrice: koboToNaira(row.sellingPriceKobo ?? row.providerCostKobo),
++    isActive: row.isActive
++  }));
++}
++
++function createTinReference() {
++  return `TIN-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
++}
++
++/** "62021151655" -> "NIN ••••1655" - enough for the customer to recognise their own request, never the full number. */
++function maskIdentifier(label: string, value: string) {
++  const trimmed = value.trim();
++  return trimmed.length <= 4 ? `${label} ${trimmed}` : `${label} ••••${trimmed.slice(-4)}`;
++}
++
++function describeSubject(type: TinType, details: TinDetails) {
++  if (type === 'individual') {
++    const d = details as TinIndividualDetails;
++    return { subject: [d.first_name, d.surname].filter(Boolean).join(' '), identifier: maskIdentifier('NIN', d.nin) };
++  }
++  const d = details as TinCorporateDetails;
++  return { subject: d.company_name, identifier: maskIdentifier('RC', d.rc_number) };
++}
++
++export type SubmitTinResult = { reference: string; balanceAfter: number };
++
++export async function submitTinRequest(params: {
++  userId: string;
++  type: TinType;
++  details: TinDetails;
++  idempotencyKey?: string;
++}): Promise<SubmitTinResult> {
++  const config = TIN_CONFIG[params.type];
++  const price = await getTinPrice(params.type);
++  const service = serviceKeyFor(params.type);
++  const { subject, identifier } = describeSubject(params.type, params.details);
++
++  const debit = await debitWallet({
++    userId: params.userId,
++    amount: price.unitPrice,
++    type: TransactionType.TIN_CERTIFICATE,
++    description: config.title,
++    metadata: {
++      service,
++      tin_type: params.type,
++      unit_price: price.unitPrice,
++      progress_notes: null,
++      tracking_ref: createTinReference(),
++      // Display-only summary shown on the customer's request table. The full
++      // identifiers live only inside the sealed `pii` below.
++      subject,
++      identifier,
++      pii: sealPII({ ...params.details })
++    } as Prisma.InputJsonValue,
++    idempotencyKey: params.idempotencyKey,
++    // Nothing was paid upstream yet - an admin obtains the TIN by hand.
++    costKobo: price.providerCostKobo
++  });
++
++  return { reference: debit.reference, balanceAfter: debit.balanceAfter };
++}
++
++export type TinHistoryEntry = {
++  reference: string;
++  status: string;
++  tin_type: string | null;
++  subject: string | null;
++  identifier: string | null;
++  amount: number;
++  progress_notes: string | null;
++  tin_number: string | null;
++  certificate_pdf_base64: string | null;
++  created_at: string;
++  updated_at: string;
++};
++
++type TinPII = Partial<TinIndividualDetails & TinCorporateDetails> & {
++  tin_number?: string;
++  certificate_pdf_base64?: string;
++};
++
++/** Every status is listed - a TIN request can take days, so the customer needs to track it while it is still PENDING. */
++export async function listTinHistory(userId: string) {
++  const transactions = await prisma.transaction.findMany({
++    where: { userId, type: TransactionType.TIN_CERTIFICATE },
++    orderBy: { createdAt: 'desc' },
++    take: 50
++  });
++
++  return transactions.map((transaction): TinHistoryEntry => {
++    const metadata = transaction.metadata as Record<string, unknown> | null;
++    const pii = openPII<TinPII>(metadata?.pii);
++    return {
++      reference: transaction.reference,
++      status: transaction.status.toLowerCase(),
++      tin_type: typeof metadata?.tin_type === 'string' ? metadata.tin_type : null,
++      subject: typeof metadata?.subject === 'string' ? metadata.subject : null,
++      identifier: typeof metadata?.identifier === 'string' ? metadata.identifier : null,
++      amount: koboToNaira(transaction.amountKobo),
++      progress_notes: typeof metadata?.progress_notes === 'string' ? metadata.progress_notes : null,
++      tin_number: typeof pii?.tin_number === 'string' ? pii.tin_number : null,
++      certificate_pdf_base64: typeof pii?.certificate_pdf_base64 === 'string' ? pii.certificate_pdf_base64 : null,
++      created_at: transaction.createdAt.toISOString(),
++      updated_at: transaction.updatedAt.toISOString()
++    };
++  });
++}
++
++async function findTinTransaction(transactionId: string) {
++  const transaction = await prisma.transaction.findUnique({ where: { id: transactionId } });
++  if (!transaction || transaction.type !== TransactionType.TIN_CERTIFICATE) {
++    throw new ApiError(404, 'TIN transaction not found', 'TRANSACTION_NOT_FOUND');
++  }
++  return transaction;
++}
++
++/** Admin-only: update the customer-visible progress note without changing status. */
++export async function updateTinProgressNotes(params: { transactionId: string; notes: string }) {
++  const transaction = await findTinTransaction(params.transactionId);
++  const metadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
++  await prisma.transaction.update({
++    where: { id: transaction.id },
++    data: { metadata: { ...metadata, progress_notes: params.notes } as Prisma.InputJsonValue }
++  });
++}
++
++/** Admin-only: attach the TIN certificate (and optionally the issued TIN) and mark the request SUCCESS. */
++export async function completeTinRequest(params: { transactionId: string; certificatePdfBase64: string; tinNumber?: string }) {
++  const transaction = await findTinTransaction(params.transactionId);
++  if (transaction.status !== TransactionStatus.PENDING) {
++    throw new ApiError(422, 'Only a pending TIN request can be marked complete', 'INVALID_STATUS');
++  }
++
++  const metadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
++  const tinNumber = params.tinNumber?.trim();
++  await prisma.transaction.update({
++    where: { id: transaction.id },
++    data: {
++      status: TransactionStatus.SUCCESS,
++      metadata: {
++        ...metadata,
++        pii: mergeSealedPII(metadata.pii, {
++          certificate_pdf_base64: params.certificatePdfBase64,
++          ...(tinNumber ? { tin_number: tinNumber } : {})
++        })
++      } as Prisma.InputJsonValue
++    }
++  });
++}
++
++/** Decrypts the sealed PII (applicant details, certificate) for the admin's manage page. Never call from a user-facing endpoint. */
++export function decryptTinPII(transaction: { metadata: unknown }) {
++  const metadata = transaction.metadata as Record<string, unknown> | null;
++  return openPII<TinPII>(metadata?.pii);
++}
+diff --git a/maria_backend/src/types/prisma-enums.ts b/maria_backend/src/types/prisma-enums.ts
+index 5652826..7ac9c49 100644
+--- a/maria_backend/src/types/prisma-enums.ts
++++ b/maria_backend/src/types/prisma-enums.ts
+@@ -47,6 +47,7 @@ export enum TransactionType {
+   BVN_MODIFICATION = 'BVN_MODIFICATION',
+   BIRTH_ATTESTATION = 'BIRTH_ATTESTATION',
+   NEWSPAPER_PUBLICATION = 'NEWSPAPER_PUBLICATION',
++  TIN_CERTIFICATE = 'TIN_CERTIFICATE',
+   REFUND = 'REFUND',
+   WALLET_FUNDING_FEE = 'WALLET_FUNDING_FEE',
+ }
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 71a82b8..cd57733 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -19,6 +19,7 @@ import VerificationPage from './pages/VerificationPage';
+ import NinPhoneVerificationPage from './pages/verification/NinPhoneVerificationPage';
+ import PhoneMultiplePage from './pages/verification/PhoneMultiplePage';
+ import CacServicesPage from './pages/verification/CacServicesPage';
++import TinCertificatePage from './pages/verification/TinCertificatePage';
+ import BvnVerificationPage from './pages/verification/BvnVerificationPage';
+ import IpeClearancePage from './pages/verification/IpeClearancePage';
+ import ValidationPage from './pages/verification/ValidationPage';
+@@ -106,6 +107,7 @@ export default function App() {
+           <Route path="/nin" element={<ProtectedRoute><NinPhoneVerificationPage /></ProtectedRoute>} />
+           <Route path="/phone" element={<ProtectedRoute><PhoneMultiplePage /></ProtectedRoute>} />
+           <Route path="/cac" element={<ProtectedRoute><CacServicesPage /></ProtectedRoute>} />
++          <Route path="/tin" element={<ProtectedRoute><TinCertificatePage /></ProtectedRoute>} />
+           <Route path="/bvn" element={<ProtectedRoute><BvnVerificationPage /></ProtectedRoute>} />
+           <Route path="/ipe" element={<ProtectedRoute><IpeClearancePage /></ProtectedRoute>} />
+           <Route path="/validation" element={<ProtectedRoute><ValidationPage /></ProtectedRoute>} />
+diff --git a/web/src/lib/services.ts b/web/src/lib/services.ts
+index 5e2e85a..61be76c 100644
+--- a/web/src/lib/services.ts
++++ b/web/src/lib/services.ts
+@@ -82,7 +82,7 @@ export const SERVICES: ServiceItem[] = [
+   // SERVICES.filter(!implemented) loop below to the friendly
+   // "coming soon" page instead.
+   { label: 'Birth Attestation', description: 'Birth attestation services.', icon: Receipt, route: '/attestation', tint: 'success', implemented: true },
+-  { label: 'TIN Certificate', description: 'Get your TIN certificate.', icon: Receipt, route: '/tin', tint: 'ember', implemented: false },
++  { label: 'TIN Certificate', description: 'Get your TIN certificate.', icon: Receipt, route: '/tin', tint: 'ember', implemented: true },
+   { label: 'Newspaper Publication', description: 'Publish notices in newspapers.', icon: MessageSquare, route: '/newspaper', tint: 'gold', implemented: true },
+   { label: 'Demographic Search', description: 'Search demographic records.', icon: Search, route: '/demo', tint: 'bronze', implemented: true },
+   // These two now have real dedicated pages + <Route> entries in App.tsx
+diff --git a/web/src/pages/verification/TinCertificatePage.tsx b/web/src/pages/verification/TinCertificatePage.tsx
+new file mode 100644
+index 0000000..88cd3a3
+--- /dev/null
++++ b/web/src/pages/verification/TinCertificatePage.tsx
+@@ -0,0 +1,215 @@
++import { useEffect, useMemo, useState, type FormEvent } from 'react';
++import { Download, FileText, Loader2 } from 'lucide-react';
++import AppShell from '../../components/AppShell';
++import { api, ApiError } from '../../lib/api';
++import { PinConfirmDialog } from '../../components/PinConfirmDialog';
++import { PageHeader, money, FORM_SECTION_CLASSES, FORM_INPUT_CLASSES, FORM_LABEL_CLASSES } from '../../components/verification/shared';
++
++type TinType = 'individual' | 'corporate';
++type TinPriceRow = { type: TinType; title: string; unitPrice: number; isActive: boolean };
++type TinHistoryEntry = {
++  reference: string;
++  status: string;
++  tin_type: string | null;
++  subject: string | null;
++  identifier: string | null;
++  amount: number;
++  progress_notes: string | null;
++  tin_number: string | null;
++  certificate_pdf_base64: string | null;
++  created_at: string;
++  updated_at: string;
++};
++
++const ORGANIZATION_TYPES = ['Business Name', 'Company', 'Incorporated Trustee', 'Limited Partnership', 'Limited Liability Partnership'];
++const STATUS_LABEL: Record<string, string> = { pending: 'Processing', success: 'Completed', failed: 'Rejected', reversed: 'Refunded' };
++
++export default function TinCertificatePage() {
++  const [prices, setPrices] = useState<TinPriceRow[]>([]);
++  const [tinType, setTinType] = useState<TinType>('individual');
++  const [nin, setNin] = useState('');
++  const [firstName, setFirstName] = useState('');
++  const [surname, setSurname] = useState('');
++  const [dob, setDob] = useState('');
++  const [rcNumber, setRcNumber] = useState('');
++  const [companyName, setCompanyName] = useState('');
++  const [organizationType, setOrganizationType] = useState('');
++  const [showPin, setShowPin] = useState(false);
++  const [busy, setBusy] = useState(false);
++  const [message, setMessage] = useState('');
++  const [history, setHistory] = useState<TinHistoryEntry[]>([]);
++  const [loadingHistory, setLoadingHistory] = useState(true);
++
++  const priceOf = (type: TinType) => prices.find((p) => p.type === type)?.unitPrice;
++  const selected = useMemo(() => prices.find((p) => p.type === tinType), [prices, tinType]);
++
++  async function loadHistory() {
++    setLoadingHistory(true);
++    try {
++      const result = await api.get<{ status: boolean; data: TinHistoryEntry[] }>('/verification/tin/history');
++      setHistory(result.data ?? []);
++    } catch {
++      setHistory([]);
++    } finally {
++      setLoadingHistory(false);
++    }
++  }
++
++  useEffect(() => {
++    api
++      .get<{ status: boolean; data: TinPriceRow[] }>('/verification/tin/prices')
++      .then((result) => setPrices(result.data ?? []))
++      .catch(() => setPrices([]));
++    void loadHistory();
++  }, []);
++
++  function prepare(event: FormEvent) {
++    event.preventDefault();
++    setMessage('');
++    setShowPin(true);
++  }
++
++  async function submit(pin: string) {
++    setShowPin(false);
++    setBusy(true);
++    setMessage('');
++    try {
++      const payload =
++        tinType === 'individual'
++          ? { tin_type: 'individual', nin, first_name: firstName.trim(), surname: surname.trim(), date_of_birth: dob }
++          : { tin_type: 'corporate', rc_number: rcNumber.trim(), company_name: companyName.trim(), organization_type: organizationType };
++      const result = await api.post<{ status: boolean; message?: string; data?: { reference: string } }>('/verification/tin', { ...payload, pin });
++      if (!result.status) throw new Error(result.message);
++      setMessage(`Request submitted — reference ${result.data?.reference}. Our team will process your TIN and update the status below.`);
++      setNin(''); setFirstName(''); setSurname(''); setDob('');
++      setRcNumber(''); setCompanyName(''); setOrganizationType('');
++      void loadHistory();
++    } catch (error) {
++      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const toggleClass = (active: boolean) =>
++    `flex-1 rounded-lg px-3 py-2.5 font-body text-sm font-semibold transition ${active ? 'bg-[#0b2f73] text-white shadow' : 'text-[#0b2f73]/70 hover:bg-blue-50'}`;
++
++  return (
++    <AppShell>
++      <div className="mx-auto max-w-5xl">
++        <PageHeader title="TIN Certificate" subtitle="Request a Tax Identification Number (TIN) certificate for an individual or a registered organisation. Our team processes each request and attaches your certificate here." />
++
++        <section className={FORM_SECTION_CLASSES}>
++          <form onSubmit={prepare}>
++            <div className="flex items-center gap-2 border-b border-blue-200 pb-2">
++              <FileText size={20} className="text-[#0b2f73]" />
++              <h2 className="font-display text-lg font-bold text-[#0b2f73]">Generate TIN</h2>
++            </div>
++
++            <p className="mt-4 rounded-xl bg-blue-50 px-4 py-3 font-body text-sm text-[#0b2f73]">
++              <b>Service Pricing:</b> Individual: <b>{money(priceOf('individual'))}</b> | Corporate: <b>{money(priceOf('corporate'))}</b>
++            </p>
++
++            <p className="mt-5 font-display text-sm font-bold text-[#0b2f73]">Select Verification Type</p>
++            <div className="mt-2 flex gap-1 rounded-xl border border-blue-200 bg-white p-1">
++              <button type="button" className={toggleClass(tinType === 'individual')} onClick={() => setTinType('individual')}>Individual (NIN)</button>
++              <button type="button" className={toggleClass(tinType === 'corporate')} onClick={() => setTinType('corporate')}>Corporate (RC)</button>
++            </div>
++
++            {tinType === 'individual' ? (
++              <div className="mt-5 grid gap-4 sm:grid-cols-2">
++                <label className={`sm:col-span-2 ${FORM_LABEL_CLASSES}`}>NIN Number
++                  <input required inputMode="numeric" pattern="\d{11}" maxLength={11} placeholder="Enter 11-digit NIN" className={`mt-1 ${FORM_INPUT_CLASSES}`} value={nin} onChange={(e) => setNin(e.target.value.replace(/\D/g, ''))} />
++                </label>
++                <label className={FORM_LABEL_CLASSES}>First Name
++                  <input required maxLength={100} className={`mt-1 ${FORM_INPUT_CLASSES}`} value={firstName} onChange={(e) => setFirstName(e.target.value)} />
++                </label>
++                <label className={FORM_LABEL_CLASSES}>Surname
++                  <input required maxLength={100} className={`mt-1 ${FORM_INPUT_CLASSES}`} value={surname} onChange={(e) => setSurname(e.target.value)} />
++                </label>
++                <label className={`sm:col-span-2 ${FORM_LABEL_CLASSES}`}>Date of Birth
++                  <input required type="date" max={new Date().toISOString().slice(0, 10)} className={`mt-1 ${FORM_INPUT_CLASSES}`} value={dob} onChange={(e) => setDob(e.target.value)} />
++                </label>
++              </div>
++            ) : (
++              <div className="mt-5 grid gap-4 sm:grid-cols-2">
++                <label className={FORM_LABEL_CLASSES}>RC Number
++                  <input required maxLength={20} placeholder="e.g. RC1234567" className={`mt-1 ${FORM_INPUT_CLASSES}`} value={rcNumber} onChange={(e) => setRcNumber(e.target.value)} />
++                </label>
++                <label className={FORM_LABEL_CLASSES}>Organization Type
++                  <select required className={`mt-1 ${FORM_INPUT_CLASSES}`} value={organizationType} onChange={(e) => setOrganizationType(e.target.value)}>
++                    <option value="">-- Select --</option>
++                    {ORGANIZATION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
++                  </select>
++                </label>
++                <label className={`sm:col-span-2 ${FORM_LABEL_CLASSES}`}>Company Name
++                  <input required minLength={2} maxLength={200} className={`mt-1 ${FORM_INPUT_CLASSES}`} value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
++                </label>
++              </div>
++            )}
++
++            <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
++              <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">Service cost: {money(selected?.unitPrice)}</span>
++              <button disabled={busy || selected?.isActive === false} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
++                {busy ? <Loader2 size={16} className="animate-spin" /> : 'Generate TIN Now'}
++              </button>
++            </div>
++            {selected?.isActive === false && <p className="mt-3 font-body text-sm text-ember-600">This service is currently unavailable.</p>}
++            {message && <p className="mt-3 rounded-lg bg-blue-50 p-3 font-body text-sm text-[#0b2f73]">{message}</p>}
++          </form>
++
++          <div className="mt-8 border-t border-blue-100 pt-5">
++            <h3 className="font-display text-base font-bold text-[#0b2f73]">Transactions</h3>
++            {loadingHistory ? (
++              <p className="mt-3 font-body text-sm text-[#0b2f73]/70">Loading…</p>
++            ) : history.length === 0 ? (
++              <p className="mt-3 rounded-xl border border-dashed border-blue-200 px-4 py-4 text-center font-body text-sm text-[#0b2f73]/70">No transactions recorded yet.</p>
++            ) : (
++              <div className="mt-3 overflow-x-auto rounded-xl border border-blue-100 bg-blue-50">
++                <table className="w-full text-left font-body text-xs">
++                  <thead>
++                    <tr className="border-b border-blue-100 text-[#0b2f73]/70">
++                      {['Ref ID', 'Type', 'Name', 'ID', 'TIN', 'Amount', 'Status', 'Progress Notes', 'Date', 'Certificate'].map((h) => (
++                        <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">{h}</th>
++                      ))}
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {history.map((row) => (
++                      <tr key={row.reference} className="border-b border-blue-100 last:border-0">
++                        <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{row.reference}</td>
++                        <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]">{row.tin_type === 'corporate' ? 'Corporate' : 'Individual'}</td>
++                        <td className="px-3 py-2 text-[#0b2f73]">{row.subject ?? '—'}</td>
++                        <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{row.identifier ?? '—'}</td>
++                        <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{row.tin_number ?? '—'}</td>
++                        <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]">{money(row.amount)}</td>
++                        <td className="whitespace-nowrap px-3 py-2">
++                          <span className={`rounded-full px-2 py-1 text-[10px] font-bold ${row.status === 'success' ? 'bg-success-500/15 text-success-600' : row.status === 'pending' ? 'bg-gold-500/15 text-gold-700' : 'bg-ember-500/15 text-ember-600'}`}>
++                            {STATUS_LABEL[row.status] ?? row.status}
++                          </span>
++                        </td>
++                        <td className="max-w-[200px] px-3 py-2 text-[#0b2f73]/70">{row.progress_notes ?? '—'}</td>
++                        <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{new Date(row.created_at).toLocaleDateString()}</td>
++                        <td className="whitespace-nowrap px-3 py-2">
++                          {row.certificate_pdf_base64 ? (
++                            <a href={`data:application/pdf;base64,${row.certificate_pdf_base64}`} download={`${row.reference}-tin-certificate.pdf`} className="flex items-center gap-1 rounded-lg bg-gold-500 px-2 py-1.5 font-bold text-ink">
++                              <Download size={12} /> PDF
++                            </a>
++                          ) : (
++                            <span className="text-[#0b2f73]/40">—</span>
++                          )}
++                        </td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              </div>
++            )}
++          </div>
++        </section>
++      </div>
++
++      <PinConfirmDialog open={showPin} onClose={() => setShowPin(false)} onVerified={submit} />
++    </AppShell>
++  );
++}
+-- 
+2.43.0
+

@@ -29,6 +29,7 @@ type RedirectToManageProps = {
 
 const TARGET_PATH_BY_TYPE: Record<string, (id: string) => string> = {
   CAC_SERVICE_REQUEST: (id) => `/admin/cac/${id}/manage`,
+  TIN_CERTIFICATE_REQUEST: (id) => `/admin/tin/${id}/manage`,
   NIN_MODIFICATION: (id) => `/admin/nin-modification/${id}/pdf`,
   BVN_LICENSE_ONBOARDING: (id) => `/admin/bvn-license/${id}/manage`,
   BVN_MODIFICATION: (id) => `/admin/bvn-modification/${id}/pdf`,

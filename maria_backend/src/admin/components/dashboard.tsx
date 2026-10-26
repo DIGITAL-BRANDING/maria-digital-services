@@ -30,6 +30,12 @@ const quickLinks: QuickLink[] = [
     icon: 'Briefcase'
   },
   {
+    label: 'TIN Certificate Requests',
+    description: 'Individual and corporate TIN applications awaiting manual processing',
+    href: `${ADMIN_ROOT_PATH}/resources/Transaction?filters.type=TIN_CERTIFICATE_REQUEST`,
+    icon: 'FileText'
+  },
+  {
     label: 'BVN License Requests',
     description: 'Agent BVN license enrollments awaiting manual processing',
     href: `${ADMIN_ROOT_PATH}/resources/Transaction?filters.type=BVN_LICENSE_ONBOARDING`,
@@ -305,4 +311,3 @@ const Dashboard: React.FC = () => (
 );
 
 export default Dashboard;
-

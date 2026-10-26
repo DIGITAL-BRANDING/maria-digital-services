@@ -14,6 +14,7 @@ const usageTypes = [
   TransactionType.BVN_VERIFICATION, TransactionType.IDENTITY_SERVICE_REQUEST,
   TransactionType.NIN_MODIFICATION, TransactionType.BVN_LICENSE_ONBOARDING,
   TransactionType.CAC_SERVICE_REQUEST, TransactionType.BVN_MODIFICATION,
+  TransactionType.TIN_CERTIFICATE_REQUEST,
   TransactionType.BIRTH_ATTESTATION, TransactionType.NEWSPAPER_PUBLICATION,
   TransactionType.BVN_CRM
 ] as const;

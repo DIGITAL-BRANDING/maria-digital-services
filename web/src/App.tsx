@@ -42,6 +42,7 @@ import SupportPage from './pages/SupportPage';
 import SlipsHistoryPage from './pages/SlipsHistoryPage';
 import WalletSummaryPage from './pages/WalletSummaryPage';
 import KycPage from './pages/KycPage';
+import TinCertificatePage from './pages/TinCertificatePage';
 import KycPromptModal from './components/KycPromptModal';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
@@ -106,6 +107,7 @@ export default function App() {
           <Route path="/nin" element={<ProtectedRoute><NinPhoneVerificationPage /></ProtectedRoute>} />
           <Route path="/phone" element={<ProtectedRoute><PhoneMultiplePage /></ProtectedRoute>} />
           <Route path="/cac" element={<ProtectedRoute><CacServicesPage /></ProtectedRoute>} />
+          <Route path="/tin" element={<ProtectedRoute><TinCertificatePage /></ProtectedRoute>} />
           <Route path="/bvn" element={<ProtectedRoute><BvnVerificationPage /></ProtectedRoute>} />
           <Route path="/ipe" element={<ProtectedRoute><IpeClearancePage /></ProtectedRoute>} />
           <Route path="/validation" element={<ProtectedRoute><ValidationPage /></ProtectedRoute>} />

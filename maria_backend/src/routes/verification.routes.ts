@@ -4,6 +4,7 @@ import { TransactionStatus, TransactionType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth.js';
 import { GEO_POLITICAL_ZONES, submitBvnLicense, type BvnLicenseInput } from '../services/bvn-license-onboarding.service.js';
 import { CAC_TYPES, listCacHistory, listCacPrices, submitCacRequest, type CacType, type CacApplicantDetails } from '../services/cac.service.js';
+import { listTinCertificateHistory, listTinCertificatePrices, submitTinCertificateRequest } from '../services/tin-certificate.service.js';
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import { prisma } from '../lib/prisma.js';
 import {
@@ -516,6 +517,58 @@ verificationRoutes.get('/ipe-clearance/:ticketId', async (req, res) => {
 });
 
 // ── CAC Services (manual — no provider API) ────────────────────────
+
+verificationRoutes.get('/tin/prices', async (_req, res) => {
+  const data = await listTinCertificatePrices();
+  res.json({ status: true, data });
+});
+
+verificationRoutes.post('/tin', async (req, res) => {
+  const body = z.discriminatedUnion('verification_type', [
+    z.object({
+      verification_type: z.literal('individual'),
+      nin_number: z.string().trim().regex(/^\d{11}$/),
+      first_name: z.string().trim().min(1).max(100),
+      surname: z.string().trim().min(1).max(100),
+      date_of_birth: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/),
+      ...pinField
+    }),
+    z.object({
+      verification_type: z.literal('corporate'),
+      rc_number: z.string().trim().min(1).max(30),
+      company_name: z.string().trim().min(2).max(200),
+      organization_type: z.enum(['Business Name', 'Company', 'Incorporated Trustee', 'Limited Partnership', 'Limited Liability Partnership']),
+      ...pinField
+    })
+  ]).parse(req.body);
+  await requirePinConfirmation(req.user!.id, body.pin);
+  const details = body.verification_type === 'individual'
+    ? {
+        type: 'individual' as const,
+        nin_number: body.nin_number,
+        first_name: body.first_name,
+        surname: body.surname,
+        date_of_birth: body.date_of_birth
+      }
+    : {
+        type: 'corporate' as const,
+        rc_number: body.rc_number,
+        company_name: body.company_name,
+        organization_type: body.organization_type
+      };
+  const result = await submitTinCertificateRequest({
+    userId: req.user!.id,
+    details,
+    idempotencyKey: idempotencyKeyFrom(req)
+  });
+  res.json({ status: true, data: { reference: result.reference, balance_after: result.balanceAfter } });
+});
+
+verificationRoutes.get('/tin/history', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const data = await listTinCertificateHistory(req.user!.id);
+  res.json({ status: true, data });
+});
 
 verificationRoutes.get('/cac/prices', async (_req, res) => {
   const prices = await listCacPrices();

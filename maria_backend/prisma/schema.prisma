@@ -69,6 +69,9 @@ enum TransactionType {
   /// uploads the completed certificate PDF, which marks the transaction
   /// SUCCESS. See cac.service.ts.
   CAC_SERVICE_REQUEST
+  /// A submitted TIN certificate request (individual NIN or corporate RC).
+  /// An admin processes it manually and attaches the issued certificate.
+  TIN_CERTIFICATE_REQUEST
   /// A submitted BVN Modification request (update name/phone/DOB/address/
   /// email tied to a BVN). No provider API for this either - same manual
   /// pattern as NIN_MODIFICATION: debit now, admin re-keys the change by
