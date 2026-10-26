@@ -6,6 +6,7 @@ import { prisma } from '../lib/prisma.js';
 import { dataPlanPricingService } from '../services/data-plan-pricing.service.js';
 import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
 import { applyServiceMarkup } from '../services/result-pin.service.js';
+import { listTinCertificatePrices } from '../services/tin-certificate.service.js';
 import { BVN_MODIFICATION_BANKS, BVN_MODIFICATION_CONFIG, listBvnModificationPrices } from '../services/bvn-modification.service.js';
 
 // @adminjs/express stores the logged-in admin as `req.session.adminUser`
@@ -64,6 +65,8 @@ export function registerBulkPricingRoutes(router: Router) {
     // Ensure every BVN Modification option has a distinct editable price row,
     // including each bank (banks can have different selling prices).
     await listBvnModificationPrices();
+    // Same for TIN Certificate so its Individual/Corporate prices are editable from first load.
+    await listTinCertificatePrices();
     const [settings, networks, servicePrices] = await Promise.all([
       getPricingSettings(),
       prisma.dataPlanPricing.findMany({

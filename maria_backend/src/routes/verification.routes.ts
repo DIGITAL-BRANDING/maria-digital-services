@@ -310,7 +310,7 @@ verificationRoutes.get('/service-history', async (req, res) => {
   const serviceTypes = new Set([
     'NIN_VERIFICATION', 'BVN_VERIFICATION', 'IDENTITY_SERVICE_REQUEST',
     'NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST',
-    'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM'
+    'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM', 'TIN_CERTIFICATE_REQUEST'
   ]);
   const data = transactions.filter((tx) => serviceTypes.has(tx.type)).map((tx) => {
     const metadata = tx.metadata as Record<string, unknown> | null;
