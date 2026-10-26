@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { koboToNaira } from '../lib/money.js';
 import { prisma } from '../lib/prisma.js';
 import { requireAuth } from '../middleware/auth.js';
+import { ApiError } from '../middleware/error.js';
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import { providerService, type ProviderPurchaseInput } from '../services/provider.service.js';
 import * as bilalsadasub from '../services/bilalsadasub.service.js';
@@ -87,7 +88,57 @@ export async function processProviderPurchase(params: {
     };
   }
 
-  const provider = await params.callProvider(debit.reference);
+  let provider: NormalizedProviderResponse;
+  try {
+    provider = await params.callProvider(debit.reference);
+  } catch (error) {
+    const code = error instanceof ApiError ? error.code : 'PROVIDER_REQUEST_ERROR';
+    const message = error instanceof Error ? error.message : 'Unknown provider error';
+    console.error(
+      `[purchase][${params.provider}] provider call threw for transaction ${debit.transaction.id} ` +
+        `(reference=${debit.reference}, code=${code}):`,
+      error
+    );
+
+    // These errors happen before a purchase request can reach the upstream
+    // provider, so refunding the debit is safe. Unknown/network errors are
+    // ambiguous: the provider may have accepted the purchase before the
+    // connection failed, so leave it pending for an admin to reconcile.
+    const definitelyNotSubmitted = [
+      'BILALSADASUB_NOT_CONFIGURED',
+      'BILALSADASUB_AUTH_FAILED',
+      'KTECH_NOT_CONFIGURED',
+      'UNSUPPORTED_NETWORK'
+    ].includes(code);
+
+    if (definitelyNotSubmitted) {
+      await prisma.transaction.update({
+        where: { id: debit.transaction.id },
+        data: { status: TransactionStatus.FAILED, provider: params.provider }
+      });
+      const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
+      return {
+        status: false as const,
+        message,
+        reference: debit.reference,
+        balanceAfter: koboToNaira(refunded.balanceAfterKobo)
+      };
+    }
+
+    await flagPendingReconciliation({
+      transactionId: debit.transaction.id,
+      provider: params.provider,
+      providerRef: debit.reference,
+      providerMessage: `Provider request error (${code}): ${message}`,
+      rawStatus: { kind: 'provider_request_error', code }
+    });
+    return {
+      status: false as const,
+      message: 'We could not confirm this purchase with the provider. It is being checked; contact support with your reference before trying again.',
+      reference: debit.reference,
+      balanceAfter: debit.balanceAfter
+    };
+  }
 
   if (provider.status) {    const finalCostKobo = provider.costKobo ?? params.costKobo;
 
