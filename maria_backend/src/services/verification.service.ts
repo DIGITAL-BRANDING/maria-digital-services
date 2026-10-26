@@ -13,7 +13,7 @@ import {
   type TechhubSlipTier,
   type TechhubSlipResult
 } from './techhub.service.js';
-import { ktechService } from './ktech.service.js';
+import { ktechService, type KtechNinSlipTier } from './ktech.service.js';
 import { activeIdentityVerificationProvider } from './pricing-settings.service.js';
 
 /**
@@ -26,6 +26,7 @@ const SERVICE_KEYS = [
   'NIN_SLIP_STANDARD',
   'NIN_SLIP_REGULAR',
   'NIN_SLIP_VNIN',
+  'NIN_SLIP_INFORMATION',
   'NIN_PHONE_SLIP_PREMIUM',
   'NIN_PHONE_SLIP_STANDARD',
   'NIN_PHONE_SLIP_REGULAR',
@@ -69,6 +70,7 @@ const DEFAULTS: Record<VerificationServiceKey, { label: string; price: number }>
   NIN_SLIP_STANDARD: { label: 'NIN Slip (Standard) — by NIN', price: 120 },
   NIN_SLIP_REGULAR: { label: 'NIN Slip (Regular) — by NIN', price: 120 },
   NIN_SLIP_VNIN: { label: 'NIN Slip (VNIN) — by NIN', price: 120 },
+  NIN_SLIP_INFORMATION: { label: 'NIN Information Slip — by NIN', price: 200 },
   NIN_PHONE_SLIP_PREMIUM: { label: 'NIN Slip (Premium) — by Phone', price: 130 },
   NIN_PHONE_SLIP_STANDARD: { label: 'NIN Slip (Standard) — by Phone', price: 130 },
   NIN_PHONE_SLIP_REGULAR: { label: 'NIN Slip (Regular) — by Phone', price: 130 },
@@ -322,7 +324,8 @@ async function purchaseSlip(params: {
   };
 }
 
-const NIN_SLIP_SERVICE_BY_TIER: Record<TechhubSlipTier, VerificationServiceKey> = {
+const NIN_SLIP_SERVICE_BY_TIER: Record<KtechNinSlipTier, VerificationServiceKey> = {
+  information: 'NIN_SLIP_INFORMATION',
   premium: 'NIN_SLIP_PREMIUM',
   standard: 'NIN_SLIP_STANDARD',
   regular: 'NIN_SLIP_REGULAR',
@@ -340,19 +343,23 @@ const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> =
   standard: 'BVN_SLIP_STANDARD'
 };
 
-export async function purchaseNinByNin(params: { userId: string; nin: string; tier: TechhubSlipTier; idempotencyKey?: string }) {
-  const provider = await activeIdentityVerificationProvider();
+export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string }) {
+  // K-Tech supports the information tier on its NIN-by-NIN endpoint. Keep
+  // this slip separate from demographic lookup, which has its own form/API.
+  if (params.tier === 'information') ktechService.assertConfigured();
+  const provider = params.tier === 'information' ? 'ktech' : await activeIdentityVerificationProvider();
   return purchaseSlip({
     userId: params.userId,
     service: NIN_SLIP_SERVICE_BY_TIER[params.tier],
     provider,
     transactionType: TransactionType.NIN_VERIFICATION,
-    description: `NIN slip (${params.tier}) by NIN`,
+    description: `NIN ${params.tier === 'information' ? 'Information ' : ''}slip (${params.tier}) by NIN`,
     operational: { mode: 'by_nin', tier: params.tier, provider },
     pii: { nin: params.nin },
     idempotencyKey: params.idempotencyKey,
-    call: (reference) =>
-      provider === 'ktech'
+    call: (reference) => params.tier === 'information'
+      ? ktechService.ninByNin(params.nin, params.tier, reference)
+      : provider === 'ktech'
         ? ktechService.ninByNin(params.nin, params.tier, reference)
         : techhubService.ninByNin(params.nin, params.tier)
   });

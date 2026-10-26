@@ -13,6 +13,7 @@ import type { DataPlan } from './data-plans.data.js';
 import { dataPlanPricingService } from './data-plan-pricing.service.js';
 
 const PROVIDER = 'ktech';
+export type KtechNinSlipTier = TechhubSlipTier | 'information';
 
 /**
  * Mirrors ProviderBalanceStatus.upsert in bilalsadasub.service.ts - keeps
@@ -117,7 +118,11 @@ export class KtechService {
     return env.KTECH_API_KEY;
   }
 
-  async ninByNin(nin: string, tier: TechhubSlipTier, idempotencyKey: string) {
+  assertConfigured() {
+    this.apiKey();
+  }
+
+  async ninByNin(nin: string, tier: KtechNinSlipTier, idempotencyKey: string) {
     return this.postSlip('/verification/nin/by-nin', { nin, tier }, idempotencyKey);
   }
 

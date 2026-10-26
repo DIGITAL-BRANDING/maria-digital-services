@@ -52,7 +52,7 @@ const NIN_TIER_IMAGE: Record<NinTier, string> = {
 };
 
 const NIN_KEY: Record<NinTier, string> = {
-  information: 'NIN_DEMOGRAPHIC',
+  information: 'NIN_SLIP_INFORMATION',
   regular: 'NIN_SLIP_REGULAR',
   standard: 'NIN_SLIP_STANDARD',
   premium: 'NIN_SLIP_PREMIUM',
@@ -75,7 +75,7 @@ export default function NinPhoneVerificationPage() {
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
 
-  const demographicLookup = method === 'demographic' || (method === 'nin' && ninTier === 'information');
+  const demographicLookup = method === 'demographic';
   const serviceKey = method === 'phone' ? PHONE_KEY[phoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
   const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
   const price = useMemo(() => (serviceKey ? prices[serviceKey] : undefined), [serviceKey, prices]);
@@ -156,16 +156,16 @@ export default function NinPhoneVerificationPage() {
                 </>
               )}
 
-              {(method === 'nin' || method === 'phone') && <>
+              <>
               <StepLabel n={3}>Select Your Preferred Slip Type</StepLabel>
               <div className="mt-3">
-                {method === 'nin' ? (
+                {method !== 'phone' ? (
                   <TierCardGrid
                     options={NIN_TIERS}
                     labels={NIN_TIER_LABELS}
                     value={ninTier}
                     onChange={setNinTier}
-                    priceFor={(t) => prices[NIN_KEY[t]]}
+                    priceFor={(t) => prices[method === 'demographic' ? 'NIN_DEMOGRAPHIC' : NIN_KEY[t]]}
                     iconFor={(t) => NIN_TIER_ICON[t]}
                     imageFor={(t) => NIN_TIER_IMAGE[t]}
                   />
@@ -181,7 +181,7 @@ export default function NinPhoneVerificationPage() {
                   />
                 )}
               </div>
-              </>}
+              </>
 
               <ConsentCheckbox checked={consent} onChange={setConsent} />
 
