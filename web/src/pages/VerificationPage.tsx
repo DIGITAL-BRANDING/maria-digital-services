@@ -112,11 +112,12 @@ type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pd
 type AsyncResult = { ticket_id: string; reference: string };
 type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
 type VerificationHistory = {
+  id: string;
   reference: string;
   status: string;
   created_at: string;
-  pdf_base64: string | null;
-  pdf_url: string | null;
+  has_document: boolean;
+  document_url: string | null;
   ticket_id: string | null;
 };
 
@@ -450,6 +451,16 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
 }
 
 function VerificationHistoryView({ history, loading }: { history: VerificationHistory[]; loading: boolean }) {
+  const openDocument = async (entry: VerificationHistory) => {
+    const tab = window.open('', '_blank');
+    try {
+      const blob = await api.document(`/transactions/${encodeURIComponent(entry.id)}/document`);
+      if (tab) tab.location.href = URL.createObjectURL(blob);
+    } catch (error) {
+      tab?.close();
+      window.alert(error instanceof Error ? error.message : 'Could not open document');
+    }
+  };
   return (
     <section className="mt-8 border-t border-parchment-line pt-5">
       <div className="flex items-baseline justify-between gap-3">
@@ -465,28 +476,19 @@ function VerificationHistoryView({ history, loading }: { history: VerificationHi
       ) : (
         <div className="mt-3 divide-y divide-parchment-line overflow-hidden rounded-xl border border-parchment-line bg-cream">
           {history.map((entry) => {
-            const base64 = entry.pdf_base64?.replace(/^data:application\/pdf;base64,/i, '');
-            const href = base64
-              ? `data:application/pdf;base64,${base64}`
-              : entry.pdf_url?.startsWith('https://')
-                ? entry.pdf_url
-                : null;
             return (
               <div key={entry.reference} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
                 <div>
                   <p className="font-mono text-xs font-semibold text-ink">{entry.reference}</p>
                   <p className="mt-1 font-body text-xs text-ink-600">{new Date(entry.created_at).toLocaleString()}</p>
                 </div>
-                {href ? (
-                  <a
-                    href={href}
-                    download={`${entry.reference}.pdf`}
-                    target={base64 ? undefined : '_blank'}
-                    rel={base64 ? undefined : 'noreferrer'}
+                {entry.has_document ? (
+                  <button
+                    onClick={() => void openDocument(entry)}
                     className="flex items-center gap-2 rounded-lg bg-gold-500 px-3 py-2 font-body text-xs font-bold text-ink"
                   >
                     <Download size={14} /> Retrieve PDF
-                  </a>
+                  </button>
                 ) : (
                   <span className="font-body text-xs font-semibold capitalize text-ink-600">{entry.status}</span>
                 )}

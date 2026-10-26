@@ -48,6 +48,7 @@ async function request<T>(
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(20_000),
   });
 
   let payload: unknown = null;
@@ -71,5 +72,15 @@ export const api = {
   get: <T>(path: string, auth = true) => request<T>(path, { method: 'GET', auth }),
   post: <T>(path: string, body?: unknown, auth = true) =>
     request<T>(path, { method: 'POST', body, auth }),
+  document: async (path: string) => {
+    const token = getAccessToken();
+    const res = await fetch(`${API_BASE}/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) {
+      let message = `Request failed (${res.status})`;
+      try { message = ((await res.json()) as { message?: string }).message ?? message; } catch { /* non-JSON error */ }
+      throw new ApiError(message, res.status);
+    }
+    return res.blob();
+  },
 };
 

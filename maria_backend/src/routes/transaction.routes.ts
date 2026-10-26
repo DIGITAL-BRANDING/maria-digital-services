@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma.js';
 import { koboToNaira } from '../lib/money.js';
 import { transactionDirection } from '../lib/transaction-direction.js';
 import { requireAuth } from '../middleware/auth.js';
+import { decryptTransactionPII } from '../services/verification.service.js';
 
 export const transactionRoutes = Router();
 
@@ -23,7 +24,7 @@ type TransactionRow = Prisma.TransactionGetPayload<Record<string, never>>;
  * funding attempt that is still PENDING or FAILED - so the UI can say "no
  * change" instead of showing a before/after pair that are simply equal.
  */
-function serialize(tx: TransactionRow) {
+function serialize(tx: TransactionRow, includeMetadata = false) {
   const type = tx.type;
   return {
     id: tx.id,
@@ -38,7 +39,7 @@ function serialize(tx: TransactionRow) {
     related_transaction_id: tx.relatedTransactionId,
     description: tx.description,
     created_at: tx.createdAt.toISOString(),
-    metadata: tx.metadata
+    ...(includeMetadata ? { metadata: tx.metadata } : {}),
   };
 }
 
@@ -52,7 +53,7 @@ transactionRoutes.get('/', async (req, res) => {
     take
   });
 
-  res.json({ status: true, data: transactions.map(serialize) });
+  res.json({ status: true, data: transactions.map((tx) => serialize(tx)) });
 });
 
 /**
@@ -112,5 +113,44 @@ transactionRoutes.get('/:id', async (req, res) => {
     where: { id: req.params.id, userId: req.user!.id }
   });
 
-  res.json(serialize(tx));
+  res.json(serialize(tx, true));
+});
+
+// Document bytes are deliberately fetched only when the customer opens or
+// reprints a record. History/list responses contain transaction metadata and
+// a lightweight document URL, never an embedded PDF or uploaded file.
+transactionRoutes.get('/:id/document', async (req, res) => {
+  const tx = await prisma.transaction.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+    select: { id: true, reference: true, metadata: true }
+  });
+  if (!tx) return res.status(404).json({ status: false, message: 'Transaction not found' });
+  const metadata = tx.metadata as Record<string, unknown> | null;
+  const pii = decryptTransactionPII(tx.metadata) ?? {};
+  const findArtifact = (keys: Set<string>) => {
+    const visit = (value: unknown, seen = new Set<object>()): string | null => {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || seen.has(value)) return null;
+      seen.add(value);
+      const record = value as Record<string, unknown>;
+      for (const [key, candidate] of Object.entries(record)) {
+        if (keys.has(key.toLowerCase()) && typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+      }
+      for (const child of Object.values(record)) {
+        const found = visit(child, seen);
+        if (found) return found;
+      }
+      return null;
+    };
+    return visit(pii);
+  };
+  const encoded = (typeof metadata?.pdf_base64 === 'string' && metadata.pdf_base64) || findArtifact(new Set(['pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64', 'publication_pdf_base64', 'submission_pdf_base64', 'file_base64']));
+  if (encoded) {
+    const base64 = encoded.replace(/^data:application\/pdf;base64,/i, '');
+    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
+    return res.send(Buffer.from(base64, 'base64'));
+  }
+  const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']));
+  if (externalUrl && !/^https:\/\//i.test(externalUrl)) return res.status(404).json({ status: false, message: 'No document is available for this transaction' });
+  if (externalUrl) return res.redirect(302, externalUrl);
+  return res.status(404).json({ status: false, message: 'No document is available for this transaction' });
 });

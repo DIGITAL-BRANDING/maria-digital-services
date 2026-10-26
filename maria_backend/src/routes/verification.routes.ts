@@ -1,6 +1,6 @@
 import { Router, type Request } from 'express';
 import { z } from 'zod';
-import { TransactionStatus, TransactionType } from '@prisma/client';
+import { TransactionType } from '@prisma/client';
 import { requireAuth } from '../middleware/auth.js';
 import { GEO_POLITICAL_ZONES, submitBvnLicense, type BvnLicenseInput } from '../services/bvn-license-onboarding.service.js';
 import { CAC_TYPES, listCacHistory, listCacPrices, submitCacRequest, type CacType, type CacApplicantDetails } from '../services/cac.service.js';
@@ -13,7 +13,6 @@ import {
   checkIpeClearanceStatus,
   checkNinValidationStatus,
   checkPersonalizationStatus,
-  decryptTransactionPII,
   listServiceTickets,
   listVerificationPrices,
   purchaseBvnSlip,
@@ -139,36 +138,6 @@ verificationRoutes.get('/bvn/license-onboarding/history', async (req, res) => {
 // opening that PDF to see who/what they verified. Deliberately a fixed,
 // named whitelist (never the raw provider payload) so a provider field we
 // don't recognise can't leak through unreviewed.
-function identityPreviewFor(pii: Record<string, unknown> | null) {
-  if (!pii) return null;
-  const userData =
-    pii.user_data && typeof pii.user_data === 'object' && !Array.isArray(pii.user_data)
-      ? (pii.user_data as Record<string, unknown>)
-      : null;
-  const pick = (...keys: string[]) => {
-    for (const source of [userData, pii]) {
-      if (!source) continue;
-      for (const key of keys) {
-        const value = source[key];
-        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
-      }
-    }
-    return null;
-  };
-  const firstName = pick('first_name', 'firstname', 'firstName');
-  const lastName = pick('last_name', 'lastname', 'surname', 'lastName');
-  const middleName = pick('middle_name', 'middlename', 'middleName');
-  const fullName = pick('full_name', 'fullname', 'name') ?? ([firstName, middleName, lastName].filter(Boolean).join(' ') || null);
-  const nin = pick('nin', 'nin_number', 'NIN');
-  const bvn = pick('bvn', 'bvn_number', 'BVN');
-  const phone = pick('phone_number', 'phone');
-  const gender = pick('gender');
-  const dob = pick('date_of_birth', 'dob');
-  const photo = pick('photo', 'photo_base64', 'image', 'image_base64', 'passport', 'passport_photo');
-  if (!fullName && !nin && !bvn && !phone && !dob && !photo) return null;
-  return { full_name: fullName, nin, bvn, phone, gender, dob, photo };
-}
-
 // A short, non-technical explanation for a failed/reversed request - the
 // actual provider error text isn't persisted (see purchaseSlip() in
 // verification.service.ts), so this is deliberately generic rather than
@@ -179,172 +148,91 @@ function friendlyOutcomeMessage(status: string): string | null {
   return null;
 }
 
-// Shared by both /history (one service, used inline on each verification
-// page) and /history/all (every service, used by the standalone "Slips
-// History" dashboard page) - keeps the pdf_base64/pdf_url extraction logic
-// in exactly one place instead of drifting between two copies.
-function toSlipHistoryEntry(transaction: {
-  reference: string;
-  status: string;
-  updatedAt: Date;
-  metadata: unknown;
-}) {
-  const metadata = transaction.metadata as Record<string, unknown> | null;
-  const pii = decryptTransactionPII(metadata);
-  // Older successful Techhub responses stored the provider payload under
-  // `user_data`, including its own `pdf_base64`.  Read that nested shape
-  // too, so an already-paid slip can be recovered without another call.
-  const userData = pii?.user_data as Record<string, unknown> | undefined;
-  const pdfBase64 =
-    // CAC completion stores the customer certificate under this key. Prefer
-    // it over the original submission form so “Document” means the actual
-    // completed certificate in the unified Service History too.
-    typeof pii?.certificate_pdf_base64 === 'string' && pii.certificate_pdf_base64.trim().length > 0
-      ? pii.certificate_pdf_base64
-      : typeof pii?.pdf_base64 === 'string' && pii.pdf_base64.trim().length > 0
-      ? pii.pdf_base64
-      : typeof userData?.pdf_base64 === 'string' && userData.pdf_base64.trim().length > 0
-        ? userData.pdf_base64
-        : null;
-  const pdfUrl =
-    typeof pii?.pdf_url === 'string' && pii.pdf_url.trim().length > 0
-      ? pii.pdf_url
-      : typeof userData?.pdf_url === 'string' && userData.pdf_url.trim().length > 0
-        ? userData.pdf_url
-        : typeof userData?.slip_url === 'string' && userData.slip_url.trim().length > 0
-          ? userData.slip_url
-          : null;
-  const status = transaction.status.toLowerCase();
+// Compact row returned by verification history lists. The document itself is
+// fetched from the owner-scoped transaction document endpoint only on demand.
+function toSlipHistoryEntry(transaction: { id: string; reference: string; status: string; updatedAt: Date; service: string | null; ticket_id?: string | null }) {
   return {
+    id: transaction.id,
     reference: transaction.reference,
-    status,
+    status: transaction.status.toLowerCase(),
     created_at: transaction.updatedAt.toISOString(),
-    service: typeof metadata?.service === 'string' ? metadata.service : null,
-    pdf_base64: pdfBase64,
-    pdf_url: pdfUrl,
-    ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
-    // Named, whitelisted identity preview (full name / NIN / BVN / phone /
-    // gender / DOB / photo) for the owner's own in-app preview - null when
-    // nothing recognisable is present (e.g. a still-pending request).
-    identity: identityPreviewFor(pii),
-    // Short human-readable explanation, only set for failed/reversed rows.
-    failure_message: friendlyOutcomeMessage(status)
+    service: transaction.service,
+    has_document: true,
+    document_url: `/transactions/${encodeURIComponent(transaction.id)}/document`,
+    ticket_id: transaction.ticket_id ?? null,
+    identity: null,
+    failure_message: null
   };
 }
 
 // A customer can retrieve a completed verification result for seven days.
-// Async requests are intentionally absent while PENDING: their window begins
-// when the transaction becomes SUCCESS, using updatedAt as the completion time.
 verificationRoutes.get('/history', async (req, res) => {
   const service = z.string().trim().min(1).max(60).parse(req.query.service);
   const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const transactions = await prisma.transaction.findMany({
-    where: {
-      userId: req.user!.id,
-      status: TransactionStatus.SUCCESS,
-      updatedAt: { gte: since },
-      type: {
-        in: [
-          TransactionType.NIN_VERIFICATION,
-          TransactionType.BVN_VERIFICATION,
-          TransactionType.IDENTITY_SERVICE_REQUEST
-        ]
-      }
-    },
-    orderBy: { updatedAt: 'desc' },
-    take: 50
-  });
-
-  const data = transactions
-    .filter((transaction) => {
-      const metadata = transaction.metadata as Record<string, unknown> | null;
-      return metadata?.service === service;
-    })
-    .slice(0, 10)
-    .map(toSlipHistoryEntry);
-
-  res.set('Cache-Control', 'no-store');
-  res.json({ status: true, data });
-});
-
-// Same SUCCESS-only, 7-day retrieval window as /history above, but across
-// every verification service at once instead of one at a time - backs the
-// standalone "Slips History" dashboard page (web/src/pages/SlipsHistoryPage.tsx),
-// which has no single `service` to filter by the way each dedicated
-// verification page does.
-verificationRoutes.get('/history/all', async (req, res) => {
-  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const transactions = await prisma.transaction.findMany({
-    where: {
-      userId: req.user!.id,
-      status: TransactionStatus.SUCCESS,
-      updatedAt: { gte: since },
-      type: {
-        in: [
-          TransactionType.NIN_VERIFICATION,
-          TransactionType.BVN_VERIFICATION,
-          TransactionType.IDENTITY_SERVICE_REQUEST
-        ]
-      }
-    },
-    orderBy: { updatedAt: 'desc' },
-    take: 50
-  });
-
+  const transactions = await prisma.$queryRaw<Array<{ id: string; reference: string; status: string; updatedAt: Date; service: string | null; ticket_id: string | null }>>`
+    SELECT "id", "reference", "status"::text AS "status", "updatedAt",
+      "metadata"->>'service' AS "service", "metadata"->>'ticket_id' AS "ticket_id"
+    FROM "Transaction"
+    WHERE "userId" = ${req.user!.id} AND "status"::text = 'SUCCESS'
+      AND "updatedAt" >= ${since}
+      AND "type"::text IN ('NIN_VERIFICATION','BVN_VERIFICATION','IDENTITY_SERVICE_REQUEST')
+      AND "metadata"->>'service' = ${service}
+    ORDER BY "updatedAt" DESC LIMIT 10
+  `;
   res.set('Cache-Control', 'no-store');
   res.json({ status: true, data: transactions.map(toSlipHistoryEntry) });
 });
 
-// One customer-facing register for every paid identity/business service.
-// Unlike the older slip-only view, this intentionally includes pending and
-// manual requests such as CAC, modifications, Birth Attestation and BVN CRM.
+verificationRoutes.get('/history/all', async (req, res) => {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const transactions = await prisma.$queryRaw<Array<{ id: string; reference: string; status: string; updatedAt: Date; service: string | null; ticket_id: string | null }>>`
+    SELECT "id", "reference", "status"::text AS "status", "updatedAt",
+      "metadata"->>'service' AS "service", "metadata"->>'ticket_id' AS "ticket_id"
+    FROM "Transaction"
+    WHERE "userId" = ${req.user!.id} AND "status"::text = 'SUCCESS'
+      AND "updatedAt" >= ${since}
+      AND "type"::text IN ('NIN_VERIFICATION','BVN_VERIFICATION','IDENTITY_SERVICE_REQUEST')
+    ORDER BY "updatedAt" DESC LIMIT 50
+  `;
+  res.set('Cache-Control', 'no-store');
+  res.json({ status: true, data: transactions.map(toSlipHistoryEntry) });
+});
 verificationRoutes.get('/service-history', async (req, res) => {
-  const transactions = await prisma.transaction.findMany({
-    // Do not send the enum list to Postgres. Some live databases are still
-    // awaiting newer enum migrations (e.g. BVN_MODIFICATION); putting such
-    // a value in an SQL IN clause makes the whole history page fail.
-    where: { userId: req.user!.id },
-    orderBy: { createdAt: 'desc' },
-    take: 100
-  });
-  const serviceTypes = new Set([
-    'NIN_VERIFICATION', 'BVN_VERIFICATION', 'IDENTITY_SERVICE_REQUEST',
-    'NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST',
-    'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM', 'TIN_CERTIFICATE_REQUEST'
-  ]);
-  const data = transactions.filter((tx) => serviceTypes.has(tx.type)).map((tx) => {
-    const metadata = tx.metadata as Record<string, unknown> | null;
-    // Re-use the safe document extraction used by the verification-slip
-    // history.  These values are only returned for the authenticated owner
-    // of the transaction, and allow a successful request to be reopened or
-    // downloaded from the unified service history as well.
-    const slip = toSlipHistoryEntry(tx);
+  // Project only public history fields. PII may contain multi-megabyte files,
+  // so the list query deliberately never loads the sealed PII blob.
+  const transactions = await prisma.$queryRaw<Array<{
+    id: string; reference: string; status: string; type: string; service: string | null;
+    description: string; amountKobo: bigint; createdAt: Date; updatedAt: Date;
+    progress_notes: string | null; ticket_id: string | null;
+  }>>`
+    SELECT "id", "reference", "status"::text AS "status", "type"::text AS "type",
+      "metadata"->>'service' AS "service", "description", "amountKobo", "createdAt", "updatedAt",
+      "metadata"->>'progress_notes' AS "progress_notes", "metadata"->>'ticket_id' AS "ticket_id"
+    FROM "Transaction"
+    WHERE "userId" = ${req.user!.id}
+      AND "type"::text IN ('DATA_PURCHASE','AIRTIME_PURCHASE','ELECTRICITY_PURCHASE','CABLE_PURCHASE',
+        'RESULT_PIN','SMS','WITHDRAWAL','NIN_VERIFICATION','BVN_VERIFICATION','IDENTITY_SERVICE_REQUEST',
+        'NIN_MODIFICATION','BVN_LICENSE_ONBOARDING','CAC_SERVICE_REQUEST','BVN_MODIFICATION',
+        'BIRTH_ATTESTATION','NEWSPAPER_PUBLICATION','BVN_CRM','TIN_CERTIFICATE_REQUEST')
+    ORDER BY "createdAt" DESC
+    LIMIT 100
+  `;
+  const downloadableTypes = new Set(['NIN_VERIFICATION', 'BVN_VERIFICATION', 'IDENTITY_SERVICE_REQUEST', 'NIN_MODIFICATION', 'BVN_LICENSE_ONBOARDING', 'CAC_SERVICE_REQUEST', 'BVN_MODIFICATION', 'BIRTH_ATTESTATION', 'NEWSPAPER_PUBLICATION', 'BVN_CRM', 'TIN_CERTIFICATE_REQUEST']);
+  const data = transactions.map((tx) => {
+    const status = tx.status.toLowerCase();
+    const hasDocument = status === 'success' && downloadableTypes.has(tx.type);
     return {
-      id: tx.id,
-      reference: tx.reference,
-      status: tx.status.toLowerCase(),
-      type: tx.type,
-      service: typeof metadata?.service === 'string' ? metadata.service : null,
-      description: tx.description,
-      amount: Number(tx.amountKobo) / 100,
-      created_at: tx.createdAt.toISOString(),
-      updated_at: tx.updatedAt.toISOString(),
-      progress_notes: typeof metadata?.progress_notes === 'string' ? metadata.progress_notes : null,
-      ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
-      pdf_base64: slip.pdf_base64,
-      pdf_url: slip.pdf_url,
-      // Owner-only identity preview + friendly outcome text - see
-      // identityPreviewFor()/friendlyOutcomeMessage() above toSlipHistoryEntry.
-      identity: slip.identity,
-      failure_message: slip.failure_message
+      id: tx.id, reference: tx.reference, status, type: tx.type, service: tx.service,
+      description: tx.description, amount: Number(tx.amountKobo) / 100,
+      created_at: tx.createdAt.toISOString(), updated_at: tx.updatedAt.toISOString(),
+      progress_notes: tx.progress_notes, ticket_id: tx.ticket_id, has_document: hasDocument,
+      document_url: hasDocument ? `/transactions/${encodeURIComponent(tx.id)}/document` : null,
+      identity: null, failure_message: friendlyOutcomeMessage(status)
     };
   });
   res.set('Cache-Control', 'no-store');
   res.json({ status: true, data });
 });
-
-// ── Slip lookups (synchronous) ────────────────────────────────────
-
 verificationRoutes.post('/nin/by-nin', async (req, res) => {
   const body = z.object({ nin: z.string().trim().length(11), tier: ninSlipTier, ...pinField }).parse(req.body);
   await requirePinConfirmation(req.user!.id, body.pin);

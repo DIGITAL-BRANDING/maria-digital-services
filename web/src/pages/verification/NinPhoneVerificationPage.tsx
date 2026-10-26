@@ -15,6 +15,7 @@ import {
   money,
   FORM_SECTION_CLASSES,
   FORM_INPUT_CLASSES,
+  FORM_LABEL_CLASSES,
   FORM_HELP_CLASSES,
   PHONE_TIERS,
   PHONE_TIER_LABELS,
@@ -26,7 +27,7 @@ import {
   type SlipResult,
 } from '../../components/verification/shared';
 
-type Method = 'nin' | 'phone';
+type Method = 'nin' | 'phone' | 'demographic';
 const NIN_TIERS = ['information', 'regular', 'standard', 'premium', 'vnin'] as const;
 type NinTier = (typeof NIN_TIERS)[number];
 
@@ -50,12 +51,8 @@ const NIN_TIER_IMAGE: Record<NinTier, string> = {
   vnin: '/branding/Vnin slip.jpg',
 };
 
-// "Information Slip" isn't wired up on Techhub's side yet (see
-// maria_backend/src/services/techhub.service.ts — TechhubSlipTier only
-// has premium/standard/regular/vnin). It renders here so the page matches
-// the reference design, but stays disabled and un-priced until the backend
-// adds that tier.
-const NIN_KEY: Record<Exclude<NinTier, 'information'>, string> = {
+const NIN_KEY: Record<NinTier, string> = {
+  information: 'NIN_DEMOGRAPHIC',
   regular: 'NIN_SLIP_REGULAR',
   standard: 'NIN_SLIP_STANDARD',
   premium: 'NIN_SLIP_PREMIUM',
@@ -66,6 +63,10 @@ export default function NinPhoneVerificationPage() {
   const { prices } = useVerificationPrices();
   const [method, setMethod] = useState<Method>('nin');
   const [idValue, setIdValue] = useState('');
+  const [firstname, setFirstname] = useState('');
+  const [lastname, setLastname] = useState('');
+  const [gender, setGender] = useState<'' | 'MALE' | 'FEMALE'>('');
+  const [dob, setDob] = useState('');
   const [ninTier, setNinTier] = useState<NinTier>('premium');
   const [phoneTier, setPhoneTier] = useState<PhoneTier>('premium');
   const [consent, setConsent] = useState(false);
@@ -74,14 +75,19 @@ export default function NinPhoneVerificationPage() {
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
 
-  const serviceKey = method === 'nin' ? (ninTier === 'information' ? '' : NIN_KEY[ninTier]) : PHONE_KEY[phoneTier];
+  const demographicLookup = method === 'demographic' || (method === 'nin' && ninTier === 'information');
+  const serviceKey = method === 'phone' ? PHONE_KEY[phoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
   const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
   const price = useMemo(() => (serviceKey ? prices[serviceKey] : undefined), [serviceKey, prices]);
 
   function prepare(event: FormEvent) {
     event.preventDefault();
-    if (method === 'nin' && ninTier === 'information') {
-      setMessage('The Information Slip is not available yet — please pick another slip type.');
+    if (demographicLookup && (!firstname.trim() || !lastname.trim() || !dob.trim() || !gender)) {
+      setMessage('Enter first name, last name, gender, and date of birth to retrieve the Information Slip.');
+      return;
+    }
+    if (!demographicLookup && idValue.trim().length !== 11) {
+      setMessage(method === 'phone' ? 'Enter an 11-digit phone number.' : 'Enter your 11-digit NIN.');
       return;
     }
     setShowPin(true);
@@ -92,8 +98,10 @@ export default function NinPhoneVerificationPage() {
     setBusy(true);
     setMessage('');
     try {
-      const path = method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
-      const body = method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: phoneTier, pin };
+      const path = demographicLookup ? '/verification/nin/by-demographic' : method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
+      const body = demographicLookup
+        ? { firstname, lastname, gender, dob, pin }
+        : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: phoneTier, pin };
       const result = await api.post<{
         status: boolean;
         message: string;
@@ -125,22 +133,30 @@ export default function NinPhoneVerificationPage() {
                 <label className="flex items-center gap-2">
                   <input type="radio" checked={method === 'phone'} onChange={() => { setMethod('phone'); setIdValue(''); setMessage(''); }} /> Phone No
                 </label>
+                <label className="flex items-center gap-2">
+                  <input type="radio" checked={method === 'demographic'} onChange={() => { setMethod('demographic'); setIdValue(''); setMessage(''); }} /> NIN By Demography
+                </label>
               </div>
 
-              <StepLabel n={2}>Supply ID Number</StepLabel>
-              <input
-                required
-                inputMode="numeric"
-                maxLength={11}
-                placeholder={method === 'nin' ? 'Enter NIN' : 'Enter Phone Number'}
-                className={`mt-3 ${FORM_INPUT_CLASSES}`}
-                value={idValue}
-                onChange={(e) => setIdValue(e.target.value)}
-              />
-              <p className={`mt-1 ${FORM_HELP_CLASSES}`}>
-                {method === 'nin' ? 'Enter your 11-digit NIN (e.g., 12345678901)' : 'Enter your 11-digit phone number starting with 0 (e.g., 08012345678)'}
-              </p>
+              {demographicLookup ? (
+                <>
+                  <StepLabel n={2}>Enter Demographic Details</StepLabel>
+                  <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                    <label className={FORM_LABEL_CLASSES}>First Name<input required placeholder="Enter first name" className={`mt-1 ${FORM_INPUT_CLASSES}`} value={firstname} onChange={(e) => setFirstname(e.target.value)} /></label>
+                    <label className={FORM_LABEL_CLASSES}>Last Name<input required placeholder="Enter last name" className={`mt-1 ${FORM_INPUT_CLASSES}`} value={lastname} onChange={(e) => setLastname(e.target.value)} /></label>
+                    <label className={FORM_LABEL_CLASSES}>Gender<select required className={`mt-1 ${FORM_INPUT_CLASSES}`} value={gender} onChange={(e) => setGender(e.target.value as '' | 'MALE' | 'FEMALE')}><option value="">Select gender</option><option value="MALE">Male</option><option value="FEMALE">Female</option></select></label>
+                    <label className={FORM_LABEL_CLASSES}>Date of Birth<input required placeholder="DD-MM-YYYY (e.g. 25-12-1990)" maxLength={10} className={`mt-1 ${FORM_INPUT_CLASSES}`} value={dob} onChange={(e) => setDob(e.target.value)} /><span className={`mt-1 block ${FORM_HELP_CLASSES}`}>Format: DD-MM-YYYY</span></label>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <StepLabel n={2}>Supply ID Number</StepLabel>
+                  <input required inputMode="numeric" maxLength={11} placeholder={method === 'nin' ? 'Enter NIN' : 'Enter Phone Number'} className={`mt-3 ${FORM_INPUT_CLASSES}`} value={idValue} onChange={(e) => setIdValue(e.target.value)} />
+                  <p className={`mt-1 ${FORM_HELP_CLASSES}`}>{method === 'nin' ? 'Enter your 11-digit NIN (e.g., 12345678901)' : 'Enter your 11-digit phone number starting with 0 (e.g., 08012345678)'}</p>
+                </>
+              )}
 
+              {(method === 'nin' || method === 'phone') && <>
               <StepLabel n={3}>Select Your Preferred Slip Type</StepLabel>
               <div className="mt-3">
                 {method === 'nin' ? (
@@ -149,10 +165,9 @@ export default function NinPhoneVerificationPage() {
                     labels={NIN_TIER_LABELS}
                     value={ninTier}
                     onChange={setNinTier}
-                    priceFor={(t) => (t === 'information' ? undefined : prices[NIN_KEY[t]])}
+                    priceFor={(t) => prices[NIN_KEY[t]]}
                     iconFor={(t) => NIN_TIER_ICON[t]}
                     imageFor={(t) => NIN_TIER_IMAGE[t]}
-                    disabledFor={(t) => t === 'information'}
                   />
                 ) : (
                   <TierCardGrid
@@ -166,6 +181,7 @@ export default function NinPhoneVerificationPage() {
                   />
                 )}
               </div>
+              </>}
 
               <ConsentCheckbox checked={consent} onChange={setConsent} />
 

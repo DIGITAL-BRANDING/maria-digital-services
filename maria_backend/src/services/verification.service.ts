@@ -893,6 +893,7 @@ export async function checkIpeClearanceStatus(params: { userId: string; ticketId
 }
 
 export type ServiceTicketEntry = {
+  transaction_id: string;
   reference: string;
   /** The VerificationServiceKey this request was submitted under - lets a combined
    * table (e.g. Validation's four detail types in one list) label each row correctly. */
@@ -904,8 +905,7 @@ export type ServiceTicketEntry = {
   tracking_id: string | null;
   nin: string | null;
   email: string | null;
-  pdf_base64: string | null;
-  pdf_url: string | null;
+  has_document: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -975,6 +975,7 @@ export async function listServiceTickets(userId: string, services: string | stri
       const metadata = transaction.metadata as Record<string, unknown> | null;
       const pii = openPII<Record<string, unknown> & { tracking_id?: string; nin?: string; email?: string }>(metadata?.pii);
       return {
+        transaction_id: transaction.id,
         reference: transaction.reference,
         service: String(metadata?.service ?? ''),
         ticket_id: typeof metadata?.ticket_id === 'string' ? metadata.ticket_id : null,
@@ -984,8 +985,7 @@ export async function listServiceTickets(userId: string, services: string | stri
         tracking_id: typeof pii?.tracking_id === 'string' ? pii.tracking_id : null,
         nin: typeof pii?.nin === 'string' ? pii.nin : null,
         email: typeof pii?.email === 'string' ? pii.email : null,
-        pdf_base64: asyncArtifact(pii, ['pdf_base64', 'certificate_pdf_base64', 'file_base64']),
-        pdf_url: asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']),
+        has_document: Boolean(asyncArtifact(pii, ['pdf_base64', 'certificate_pdf_base64', 'file_base64']) || asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url'])),
         created_at: transaction.createdAt.toISOString(),
         updated_at: transaction.updatedAt.toISOString()
       };

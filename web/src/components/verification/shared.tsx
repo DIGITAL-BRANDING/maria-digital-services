@@ -8,11 +8,12 @@ export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: str
 export type AsyncResult = { ticket_id: string; reference: string };
 export type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
 export type VerificationHistory = {
+  id: string;
   reference: string;
   status: string;
   created_at: string;
-  pdf_base64: string | null;
-  pdf_url: string | null;
+  has_document: boolean;
+  document_url: string | null;
   ticket_id: string | null;
 };
 
@@ -456,6 +457,16 @@ export function AsyncResultView({
 }
 
 export function VerificationHistoryView({ history, loading }: { history: VerificationHistory[]; loading: boolean }) {
+  const openDocument = async (entry: VerificationHistory) => {
+    const tab = window.open('', '_blank');
+    try {
+      const blob = await api.document(`/transactions/${encodeURIComponent(entry.id)}/document`);
+      if (tab) tab.location.href = URL.createObjectURL(blob);
+    } catch (error) {
+      tab?.close();
+      window.alert(error instanceof Error ? error.message : 'Could not open document');
+    }
+  };
   return (
     <section className="mt-8 border-t border-blue-100 pt-5">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -469,18 +480,16 @@ export function VerificationHistoryView({ history, loading }: { history: Verific
       ) : (
         <div className="mt-3 divide-y divide-blue-100 overflow-hidden rounded-xl border border-blue-100 bg-blue-50">
           {history.map((entry) => {
-            const base64 = entry.pdf_base64?.replace(/^data:application\/pdf;base64,/i, '');
-            const href = base64 ? `data:application/pdf;base64,${base64}` : entry.pdf_url?.startsWith('https://') ? entry.pdf_url : null;
             return (
               <div key={entry.reference} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
                 <div className="min-w-0">
                   <p className="break-all font-mono text-xs font-semibold text-[#0b2f73]">{entry.reference}</p>
                   <p className="mt-1 font-body text-xs text-[#0b2f73]/70">{new Date(entry.created_at).toLocaleString()}</p>
                 </div>
-                {href ? (
-                  <a href={href} download={`${entry.reference}.pdf`} target={base64 ? undefined : '_blank'} rel={base64 ? undefined : 'noreferrer'} className="flex shrink-0 items-center gap-2 rounded-lg bg-gold-500 px-3 py-2 font-body text-xs font-bold text-ink">
+                {entry.has_document ? (
+                  <button onClick={() => void openDocument(entry)} className="flex shrink-0 items-center gap-2 rounded-lg bg-gold-500 px-3 py-2 font-body text-xs font-bold text-ink">
                     <Download size={14} /> Retrieve PDF
-                  </a>
+                  </button>
                 ) : (
                   <span className="shrink-0 font-body text-xs font-semibold capitalize text-[#0b2f73]/70">{entry.status}</span>
                 )}
@@ -528,6 +537,7 @@ export function ConsentCheckbox({ checked, onChange }: { checked: boolean; onCha
 // and includes every status - PENDING requests are the whole point of a
 // "Check Status" tracking table like the reference screenshots show.
 export type ServiceTicket = {
+  transaction_id: string;
   reference: string;
   /** The VerificationServiceKey this ticket belongs to - lets a combined table (several service keys in one list) label each row. */
   service: string;
@@ -538,8 +548,7 @@ export type ServiceTicket = {
   tracking_id: string | null;
   nin: string | null;
   email: string | null;
-  pdf_base64: string | null;
-  pdf_url: string | null;
+  has_document: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -620,6 +629,16 @@ export function TicketTrackingTable({
   searchPlaceholder?: string;
   emptyMessage?: string;
 }) {
+  const openDocument = async (ticket: ServiceTicket) => {
+    const tab = window.open('', '_blank');
+    try {
+      const blob = await api.document(`/transactions/${encodeURIComponent(ticket.transaction_id)}/document`);
+      if (tab) tab.location.href = URL.createObjectURL(blob);
+    } catch (error) {
+      tab?.close();
+      window.alert(error instanceof Error ? error.message : 'Could not open document');
+    }
+  };
   const q = search.trim().toLowerCase();
   const filtered = tickets.filter((t) => {
     if (!q) return true;
@@ -681,15 +700,7 @@ export function TicketTrackingTable({
                     <StatusBadge status={t.status} />
                   </td>
                   <td className="whitespace-nowrap px-3 py-2">
-                    {(() => {
-                      const base64 = t.pdf_base64?.replace(/^data:application\/pdf;base64,/i, '');
-                      const href = base64 ? `data:application/pdf;base64,${base64}` : t.pdf_url?.startsWith('https://') ? t.pdf_url : null;
-                      return href ? (
-                        <a href={href} download={`${t.reference}.pdf`} target={base64 ? undefined : '_blank'} rel={base64 ? undefined : 'noreferrer'} className="rounded-lg bg-gold-500 px-2 py-1.5 font-bold text-ink">
-                          <Download size={12} className="mr-1 inline" /> Download
-                        </a>
-                      ) : <span className="text-[#0b2f73]/40">—</span>;
-                    })()}
+                    {t.has_document ? <button onClick={() => void openDocument(t)} className="rounded-lg bg-gold-500 px-2 py-1.5 font-bold text-ink"><Download size={12} className="mr-1 inline" /> Download</button> : <span className="text-[#0b2f73]/40">—</span>}
                   </td>
                   <td className="whitespace-nowrap px-3 py-2 text-[#0b2f73]/70">{new Date(t.created_at).toLocaleDateString()}</td>
                 </tr>
