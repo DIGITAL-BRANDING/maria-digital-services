@@ -52,6 +52,7 @@ const ninValidationType = z.enum([
 function slipResponse(result: Awaited<ReturnType<typeof purchaseNinByNin>>) {
   return {
     status: result.status,
+    pending: result.pending ?? false,
     message: result.message,
     data: {
       reference: result.reference,

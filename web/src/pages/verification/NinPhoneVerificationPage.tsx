@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react';
+import { useMemo, useRef, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
 import { api, ApiError } from '../../lib/api';
@@ -74,6 +74,7 @@ export default function NinPhoneVerificationPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
+  const idempotencyKey = useRef<string | null>(null);
 
   const demographicLookup = method === 'demographic';
   const phoneTiers = useMemo(() => PHONE_TIERS.filter((tier) => {
@@ -107,6 +108,7 @@ export default function NinPhoneVerificationPage() {
     setShowPin(false);
     setBusy(true);
     setMessage('');
+    idempotencyKey.current ??= crypto.randomUUID();
     try {
       const path = demographicLookup ? '/verification/nin/by-demographic' : method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
       const body = demographicLookup
@@ -114,13 +116,20 @@ export default function NinPhoneVerificationPage() {
         : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
       const result = await api.post<{
         status: boolean;
+        pending?: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>(path, body, true, 60_000);
+      }>(path, body, true, 60_000, idempotencyKey.current);
+      if (result.pending) {
+        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'check your transaction history'}. Please do not submit this request again yet.`);
+        return;
+      }
+      idempotencyKey.current = null;
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');
     } catch (error) {
+      // Keep the idempotency key after a browser/network timeout to prevent a duplicate provider call.
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);

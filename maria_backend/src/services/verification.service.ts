@@ -210,6 +210,7 @@ export async function listVerificationPricesForAdmin() {
 
 export type SlipPurchaseResult = {
   status: boolean;
+  pending?: boolean;
   message: string;
   reference: string;
   userData?: Record<string, unknown>;
@@ -283,6 +284,16 @@ async function purchaseSlip(params: {
     };
   }
 
+  if (debit.reused && debit.transaction.status === TransactionStatus.PENDING) {
+    return {
+      status: false,
+      pending: true,
+      message: 'This request is still being checked. Review transaction history before trying again.',
+      reference: debit.reference,
+      balanceAfter: koboToNaira(debit.transaction.balanceAfterKobo)
+    };
+  }
+
   const provider = await params.call(debit.reference);
 
   if (provider.ok) {
@@ -327,6 +338,32 @@ async function purchaseSlip(params: {
       pdfBase64: provider.pdfBase64,
       pdfUrl: provider.pdfUrl,
       downloadToken: provider.downloadToken,
+      balanceAfter: debit.balanceAfter
+    };
+  }
+
+  if (provider.ambiguous) {
+    // Hubbu may have fulfilled the request despite a timeout, malformed
+    // response, or dropped connection. Keep it pending for reconciliation;
+    // refunding could give the customer both the slip and their money back.
+    await prisma.transaction.update({
+      where: { id: debit.transaction.id },
+      data: {
+        provider: params.provider,
+        metadata: {
+          service: params.service,
+          ...params.operational,
+          unit_price: price.unitPrice,
+          provider_outcome: 'unknown',
+          pii: sealPII(params.pii)
+        } as Prisma.InputJsonValue
+      }
+    });
+    return {
+      status: false,
+      pending: true,
+      message: provider.message,
+      reference: debit.reference,
       balanceAfter: debit.balanceAfter
     };
   }

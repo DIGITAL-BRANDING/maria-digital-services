@@ -34,15 +34,16 @@ export class ApiError extends Error {
 
 async function request<T>(
   path: string,
-  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number } = {}
+  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number; idempotencyKey?: string } = {}
 ): Promise<T> {
-  const { method = 'GET', body, auth = true, timeoutMs = 20_000 } = options;
+  const { method = 'GET', body, auth = true, timeoutMs = 20_000, idempotencyKey } = options;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (auth) {
     const token = getAccessToken();
     if (token) headers.Authorization = `Bearer ${token}`;
   }
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
   const res = await fetch(`${API_BASE}/api${path}`, {
     method,
@@ -70,8 +71,8 @@ async function request<T>(
 
 export const api = {
   get: <T>(path: string, auth = true) => request<T>(path, { method: 'GET', auth }),
-  post: <T>(path: string, body?: unknown, auth = true, timeoutMs = 20_000) =>
-    request<T>(path, { method: 'POST', body, auth, timeoutMs }),
+  post: <T>(path: string, body?: unknown, auth = true, timeoutMs = 20_000, idempotencyKey?: string) =>
+    request<T>(path, { method: 'POST', body, auth, timeoutMs, idempotencyKey }),
   document: async (path: string) => {
     const token = getAccessToken();
     const res = await fetch(`${API_BASE}/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(30_000) });

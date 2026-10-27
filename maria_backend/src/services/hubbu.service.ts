@@ -14,6 +14,12 @@ type HubbuResponse = {
   };
 };
 
+function asRecord(value: unknown): HubbuResponse | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as HubbuResponse
+    : undefined;
+}
+
 function configured() {
   if (!env.HUBBU_API_KEY) throw new ApiError(503, 'Hubbu verification provider is not configured.', 'PROVIDER_NOT_CONFIGURED');
 }
@@ -31,6 +37,7 @@ async function post(
     reference: context.reference,
     fields: requestFields
   });
+  const startedAt = Date.now();
   let response: Response;
   try {
     response = await fetch(`${env.HUBBU_BASE_URL.replace(/\/$/, '')}${path}`, {
@@ -40,14 +47,25 @@ async function post(
       signal: AbortSignal.timeout(45_000)
     });
   } catch (error) {
-    console.error('[hubbu] network request failed', { path, method: context.method ?? body.method, reference: context.reference, error });
-    return { ok: false, message: 'The verification service could not process this request right now.', raw: null };
+    console.error('[hubbu] network request failed', { path, method: context.method ?? body.method, reference: context.reference, elapsedMs: Date.now() - startedAt, error });
+    return { ok: false, ambiguous: true, message: 'Hubbu may have completed this request, but our server did not receive its response. Check your transaction history before trying again.', raw: null };
   }
-  let payload: HubbuResponse;
-  try { payload = await response.json() as HubbuResponse; }
+  let rawPayload: unknown;
+  try { rawPayload = await response.json(); }
   catch {
-    console.error('[hubbu] invalid JSON response', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status });
-    return { ok: false, message: 'The verification provider returned an invalid response.', raw: null };
+    console.error('[hubbu] invalid JSON response', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
+    const ambiguous = response.ok;
+    return { ok: false, ambiguous, message: ambiguous
+      ? 'Hubbu may have completed this request, but returned an unreadable response. Check your transaction history before trying again.'
+      : 'The verification provider returned an invalid response.', raw: null };
+  }
+  const payload = asRecord(rawPayload);
+  if (!payload) {
+    const ambiguous = response.ok;
+    console.error('[hubbu] unexpected response body', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, bodyType: rawPayload === null ? 'null' : Array.isArray(rawPayload) ? 'array' : typeof rawPayload, elapsedMs: Date.now() - startedAt });
+    return { ok: false, ambiguous, message: ambiguous
+      ? 'Hubbu may have completed this request, but returned an empty or unexpected response. Check your transaction history before trying again.'
+      : 'The verification provider returned an invalid response.', raw: rawPayload };
   }
   const data = payload.data ?? {};
   const providerSucceeded = payload.status === true || (typeof payload.status === 'string' && payload.status.toLowerCase() === 'success');
@@ -58,6 +76,7 @@ async function post(
     method: context.method ?? (typeof body.method === 'string' ? body.method : undefined),
     reference: context.reference,
     httpStatus: response.status,
+    elapsedMs: Date.now() - startedAt,
     providerStatus: payload.status,
     providerCode: payload.code,
     ok,

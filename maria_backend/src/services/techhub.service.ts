@@ -76,6 +76,8 @@ type TechhubAsyncStatusResponse = {
 export type TechhubSlipResult = {
   ok: boolean;
   message: string;
+  /** The upstream may have completed the request even though no usable response arrived. */
+  ambiguous?: boolean;
   userData?: Record<string, unknown>;
   pdfBase64?: string;
   pdfUrl?: string;
