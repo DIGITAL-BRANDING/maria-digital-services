@@ -191,7 +191,8 @@ export class KtechService {
           'X-API-Key': this.apiKey(),
           'Idempotency-Key': idempotencyKey
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45_000)
       });
     } catch (error) {
       console.error(`[ktech] network error calling ${path}:`, error);

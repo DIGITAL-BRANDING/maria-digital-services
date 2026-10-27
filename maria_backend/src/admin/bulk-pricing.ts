@@ -39,6 +39,29 @@ function field(req: Request, name: string): string {
   return typeof v === 'string' ? v : '';
 }
 
+type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
+const VERIFICATION_PROVIDER_GROUPS: Array<{
+  key: string;
+  label: string;
+  services: string[];
+  providers: IdentityProvider[];
+  fixedProvider?: IdentityProvider;
+}> = [
+  { key: 'nin_by_nin', label: 'NIN slips by NIN', services: ['NIN_SLIP_PREMIUM', 'NIN_SLIP_STANDARD', 'NIN_SLIP_REGULAR', 'NIN_SLIP_VNIN'], providers: ['techhub', 'ktech', 'hubbu'] },
+  { key: 'nin_by_phone', label: 'NIN slips by phone', services: ['NIN_PHONE_SLIP_PREMIUM', 'NIN_PHONE_SLIP_STANDARD', 'NIN_PHONE_SLIP_REGULAR'], providers: ['techhub', 'ktech', 'hubbu'] },
+  { key: 'nin_phone_vnin', label: 'NIN V-NIN slip by phone', services: ['NIN_PHONE_SLIP_VNIN'], providers: ['hubbu'], fixedProvider: 'hubbu' },
+  { key: 'nin_personal_info', label: 'NIN Personal Information slips', services: ['NIN_SLIP_INFORMATION', 'NIN_PHONE_SLIP_INFORMATION'], providers: ['ktech'], fixedProvider: 'ktech' },
+  { key: 'nin_demographic', label: 'NIN by demography', services: ['NIN_DEMOGRAPHIC'], providers: ['techhub', 'hubbu'] },
+  { key: 'bvn_slips', label: 'BVN slips', services: ['BVN_SLIP_PREMIUM', 'BVN_SLIP_STANDARD'], providers: ['techhub', 'ktech', 'hubbu'] },
+  { key: 'nin_async', label: 'NIN validation and async services', services: [
+    'NIN_VALIDATION_GENERAL', 'NIN_VALIDATION_NO_RECORD', 'NIN_VALIDATION_SIM', 'NIN_VALIDATION_BANK',
+    'NIN_VALIDATION_UPDATE_RECORDS', 'NIN_VALIDATION_MODIFICATION', 'NIN_VALIDATION_PHOTO_ERROR',
+    'NIN_VALIDATION_VNIN', 'NIN_PERSONALIZATION', 'IPE_CLEARANCE'
+  ], providers: ['techhub', 'ktech'] }
+];
+
+const PROVIDER_LABEL: Record<IdentityProvider, string> = { techhub: 'Techhub', ktech: 'K-Tech', hubbu: 'Hubbu' };
+
 /**
  * A single page for bulk-repricing everything, instead of an admin hand-
  * editing sellingPriceKobo on ~250+ DataPlanPricing rows one at a time
@@ -229,6 +252,55 @@ export function registerBulkPricingRoutes(router: Router) {
     }
   });
 
+  router.post('/bulk-pricing/verification-providers', async (req, res) => {
+    const admin = requireFinanceOrSuper(req);
+    if (!admin) return res.redirect('/admin/login');
+
+    let unsupportedProvider = false;
+    const updates = VERIFICATION_PROVIDER_GROUPS.flatMap((group) => {
+      if (group.fixedProvider) return [{ group, provider: group.fixedProvider }];
+      const value = field(req, `groupProvider_${group.key}`);
+      if (!value || value === 'mixed') return [];
+      if (!group.providers.includes(value as IdentityProvider)) {
+        unsupportedProvider = true;
+        return [];
+      }
+      return [{ group, provider: value as IdentityProvider }];
+    });
+    if (unsupportedProvider) {
+      return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'A provider is not supported for one of the selected service groups. No provider was changed.'));
+    }
+    if (updates.length === 0) {
+      return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Choose a provider for at least one service group.'));
+    }
+
+    try {
+      await listVerificationPricesForAdmin();
+      const updated = await prisma.$transaction(async (tx) => {
+        const counts: Record<string, number> = {};
+        for (const { group, provider } of updates) {
+          const result = await tx.servicePricing.updateMany({
+            where: { service: { in: group.services } },
+            data: { provider }
+          });
+          counts[group.key] = result.count;
+        }
+        return counts;
+      }, { maxWait: 10_000, timeout: 120_000 });
+      await logAdminAction({
+        adminId: admin.id,
+        action: 'UPDATE_VERIFICATION_PROVIDER_GROUPS',
+        targetType: 'ServicePricing',
+        metadata: { groups: updates.map(({ group, provider }) => ({ group: group.key, provider, updated: updated[group.key] })) }
+      });
+      const summary = updates.map(({ group, provider }) => `${group.label}: ${PROVIDER_LABEL[provider]} (${updated[group.key]})`).join(', ');
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Provider groups saved — ${summary}.`));
+    } catch (error) {
+      console.error('[bulk-pricing] verification provider groups failed:', error);
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Provider groups were not changed. Check the server logs.'));
+    }
+  });
+
   router.post('/bulk-pricing/service-prices', async (req, res) => {
     const admin = requireFinanceOrSuper(req);
     if (!admin) return res.redirect('/admin/login');
@@ -249,18 +321,9 @@ export function registerBulkPricingRoutes(router: Router) {
       if (existing.length !== serviceIds.length) {
         return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Some selected services were not found. Refresh the page and try again.'));
       }
-      const invalidVninRoute = existing.some((row) => row.service === 'NIN_PHONE_SLIP_VNIN' && field(req, `provider_${row.id}`) !== 'hubbu');
-      if (invalidVninRoute) {
-        return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'NIN by Phone V-NIN is supported only by Hubbu.'));
-      }
       await prisma.$transaction(async (tx) => {
         for (const { id, price } of prices) {
-          const providerRaw = field(req, `provider_${id}`);
-          const row = existing.find((item) => item.id === id)!;
-          const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
-          const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
-          const provider = row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : providerRaw === 'ktech' && ktechSupported ? 'ktech' : providerRaw === 'hubbu' && hubbuSupported ? 'hubbu' : 'techhub';
-          await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)), provider } });
+          await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)) } });
         }
       }, { maxWait: 10_000, timeout: 120_000 });
       await logAdminAction({
@@ -335,9 +398,19 @@ function renderPage(params: {
     }
     const sellingPrice = row.sellingPriceKobo === null ? '' : (Number(row.sellingPriceKobo) / 100).toFixed(2);
     const infoOnly = row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION';
-    const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
-    const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|INFORMATION)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
-    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td><select name="provider_${escape(row.id)}"><option value="techhub" ${row.provider === 'techhub' && !infoOnly ? 'selected' : ''} ${infoOnly ? 'disabled' : ''}>Techhub</option><option value="ktech" ${row.provider === 'ktech' || infoOnly ? 'selected' : ''} ${ktechSupported ? '' : 'disabled'}>K-Tech${ktechSupported ? '' : ' (unsupported)'}</option><option value="hubbu" ${row.provider === 'hubbu' ? 'selected' : ''} ${hubbuSupported ? '' : 'disabled'}>Hubbu${hubbuSupported ? '' : ' (unsupported)'}</option></select><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
+    const currentProvider = infoOnly ? 'ktech' : row.service === 'NIN_PHONE_SLIP_VNIN' ? 'hubbu' : row.provider as IdentityProvider;
+    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td>${escape(PROVIDER_LABEL[currentProvider] ?? currentProvider)}<br><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
+  }).join('');
+
+  const verificationProviderRows = VERIFICATION_PROVIDER_GROUPS.map((group) => {
+    const groupRows = servicePrices.filter((row) => group.services.includes(row.service));
+    const currentProviders = [...new Set(groupRows.map((row) => row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : row.service === 'NIN_PHONE_SLIP_VNIN' ? 'hubbu' : row.provider))];
+    const current = group.fixedProvider ?? (currentProviders.length === 1 ? currentProviders[0] : 'mixed');
+    const serviceList = group.services.map((service) => groupRows.find((row) => row.service === service)?.label ?? service).join(', ');
+    const providerControl = group.fixedProvider
+      ? `<strong>${PROVIDER_LABEL[group.fixedProvider]} (fixed)</strong><input type="hidden" name="groupProvider_${group.key}" value="${group.fixedProvider}">`
+      : `<select name="groupProvider_${group.key}">${current === 'mixed' ? '<option value="mixed" selected>Mixed — choose one provider</option>' : ''}${group.providers.map((provider) => `<option value="${provider}" ${current === provider ? 'selected' : ''}>${PROVIDER_LABEL[provider]}</option>`).join('')}</select>`;
+    return `<tr><td><strong>${escape(group.label)}</strong><br><small>${escape(serviceList)}</small></td><td>${providerControl}</td></tr>`;
   }).join('');
 
   const flashHtml = flash
@@ -396,12 +469,21 @@ function renderPage(params: {
   ${flashHtml}
 
   <div class="card wide">
+    <h2>Choose verification providers by group</h2>
+    <p class="hint">Set one provider for a whole compatible group, then save once. Groups with a single supported provider are fixed automatically. This changes provider routing only; it does not change selling prices.</p>
+    <form method="POST" action="/admin/bulk-pricing/verification-providers">
+      <table class="price-table"><thead><tr><th>Service group</th><th>Provider</th></tr></thead><tbody>${verificationProviderRows}</tbody></table>
+      <button type="submit">Save grouped providers</button>
+    </form>
+  </div>
+
+  <div class="card wide">
     <h2>Set exact service prices</h2>
     <p class="hint">Select one or more services, enter each selling price in naira, then save once. BVN Modification prices are separate for Agency and every bank, including Access Bank. Leave an input blank to use its provider cost.</p>
     <form method="POST" action="/admin/bulk-pricing/service-prices" onsubmit="return document.querySelectorAll('input[name=serviceIds]:checked').length > 0 || (alert('Select at least one service.'), false);">
       <p><label style="display:inline"><input type="checkbox" onclick="document.querySelectorAll('input[name=serviceIds]').forEach((item) => item.checked = this.checked)"> Select all listed services</label></p>
       <table class="price-table"><thead><tr><th>Select</th><th>Service</th><th>Provider &amp; cost</th><th>Selling price (₦)</th><th>Status</th></tr></thead><tbody>${serviceRows || '<tr><td colspan="5">No service prices found yet.</td></tr>'}</tbody></table>
-      <button type="submit">Save selected prices and providers</button>
+      <button type="submit">Save selected prices</button>
     </form>
   </div>
 
@@ -439,7 +521,7 @@ function renderPage(params: {
         <option value="alrahuz" ${settings.resultPinProvider === 'alrahuz' ? 'selected' : ''}>Alrahuz</option>
         <option value="bilalsadasub" ${settings.resultPinProvider === 'bilalsadasub' ? 'selected' : ''}>BilalSadaSub</option>
       </select>
-      <p class="hint">Choose the NIN/BVN API separately for each service in the table above. Hubbu can be selected only for services its API documents support.</p>
+      <p class="hint">NIN and BVN verification providers are set by service group in the grouped provider section above.</p>
       <div class="row">
         <div>
           <label>Cable TV markup %</label>
