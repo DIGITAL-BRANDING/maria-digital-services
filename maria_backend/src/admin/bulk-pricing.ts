@@ -119,36 +119,29 @@ export function registerBulkPricingRoutes(router: Router) {
     const dataAirtimeProvider =
       dataAirtimeProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : dataAirtimeProviderRaw === 'ktech' ? 'ktech' : 'alrahuz';
     const resultPinProvider = resultPinProviderRaw === 'bilalsadasub' ? 'bilalsadasub' : 'alrahuz';
-    const identityVerificationProvider = identityVerificationProviderRaw === 'ktech' ? 'ktech' : 'techhub';
+    const identityVerificationProvider = identityVerificationProviderRaw === 'ktech' ? 'ktech' : identityVerificationProviderRaw === 'techhub' ? 'techhub' : undefined;
 
     if (cableMarkupPercent === null || electricityMarkupPercent === null) {
       return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Cable and electricity markup % must both be valid numbers ≥ 0.'));
     }
 
     try {
-      await updatePricingSettings({ dataAirtimeProvider, resultPinProvider, identityVerificationProvider, cableMarkupPercent, electricityMarkupPercent });
+      await updatePricingSettings({ dataAirtimeProvider, resultPinProvider, ...(identityVerificationProvider ? { identityVerificationProvider } : {}), cableMarkupPercent, electricityMarkupPercent });
       await logAdminAction({
         adminId: admin.id,
         action: 'UPDATE_PROVIDER_SWITCH',
         targetType: 'PricingSettings',
         targetId: 'default',
-        metadata: { dataAirtimeProvider, resultPinProvider, identityVerificationProvider, cableMarkupPercent, electricityMarkupPercent }
+        metadata: { dataAirtimeProvider, resultPinProvider, ...(identityVerificationProvider ? { identityVerificationProvider } : {}), cableMarkupPercent, electricityMarkupPercent }
       });
-      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Providers updated - Data/Airtime: ${dataAirtimeProvider}, Result Pins: ${resultPinProvider}, NIN/BVN Verification: ${identityVerificationProvider}.`));
+      res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('success', `Providers updated - Data/Airtime: ${dataAirtimeProvider}, Result Pins: ${resultPinProvider}. NIN/BVN providers are configured per service above.`));
     } catch (error) {
       console.error('[bulk-pricing] provider-switch update failed:', error);
-      // Include the real error inline (unlike the other catch blocks on this
-      // page) - this exact "selected K-Tech but it kept using Techhub"
-      // symptom is what happens when this save silently fails (most likely:
-      // the identityVerificationProvider migration hasn't been run on this
-      // database yet, so the UPDATE throws on an unknown column), and a
-      // generic "check the logs" message hides that from the admin who
-      // needs to notice it, not just whoever reads the server console.
       res.redirect(
         '/admin/bulk-pricing?flash=' +
           encodeFlash(
             'error',
-            `Provider switch was NOT saved: ${(error as Error).message}. If this mentions an unknown column, the database migration for identityVerificationProvider hasn't run yet (npx prisma migrate deploy) - until it does, NIN/BVN verification keeps using whatever provider is already saved, regardless of what you pick above.`
+            `Provider switch was NOT saved: ${(error as Error).message}.`
           )
       );
     }
@@ -256,7 +249,12 @@ export function registerBulkPricingRoutes(router: Router) {
       }
       await prisma.$transaction(async (tx) => {
         for (const { id, price } of prices) {
-          await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)) } });
+          const providerRaw = field(req, `provider_${id}`);
+          const row = existing.find((item) => item.id === id)!;
+          const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
+          const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
+          const provider = row.service === 'NIN_SLIP_INFORMATION' ? 'ktech' : providerRaw === 'ktech' && ktechSupported ? 'ktech' : providerRaw === 'hubbu' && hubbuSupported ? 'hubbu' : 'techhub';
+          await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)), provider } });
         }
       }, { maxWait: 10_000, timeout: 120_000 });
       await logAdminAction({
@@ -330,7 +328,9 @@ function renderPage(params: {
       label = `BVN Modification — ${enrollment} — ${modificationType}`;
     }
     const sellingPrice = row.sellingPriceKobo === null ? '' : (Number(row.sellingPriceKobo) / 100).toFixed(2);
-    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.provider)} · ${escape(row.service)}</small></td><td>₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
+    const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
+    const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
+    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td><select name="provider_${escape(row.id)}"><option value="techhub" ${row.provider === 'techhub' && row.service !== 'NIN_SLIP_INFORMATION' ? 'selected' : ''} ${row.service === 'NIN_SLIP_INFORMATION' ? 'disabled' : ''}>Techhub</option><option value="ktech" ${row.provider === 'ktech' || row.service === 'NIN_SLIP_INFORMATION' ? 'selected' : ''} ${ktechSupported ? '' : 'disabled'}>K-Tech${ktechSupported ? '' : ' (unsupported)'}</option><option value="hubbu" ${row.provider === 'hubbu' ? 'selected' : ''} ${hubbuSupported ? '' : 'disabled'}>Hubbu${hubbuSupported ? '' : ' (unsupported)'}</option></select><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
   }).join('');
 
   const flashHtml = flash
@@ -393,8 +393,8 @@ function renderPage(params: {
     <p class="hint">Select one or more services, enter each selling price in naira, then save once. BVN Modification prices are separate for Agency and every bank, including Access Bank. Leave an input blank to use its provider cost.</p>
     <form method="POST" action="/admin/bulk-pricing/service-prices" onsubmit="return document.querySelectorAll('input[name=serviceIds]:checked').length > 0 || (alert('Select at least one service.'), false);">
       <p><label style="display:inline"><input type="checkbox" onclick="document.querySelectorAll('input[name=serviceIds]').forEach((item) => item.checked = this.checked)"> Select all listed services</label></p>
-      <table class="price-table"><thead><tr><th>Select</th><th>Service</th><th>Provider cost</th><th>Selling price (₦)</th><th>Status</th></tr></thead><tbody>${serviceRows || '<tr><td colspan="5">No service prices found yet.</td></tr>'}</tbody></table>
-      <button type="submit">Save selected prices</button>
+      <table class="price-table"><thead><tr><th>Select</th><th>Service</th><th>Provider &amp; cost</th><th>Selling price (₦)</th><th>Status</th></tr></thead><tbody>${serviceRows || '<tr><td colspan="5">No service prices found yet.</td></tr>'}</tbody></table>
+      <button type="submit">Save selected prices and providers</button>
     </form>
   </div>
 
@@ -432,12 +432,7 @@ function renderPage(params: {
         <option value="alrahuz" ${settings.resultPinProvider === 'alrahuz' ? 'selected' : ''}>Alrahuz</option>
         <option value="bilalsadasub" ${settings.resultPinProvider === 'bilalsadasub' ? 'selected' : ''}>BilalSadaSub</option>
       </select>
-      <label>NIN/BVN Verification provider</label>
-      <select name="identityVerificationProvider">
-        <option value="techhub" ${settings.identityVerificationProvider === 'techhub' ? 'selected' : ''}>Techhub</option>
-        <option value="ktech" ${settings.identityVerificationProvider === 'ktech' ? 'selected' : ''}>K-Tech Solutions</option>
-      </select>
-      <p class="hint">Covers NIN-by-NIN, NIN-by-Phone, BVN Slip, NIN Validation, Personalization, and IPE Clearance. Demographic lookup, BVN Retrieval, and Delinking always use Techhub.</p>
+      <p class="hint">Choose the NIN/BVN API separately for each service in the table above. Hubbu can be selected only for services its API documents support.</p>
       <div class="row">
         <div>
           <label>Cable TV markup %</label>

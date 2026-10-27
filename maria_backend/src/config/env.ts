@@ -85,6 +85,8 @@ const EnvSchema = z.object({
   // points to K-Tech's current production API.
   KTECH_BASE_URL: z.string().url().default('https://k-tech.com.ng/api/v1'),
   KTECH_API_KEY: z.string().optional(),
+  HUBBU_BASE_URL: z.string().url().default('https://hubbu.com.ng/api/v1'),
+  HUBBU_API_KEY: z.string().optional(),
   // The "webhook secret" shown next to the callback URL on the K-Tech partner
   // dashboard. Without it POST /api/webhooks/ktech answers 503 (see
   // webhook.routes.ts) - which is exactly what the dashboard reports as

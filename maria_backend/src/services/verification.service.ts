@@ -14,7 +14,19 @@ import {
   type TechhubSlipResult
 } from './techhub.service.js';
 import { ktechService, type KtechNinSlipTier } from './ktech.service.js';
-import { activeIdentityVerificationProvider } from './pricing-settings.service.js';
+import { hubbuService } from './hubbu.service.js';
+
+type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
+async function providerForService(service: VerificationServiceKey): Promise<IdentityProvider> {
+  const row = await getOrCreateVerificationPricingRow(service);
+  const value = row.provider.toLowerCase();
+  return value === 'hubbu' || value === 'ktech' ? value : 'techhub';
+}
+async function asyncProviderForService(service: VerificationServiceKey): Promise<'techhub' | 'ktech'> {
+  const provider = await providerForService(service);
+  if (provider === 'hubbu') throw new ApiError(422, 'Hubbu does not document async status polling for this service yet.', 'PROVIDER_SERVICE_UNSUPPORTED');
+  return provider;
+}
 
 /**
  * Matches VerificationServiceX.key in the Flutter app's
@@ -197,6 +209,7 @@ export type SlipPurchaseResult = {
   userData?: Record<string, unknown>;
   pdfBase64?: string;
   pdfUrl?: string;
+  downloadToken?: string;
   balanceAfter: number;
 };
 
@@ -223,7 +236,7 @@ async function purchaseSlip(params: {
   service: VerificationServiceKey;
   // This value must match the upstream that receives the request. It is
   // persisted on both the customer transaction and provider ledger entry.
-  provider: 'techhub' | 'ktech';
+  provider: IdentityProvider;
   transactionType: typeof TransactionType.NIN_VERIFICATION | typeof TransactionType.BVN_VERIFICATION;
   description: string;
   operational: Record<string, unknown>;
@@ -280,8 +293,9 @@ async function purchaseSlip(params: {
           pii: mergeSealedPII(existingMetadata?.pii, {
             ...params.pii,
             user_data: provider.userData,
-            pdf_base64: provider.pdfBase64,
-            pdf_url: provider.pdfUrl
+            pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
+            pdf_url: provider.pdfUrl,
+            hubbu_download_token: provider.downloadToken
           })
         } as Prisma.InputJsonValue
       }
@@ -306,6 +320,7 @@ async function purchaseSlip(params: {
       userData: provider.userData,
       pdfBase64: provider.pdfBase64,
       pdfUrl: provider.pdfUrl,
+      downloadToken: provider.downloadToken,
       balanceAfter: debit.balanceAfter
     };
   }
@@ -347,7 +362,8 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
   // K-Tech supports the information tier on its NIN-by-NIN endpoint. Keep
   // this slip separate from demographic lookup, which has its own form/API.
   if (params.tier === 'information') ktechService.assertConfigured();
-  const provider = params.tier === 'information' ? 'ktech' : await activeIdentityVerificationProvider();
+  const provider: IdentityProvider = params.tier === 'information' ? 'ktech' : await providerForService(NIN_SLIP_SERVICE_BY_TIER[params.tier]);
+  if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
     service: NIN_SLIP_SERVICE_BY_TIER[params.tier],
@@ -361,7 +377,9 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
       ? ktechService.ninByNin(params.nin, params.tier, reference)
       : provider === 'ktech'
         ? ktechService.ninByNin(params.nin, params.tier, reference)
-        : techhubService.ninByNin(params.nin, params.tier)
+        : provider === 'hubbu'
+          ? hubbuService.ninByNin(params.nin, params.tier)
+          : techhubService.ninByNin(params.nin, params.tier)
   });
 }
 
@@ -371,10 +389,12 @@ export async function purchaseNinByPhone(params: {
   tier: Exclude<TechhubSlipTier, 'vnin'>;
   idempotencyKey?: string;
 }) {
-  const provider = await activeIdentityVerificationProvider();
+  const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
+  const provider: IdentityProvider = await providerForService(service);
+  if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
-    service: NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier],
+    service,
     provider,
     transactionType: TransactionType.NIN_VERIFICATION,
     description: `NIN slip (${params.tier}) by Phone`,
@@ -384,7 +404,9 @@ export async function purchaseNinByPhone(params: {
     call: (reference) =>
       provider === 'ktech'
         ? ktechService.ninByPhone(params.phone, params.tier, reference)
-        : techhubService.ninByPhone(params.phone, params.tier)
+        : provider === 'hubbu'
+          ? hubbuService.ninByPhone(params.phone, params.tier)
+          : techhubService.ninByPhone(params.phone, params.tier)
   });
 }
 
@@ -396,16 +418,15 @@ export function purchaseNinByDemographic(params: {
   gender?: string;
   idempotencyKey?: string;
 }) {
-  // Always Techhub - K-Tech's demographic-lookup request body was never
-  // captured from the docs (see ktech.service.ts's doc comment), so
-  // switching this one isn't safe to do blind.
+  return providerForService('NIN_DEMOGRAPHIC').then(async (provider) => {
+  if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
     service: 'NIN_DEMOGRAPHIC',
-    provider: 'techhub',
+    provider,
     transactionType: TransactionType.NIN_VERIFICATION,
     description: 'NIN slip by demographic details',
-    operational: { mode: 'by_demographic' },
+    operational: { mode: 'by_demographic', provider },
     pii: {
       firstname: params.firstname,
       lastname: params.lastname,
@@ -413,21 +434,25 @@ export function purchaseNinByDemographic(params: {
       gender: params.gender
     },
     idempotencyKey: params.idempotencyKey,
-    call: () =>
-      techhubService.ninByDemographic({
+    call: () => provider === 'hubbu'
+      ? hubbuService.ninByDemographic({ first_name: params.firstname, last_name: params.lastname, dob: params.dob, gender: params.gender ?? '' })
+      : techhubService.ninByDemographic({
         firstname: params.firstname,
         lastname: params.lastname,
         dob: params.dob,
         gender: params.gender
       })
   });
+  });
 }
 
 export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string }) {
-  const provider = await activeIdentityVerificationProvider();
+  const service = BVN_SLIP_SERVICE_BY_TIER[params.tier];
+  const provider: IdentityProvider = await providerForService(service);
+  if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
-    service: BVN_SLIP_SERVICE_BY_TIER[params.tier],
+    service,
     provider,
     transactionType: TransactionType.BVN_VERIFICATION,
     description: `BVN slip (${params.tier})`,
@@ -437,7 +462,9 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
     call: (reference) =>
       provider === 'ktech'
         ? ktechService.bvnSlip(params.bvn, params.tier, reference)
-        : techhubService.bvnSlip(params.bvn, params.tier)
+        : provider === 'hubbu'
+          ? hubbuService.bvnSlip(params.bvn, params.tier)
+          : techhubService.bvnSlip(params.bvn, params.tier)
   });
 }
 
@@ -814,7 +841,7 @@ export function checkDelinkingStatus(params: { userId: string; ticketId: string 
 
 export function submitNinValidation(params: { userId: string; nin: string; validationType?: string; idempotencyKey?: string }) {
   const service = NIN_VALIDATION_SERVICE_BY_TYPE[params.validationType ?? 'nin_validation'] ?? 'NIN_VALIDATION_GENERAL';
-  return activeIdentityVerificationProvider().then((provider) =>
+  return asyncProviderForService(service).then((provider) =>
     submitAsyncService({
       userId: params.userId,
       service,
@@ -835,7 +862,7 @@ export async function checkNinValidationStatus(params: { userId: string; ticketI
 }
 
 export function submitPersonalization(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return activeIdentityVerificationProvider().then((provider) =>
+  return asyncProviderForService('NIN_PERSONALIZATION').then((provider) =>
     submitAsyncService({
       userId: params.userId, service: 'NIN_PERSONALIZATION', provider,
       description: 'NIN personalization request', operational: { provider }, pii: { tracking_id: params.trackingId },
@@ -888,15 +915,18 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
 // this flow was built against, and is the one actually being used in
 // production - it is not switched by the general NIN/BVN provider setting.
 export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return submitAsyncService({
-    userId: params.userId, service: 'IPE_CLEARANCE', provider: 'ktech',
-    description: 'IPE clearance request', operational: { provider: 'ktech' }, pii: { tracking_id: params.trackingId },
+  return asyncProviderForService('IPE_CLEARANCE').then((provider) => submitAsyncService({
+    userId: params.userId, service: 'IPE_CLEARANCE', provider,
+    description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
     idempotencyKey: params.idempotencyKey,
-    call: (reference) => ktechService.submitIpeClearance(params.trackingId, reference)
-  });
+    call: (reference) => provider === 'ktech'
+      ? ktechService.submitIpeClearance(params.trackingId, reference)
+      : techhubService.submitIpeClearance(params.trackingId)
+  }));
 }
 export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
-  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id) => ktechService.checkIpeClearance(id) });
+  return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+    provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
 }
 
 export type ServiceTicketEntry = {

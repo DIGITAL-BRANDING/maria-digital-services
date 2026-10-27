@@ -79,6 +79,7 @@ export type TechhubSlipResult = {
   userData?: Record<string, unknown>;
   pdfBase64?: string;
   pdfUrl?: string;
+  downloadToken?: string;
   raw: unknown;
 };
 
