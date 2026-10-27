@@ -7,6 +7,7 @@ import { dataPlanPricingService } from '../services/data-plan-pricing.service.js
 import { getPricingSettings, updatePricingSettings } from '../services/pricing-settings.service.js';
 import { applyServiceMarkup } from '../services/result-pin.service.js';
 import { listTinCertificatePrices } from '../services/tin-certificate.service.js';
+import { listVerificationPricesForAdmin } from '../services/verification.service.js';
 import { BVN_MODIFICATION_BANKS, BVN_MODIFICATION_CONFIG, listBvnModificationPrices } from '../services/bvn-modification.service.js';
 
 // @adminjs/express stores the logged-in admin as `req.session.adminUser`
@@ -65,6 +66,7 @@ export function registerBulkPricingRoutes(router: Router) {
     // Ensure every BVN Modification option has a distinct editable price row,
     // including each bank (banks can have different selling prices).
     await listBvnModificationPrices();
+    await listVerificationPricesForAdmin();
     // Same for TIN Certificate so its Individual/Corporate prices are editable from first load.
     await listTinCertificatePrices();
     const [settings, networks, servicePrices] = await Promise.all([
@@ -247,13 +249,17 @@ export function registerBulkPricingRoutes(router: Router) {
       if (existing.length !== serviceIds.length) {
         return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'Some selected services were not found. Refresh the page and try again.'));
       }
+      const invalidVninRoute = existing.some((row) => row.service === 'NIN_PHONE_SLIP_VNIN' && field(req, `provider_${row.id}`) !== 'hubbu');
+      if (invalidVninRoute) {
+        return res.redirect('/admin/bulk-pricing?flash=' + encodeFlash('error', 'NIN by Phone V-NIN is supported only by Hubbu.'));
+      }
       await prisma.$transaction(async (tx) => {
         for (const { id, price } of prices) {
           const providerRaw = field(req, `provider_${id}`);
           const row = existing.find((item) => item.id === id)!;
-          const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
+          const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
           const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
-          const provider = row.service === 'NIN_SLIP_INFORMATION' ? 'ktech' : providerRaw === 'ktech' && ktechSupported ? 'ktech' : providerRaw === 'hubbu' && hubbuSupported ? 'hubbu' : 'techhub';
+          const provider = row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : providerRaw === 'ktech' && ktechSupported ? 'ktech' : providerRaw === 'hubbu' && hubbuSupported ? 'hubbu' : 'techhub';
           await tx.servicePricing.update({ where: { id }, data: { sellingPriceKobo: price === null ? null : BigInt(Math.round(price * 100)), provider } });
         }
       }, { maxWait: 10_000, timeout: 120_000 });
@@ -328,9 +334,10 @@ function renderPage(params: {
       label = `BVN Modification — ${enrollment} — ${modificationType}`;
     }
     const sellingPrice = row.sellingPriceKobo === null ? '' : (Number(row.sellingPriceKobo) / 100).toFixed(2);
-    const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
-    const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
-    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td><select name="provider_${escape(row.id)}"><option value="techhub" ${row.provider === 'techhub' && row.service !== 'NIN_SLIP_INFORMATION' ? 'selected' : ''} ${row.service === 'NIN_SLIP_INFORMATION' ? 'disabled' : ''}>Techhub</option><option value="ktech" ${row.provider === 'ktech' || row.service === 'NIN_SLIP_INFORMATION' ? 'selected' : ''} ${ktechSupported ? '' : 'disabled'}>K-Tech${ktechSupported ? '' : ' (unsupported)'}</option><option value="hubbu" ${row.provider === 'hubbu' ? 'selected' : ''} ${hubbuSupported ? '' : 'disabled'}>Hubbu${hubbuSupported ? '' : ' (unsupported)'}</option></select><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
+    const infoOnly = row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION';
+    const hubbuSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN)|NIN_DEMOGRAPHIC|BVN_SLIP_(PREMIUM|STANDARD))$/.test(row.service);
+    const ktechSupported = /^(NIN_SLIP_(PREMIUM|STANDARD|REGULAR|VNIN|INFORMATION)|NIN_PHONE_SLIP_(PREMIUM|STANDARD|REGULAR|INFORMATION)|BVN_SLIP_(PREMIUM|STANDARD)|NIN_VALIDATION_.+|NIN_PERSONALIZATION|IPE_CLEARANCE)$/.test(row.service);
+    return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td><select name="provider_${escape(row.id)}"><option value="techhub" ${row.provider === 'techhub' && !infoOnly ? 'selected' : ''} ${infoOnly ? 'disabled' : ''}>Techhub</option><option value="ktech" ${row.provider === 'ktech' || infoOnly ? 'selected' : ''} ${ktechSupported ? '' : 'disabled'}>K-Tech${ktechSupported ? '' : ' (unsupported)'}</option><option value="hubbu" ${row.provider === 'hubbu' ? 'selected' : ''} ${hubbuSupported ? '' : 'disabled'}>Hubbu${hubbuSupported ? '' : ' (unsupported)'}</option></select><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
   }).join('');
 
   const flashHtml = flash

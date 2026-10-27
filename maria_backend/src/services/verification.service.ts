@@ -18,6 +18,7 @@ import { hubbuService } from './hubbu.service.js';
 
 type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
 async function providerForService(service: VerificationServiceKey): Promise<IdentityProvider> {
+  if (service === 'NIN_SLIP_INFORMATION' || service === 'NIN_PHONE_SLIP_INFORMATION') return 'ktech';
   const row = await getOrCreateVerificationPricingRow(service);
   const value = row.provider.toLowerCase();
   return value === 'hubbu' || value === 'ktech' ? value : 'techhub';
@@ -42,6 +43,8 @@ const SERVICE_KEYS = [
   'NIN_PHONE_SLIP_PREMIUM',
   'NIN_PHONE_SLIP_STANDARD',
   'NIN_PHONE_SLIP_REGULAR',
+  'NIN_PHONE_SLIP_VNIN',
+  'NIN_PHONE_SLIP_INFORMATION',
   'NIN_DEMOGRAPHIC',
   'BVN_SLIP_PREMIUM',
   'BVN_SLIP_STANDARD',
@@ -86,6 +89,8 @@ const DEFAULTS: Record<VerificationServiceKey, { label: string; price: number }>
   NIN_PHONE_SLIP_PREMIUM: { label: 'NIN Slip (Premium) — by Phone', price: 130 },
   NIN_PHONE_SLIP_STANDARD: { label: 'NIN Slip (Standard) — by Phone', price: 130 },
   NIN_PHONE_SLIP_REGULAR: { label: 'NIN Slip (Regular) — by Phone', price: 130 },
+  NIN_PHONE_SLIP_VNIN: { label: 'NIN Slip (VNIN) — by Phone', price: 180 },
+  NIN_PHONE_SLIP_INFORMATION: { label: 'NIN Personal Information Slip — by Phone', price: 200 },
   NIN_DEMOGRAPHIC: { label: 'NIN Slip — by Demographic', price: 130 },
   BVN_SLIP_PREMIUM: { label: 'BVN Slip (Premium)', price: 80 },
   BVN_SLIP_STANDARD: { label: 'BVN Slip (Standard)', price: 80 },
@@ -184,6 +189,7 @@ export async function listVerificationPrices() {
     service: row.service,
     label: row.label,
     unitPrice: koboToNaira(row.sellingPriceKobo ?? row.providerCostKobo),
+    provider: row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : row.provider,
     isActive: row.isActive
   }));
 }
@@ -347,10 +353,13 @@ const NIN_SLIP_SERVICE_BY_TIER: Record<KtechNinSlipTier, VerificationServiceKey>
   vnin: 'NIN_SLIP_VNIN'
 };
 
-const NIN_PHONE_SLIP_SERVICE_BY_TIER: Record<Exclude<TechhubSlipTier, 'vnin'>, VerificationServiceKey> = {
+type NinPhoneTier = TechhubSlipTier | 'information';
+const NIN_PHONE_SLIP_SERVICE_BY_TIER: Record<NinPhoneTier, VerificationServiceKey> = {
   premium: 'NIN_PHONE_SLIP_PREMIUM',
   standard: 'NIN_PHONE_SLIP_STANDARD',
-  regular: 'NIN_PHONE_SLIP_REGULAR'
+  regular: 'NIN_PHONE_SLIP_REGULAR',
+  vnin: 'NIN_PHONE_SLIP_VNIN',
+  information: 'NIN_PHONE_SLIP_INFORMATION'
 };
 
 const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> = {
@@ -374,7 +383,7 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
     pii: { nin: params.nin },
     idempotencyKey: params.idempotencyKey,
     call: (reference) => params.tier === 'information'
-      ? ktechService.ninByNin(params.nin, params.tier, reference)
+      ? ktechService.ninPersonalInformation({ nin: params.nin }, reference)
       : provider === 'ktech'
         ? ktechService.ninByNin(params.nin, params.tier, reference)
         : provider === 'hubbu'
@@ -386,12 +395,16 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
 export async function purchaseNinByPhone(params: {
   userId: string;
   phone: string;
-  tier: Exclude<TechhubSlipTier, 'vnin'>;
+  tier: NinPhoneTier;
   idempotencyKey?: string;
 }) {
   const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
-  if (provider === 'hubbu') hubbuService.assertConfigured();
+  if (params.tier === 'information') ktechService.assertConfigured();
+  else if (provider === 'hubbu') hubbuService.assertConfigured();
+  if (params.tier === 'vnin' && provider !== 'hubbu') {
+    throw new ApiError(422, 'VNIN slip by phone is only available through Hubbu.', 'PROVIDER_SERVICE_UNSUPPORTED');
+  }
   return purchaseSlip({
     userId: params.userId,
     service,
@@ -402,7 +415,11 @@ export async function purchaseNinByPhone(params: {
     pii: { phone: params.phone },
     idempotencyKey: params.idempotencyKey,
     call: (reference) =>
-      provider === 'ktech'
+      params.tier === 'information'
+        ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
+        : params.tier === 'vnin'
+        ? hubbuService.ninByPhone(params.phone, params.tier)
+        : provider === 'ktech'
         ? ktechService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'hubbu'
           ? hubbuService.ninByPhone(params.phone, params.tier)

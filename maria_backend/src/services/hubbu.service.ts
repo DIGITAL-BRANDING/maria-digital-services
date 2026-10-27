@@ -67,7 +67,7 @@ export const hubbuService = {
   ninByNin(nin: string, slipType: TechhubSlipTier) {
     return post('/nin/verify', { method: 'nin', nin, slip_type: tier(slipType) });
   },
-  ninByPhone(phone: string, slipType: Exclude<TechhubSlipTier, 'vnin'>) {
+  ninByPhone(phone: string, slipType: TechhubSlipTier) {
     return post('/nin/verify', { method: 'phone', phone, slip_type: tier(slipType) });
   },
   ninByDemographic(input: { first_name: string; last_name: string; dob: string; gender: string }) {

@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 
 // ── Shared types ────────────────────────────────────────────────
-export type PriceRow = { service: string; unitPrice: number; isActive: boolean };
+export type PriceRow = { service: string; unitPrice: number; isActive: boolean; provider?: string };
 export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; reference: string };
 export type AsyncResult = { ticket_id: string; reference: string };
 export type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
@@ -25,23 +25,29 @@ export const money = (amount?: number) =>
 // dedicated PhoneMultiplePage, since they hit the exact same
 // POST /verification/nin/by-phone endpoint and NIN_PHONE_SLIP_* prices —
 // kept in one place so the two pages can't drift apart.
-export const PHONE_TIERS = ['regular', 'standard', 'premium'] as const;
+export const PHONE_TIERS = ['information', 'regular', 'standard', 'premium', 'vnin'] as const;
 export type PhoneTier = (typeof PHONE_TIERS)[number];
 export const PHONE_TIER_LABELS: Record<PhoneTier, string> = {
+  information: 'Personal Information Slip',
   regular: 'Regular Slip',
   standard: 'Standard Slip',
   premium: 'Premium Slip',
+  vnin: 'V-NIN Slip',
 };
-export const PHONE_TIER_ICON: Record<PhoneTier, SlipIconVariant> = { regular: 'regular', standard: 'standard', premium: 'premium' };
+export const PHONE_TIER_ICON: Record<PhoneTier, SlipIconVariant> = { information: 'document', regular: 'regular', standard: 'standard', premium: 'premium', vnin: 'premium' };
 export const PHONE_TIER_IMAGE: Record<PhoneTier, string> = {
+  information: '/branding/information slip.jpg',
   regular: '/branding/regular slip.jpg',
   standard: '/branding/standard slip.jpg',
   premium: '/branding/premium slip.jpg',
+  vnin: '/branding/Vnin slip.jpg',
 };
 export const PHONE_KEY: Record<PhoneTier, string> = {
+  information: 'NIN_PHONE_SLIP_INFORMATION',
   regular: 'NIN_PHONE_SLIP_REGULAR',
   standard: 'NIN_PHONE_SLIP_STANDARD',
   premium: 'NIN_PHONE_SLIP_PREMIUM',
+  vnin: 'NIN_PHONE_SLIP_VNIN',
 };
 
 /**
@@ -80,6 +86,7 @@ export const FORM_HELP_CLASSES = 'font-body text-xs text-[#0b2f73]/70';
 // ── Prices ──────────────────────────────────────────────────────
 export function useVerificationPrices() {
   const [prices, setPrices] = useState<Record<string, number>>({});
+  const [priceRows, setPriceRows] = useState<Record<string, PriceRow>>({});
   const [error, setError] = useState('');
   useEffect(() => {
     api
@@ -87,10 +94,11 @@ export function useVerificationPrices() {
       .then((result) => {
         const rows = Array.isArray(result) ? result : (result.data ?? []);
         setPrices(Object.fromEntries(rows.map((row) => [row.service, Number(row.unitPrice)])));
+        setPriceRows(Object.fromEntries(rows.map((row) => [row.service, row])));
       })
       .catch(() => setError('Unable to load current prices. Please refresh and try again.'));
   }, []);
-  return { prices, error };
+  return { prices, priceRows, error };
 }
 
 // ── Recent request history for one service key ─────────────────

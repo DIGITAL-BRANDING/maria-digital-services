@@ -60,7 +60,7 @@ const NIN_KEY: Record<NinTier, string> = {
 };
 
 export default function NinPhoneVerificationPage() {
-  const { prices } = useVerificationPrices();
+  const { prices, priceRows } = useVerificationPrices();
   const [method, setMethod] = useState<Method>('nin');
   const [idValue, setIdValue] = useState('');
   const [firstname, setFirstname] = useState('');
@@ -76,7 +76,17 @@ export default function NinPhoneVerificationPage() {
   const [result, setResult] = useState<SlipResult | null>(null);
 
   const demographicLookup = method === 'demographic';
-  const serviceKey = method === 'phone' ? PHONE_KEY[phoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
+  const phoneTiers = useMemo(() => PHONE_TIERS.filter((tier) => {
+    const row = priceRows[PHONE_KEY[tier]];
+    if (!row) return tier !== 'vnin';
+    if (!row.isActive) return false;
+    const provider = (row.provider ?? 'techhub').toLowerCase();
+    if (tier === 'vnin') return provider === 'hubbu';
+    if (tier === 'information') return provider === 'ktech';
+    return ['techhub', 'ktech', 'hubbu'].includes(provider);
+  }), [priceRows]);
+  const selectedPhoneTier = phoneTiers.includes(phoneTier) ? phoneTier : phoneTiers[0] ?? 'premium';
+  const serviceKey = method === 'phone' ? PHONE_KEY[selectedPhoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
   const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
   const price = useMemo(() => (serviceKey ? prices[serviceKey] : undefined), [serviceKey, prices]);
 
@@ -101,7 +111,7 @@ export default function NinPhoneVerificationPage() {
       const path = demographicLookup ? '/verification/nin/by-demographic' : method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
       const body = demographicLookup
         ? { firstname, lastname, gender, dob, pin }
-        : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: phoneTier, pin };
+        : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
       const result = await api.post<{
         status: boolean;
         message: string;
@@ -171,9 +181,9 @@ export default function NinPhoneVerificationPage() {
                   />
                 ) : (
                   <TierCardGrid
-                    options={PHONE_TIERS}
+                    options={phoneTiers}
                     labels={PHONE_TIER_LABELS}
-                    value={phoneTier}
+                    value={selectedPhoneTier}
                     onChange={setPhoneTier}
                     priceFor={(t) => prices[PHONE_KEY[t]]}
                     iconFor={(t) => PHONE_TIER_ICON[t]}
@@ -187,7 +197,7 @@ export default function NinPhoneVerificationPage() {
 
               <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">Service cost: {money(price)}</span>
-                <button disabled={busy || !consent} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
+                <button disabled={busy || !consent || (method === 'phone' && phoneTiers.length === 0)} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
                   {busy ? <Loader2 size={16} className="animate-spin" /> : 'Verify'}
                 </button>
               </div>

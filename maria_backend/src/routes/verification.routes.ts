@@ -36,7 +36,7 @@ function idempotencyKeyFrom(req: Request) {
 }
 
 const ninSlipTier = z.enum(['premium', 'standard', 'regular', 'vnin', 'information']);
-const ninPhoneSlipTier = z.enum(['premium', 'standard', 'regular']);
+const ninPhoneSlipTier = z.enum(['premium', 'standard', 'regular', 'vnin', 'information']);
 const bvnSlipTier = z.enum(['premium', 'standard']);
 const ninValidationType = z.enum([
   'nin_validation',

@@ -130,6 +130,13 @@ export class KtechService {
     return this.postSlip('/verification/nin/by-phone', { phone, tier }, idempotencyKey);
   }
 
+  async ninPersonalInformation(input: { nin?: string; phone?: string }, idempotencyKey: string) {
+    if ((!input.nin && !input.phone) || (input.nin && input.phone)) {
+      throw new ApiError(422, 'Provide either an NIN or a phone number for the Personal Information Slip.', 'INVALID_PERSONAL_INFO_LOOKUP');
+    }
+    return this.postSlip('/verification/nin/personal-info', input, idempotencyKey);
+  }
+
   async bvnSlip(bvn: string, tier: TechhubBvnTier, idempotencyKey: string) {
     return this.postSlip('/verification/bvn/slip', { bvn, tier }, idempotencyKey);
   }

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
 import { api, ApiError } from '../../lib/api';
@@ -34,7 +34,7 @@ import {
 // regular/standard/premium tier, one slip back) - so this page now uses
 // that real, working endpoint instead, with the same slip-type tiles.
 export default function PhoneMultiplePage() {
-  const { prices } = useVerificationPrices();
+  const { prices, priceRows } = useVerificationPrices();
   const [phone, setPhone] = useState('');
   const [tier, setTier] = useState<PhoneTier>('premium');
   const [consent, setConsent] = useState(false);
@@ -43,7 +43,19 @@ export default function PhoneMultiplePage() {
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
 
-  const serviceKey = PHONE_KEY[tier];
+  const phoneTiers = useMemo(() => PHONE_TIERS.filter((candidate) => {
+    const row = priceRows[PHONE_KEY[candidate]];
+    if (!row) return candidate !== 'vnin';
+    if (!row.isActive) return false;
+    const provider = (row.provider ?? 'techhub').toLowerCase();
+    if (candidate === 'vnin') return provider === 'hubbu';
+    if (candidate === 'information') return provider === 'ktech';
+    return ['techhub', 'ktech', 'hubbu'].includes(provider);
+  }), [priceRows]);
+
+  const safeTier = phoneTiers.includes(tier) ? tier : phoneTiers[0] ?? 'premium';
+
+  const serviceKey = PHONE_KEY[safeTier];
   const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
   const price = prices[serviceKey];
 
@@ -61,7 +73,7 @@ export default function PhoneMultiplePage() {
         status: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>('/verification/nin/by-phone', { phone, tier, pin });
+      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin });
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');
@@ -95,9 +107,9 @@ export default function PhoneMultiplePage() {
               <StepLabel n={2}>Select Your Preferred Slip Type</StepLabel>
               <div className="mt-3">
                 <TierCardGrid
-                  options={PHONE_TIERS}
+                  options={phoneTiers}
                   labels={PHONE_TIER_LABELS}
-                  value={tier}
+                  value={safeTier}
                   onChange={setTier}
                   priceFor={(t) => prices[PHONE_KEY[t]]}
                   iconFor={(t) => PHONE_TIER_ICON[t]}
