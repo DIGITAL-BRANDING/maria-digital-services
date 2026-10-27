@@ -116,7 +116,7 @@ export default function NinPhoneVerificationPage() {
         status: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>(path, body);
+      }>(path, body, true, 60_000);
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');

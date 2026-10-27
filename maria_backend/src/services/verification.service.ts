@@ -418,11 +418,11 @@ export async function purchaseNinByPhone(params: {
       params.tier === 'information'
         ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
         : params.tier === 'vnin'
-        ? hubbuService.ninByPhone(params.phone, params.tier)
+        ? hubbuService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'ktech'
         ? ktechService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'hubbu'
-          ? hubbuService.ninByPhone(params.phone, params.tier)
+        ? hubbuService.ninByPhone(params.phone, params.tier, reference)
           : techhubService.ninByPhone(params.phone, params.tier)
   });
 }

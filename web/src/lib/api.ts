@@ -34,9 +34,9 @@ export class ApiError extends Error {
 
 async function request<T>(
   path: string,
-  options: { method?: string; body?: unknown; auth?: boolean } = {}
+  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number } = {}
 ): Promise<T> {
-  const { method = 'GET', body, auth = true } = options;
+  const { method = 'GET', body, auth = true, timeoutMs = 20_000 } = options;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (auth) {
@@ -48,7 +48,7 @@ async function request<T>(
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   let payload: unknown = null;
@@ -70,8 +70,8 @@ async function request<T>(
 
 export const api = {
   get: <T>(path: string, auth = true) => request<T>(path, { method: 'GET', auth }),
-  post: <T>(path: string, body?: unknown, auth = true) =>
-    request<T>(path, { method: 'POST', body, auth }),
+  post: <T>(path: string, body?: unknown, auth = true, timeoutMs = 20_000) =>
+    request<T>(path, { method: 'POST', body, auth, timeoutMs }),
   document: async (path: string) => {
     const token = getAccessToken();
     const res = await fetch(`${API_BASE}/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(30_000) });
