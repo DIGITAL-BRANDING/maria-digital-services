@@ -3,6 +3,14 @@ import { ApiError, api, clearTokens, getAccessToken, setTokens } from './api';
 
 export const KYC_PROMPT_PENDING_KEY = 'kyc_prompt_pending';
 
+function markKycPromptPending() {
+  try { window.sessionStorage.setItem(KYC_PROMPT_PENDING_KEY, '1'); } catch { /* Optional prompt state must not block sign-in. */ }
+}
+
+function clearKycPromptPending() {
+  try { window.sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY); } catch { /* Optional prompt state must not block sign-out. */ }
+}
+
 export type AppUser = {
   id: string;
   full_name: string;
@@ -92,12 +100,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setMustChangePassword(!!res.data.requires_password_change);
       setRequiresLoginPinSetup(!!res.data.requires_login_pin_setup);
       setRequiresTransactionPinSetup(!!res.data.requires_pin_setup);
-      sessionStorage.setItem(KYC_PROMPT_PENDING_KEY, '1');
+      markKycPromptPending();
     } catch (err) {
       // LOGIN_PIN_REQUIRED means the password was correct but this account
       // has a 6-digit login PIN set - the caller (LoginPage) shows a PIN
       // field and calls login() again with it included.
-      throw err instanceof ApiError ? err : new ApiError('Login failed', 500);
+      if (err instanceof ApiError) throw err;
+      if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
+        throw new ApiError('The login request timed out. Check your connection and try again.', 408, 'REQUEST_TIMEOUT');
+      }
+      if (err instanceof TypeError) {
+        throw new ApiError('Could not connect to the server. Check your internet connection and try again.', 0, 'NETWORK_ERROR');
+      }
+      throw new ApiError(err instanceof Error ? err.message : 'Login could not be completed. Please try again.', 500, 'LOGIN_ERROR');
     }
   }
 
@@ -118,7 +133,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   function logout() {
     clearTokens();
-    sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
+    clearKycPromptPending();
     setUser(null);
     setMustChangePassword(false);
     setRequiresLoginPinSetup(false);

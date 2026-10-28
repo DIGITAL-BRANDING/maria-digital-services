@@ -116,11 +116,39 @@ export const hubbuService = {
   assertConfigured: configured,
   async downloadSlip(fileToken: string) {
     configured();
-    const response = await fetch(`${env.HUBBU_BASE_URL.replace(/\/$/, '')}/slips/download?file=${encodeURIComponent(fileToken)}`, {
+    const baseUrl = env.HUBBU_BASE_URL.replace(/\/$/, '');
+    let downloadUrl: URL;
+    try {
+      const suppliedUrl = new URL(fileToken, `${baseUrl}/`);
+      const base = new URL(baseUrl);
+      // Hubbu sometimes returns a complete download URL, sometimes only the
+      // opaque `file` token. Preserve its query string when it's a same-host
+      // Hubbu download link; never send the API key to another host.
+      if (suppliedUrl.origin === base.origin && /\/slips\/download\/?$/.test(suppliedUrl.pathname)) {
+        downloadUrl = suppliedUrl;
+      } else if (/^https?:\/\//i.test(fileToken)) {
+        throw new Error('Hubbu returned an unsupported slip download URL');
+      } else {
+        downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(fileToken)}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('unsupported')) throw error;
+      downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(fileToken)}`);
+    }
+
+    const response = await fetch(downloadUrl, {
       headers: { 'X-API-KEY': env.HUBBU_API_KEY! }, signal: AbortSignal.timeout(45_000)
     });
-    if (!response.ok) throw new Error(`Hubbu slip download returned HTTP ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
+    if (!response.ok) {
+      console.error('[hubbu] slip download rejected', { httpStatus: response.status, contentType: response.headers.get('content-type') });
+      throw new Error(`Hubbu slip download returned HTTP ${response.status}`);
+    }
+    const pdf = Buffer.from(await response.arrayBuffer());
+    if (pdf.length < 5 || pdf.subarray(0, 5).toString('ascii') !== '%PDF-') {
+      console.error('[hubbu] slip download response was not a PDF', { contentType: response.headers.get('content-type'), bytes: pdf.length });
+      throw new Error('Hubbu returned a non-PDF response for the slip download');
+    }
+    return pdf;
   },
   ninByNin(nin: string, slipType: TechhubSlipTier, reference?: string) {
     return post('/nin/verify', { method: 'nin', nin, slip_type: tier(slipType) }, { reference, method: 'nin' });

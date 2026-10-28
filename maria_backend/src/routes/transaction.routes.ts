@@ -137,7 +137,7 @@ transactionRoutes.get('/:id/document', async (req, res) => {
       res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
       return res.send(pdf);
     } catch (error) {
-      console.error('[hubbu] owner slip download failed:', error);
+      console.error('[hubbu] owner slip download failed:', { transactionId: tx.id, reference: tx.reference, error });
       return res.status(502).json({ status: false, message: 'The slip could not be retrieved from the provider right now.' });
     }
   }

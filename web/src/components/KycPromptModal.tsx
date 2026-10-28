@@ -13,16 +13,18 @@ export default function KycPromptModal() {
 
   useEffect(() => {
     if (!user) return;
-    if (sessionStorage.getItem(KYC_PROMPT_PENDING_KEY) !== '1') return;
+    let promptPending = false;
+    try { promptPending = window.sessionStorage.getItem(KYC_PROMPT_PENDING_KEY) === '1'; } catch { /* Optional UI prompt state. */ }
+    if (!promptPending) return;
     // Wait until we know the KYC status for this login.
     if (!needsKyc) {
-      sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
+      try { window.sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY); } catch { /* Ignore unavailable storage. */ }
       return;
     }
     // Keep the login flag until navigation reaches the authenticated app.
     // login() updates auth state before LoginPage navigates to the dashboard.
     if (pathname === '/login' || pathname === '/kyc' || pathname === '/setup-pins' || pathname === '/set-new-password') return;
-    sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY);
+    try { window.sessionStorage.removeItem(KYC_PROMPT_PENDING_KEY); } catch { /* Ignore unavailable storage. */ }
     setOpen(true);
   }, [user, needsKyc, pathname]);
 

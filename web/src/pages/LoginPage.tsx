@@ -24,7 +24,8 @@ export default function LoginPage() {
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    const remembered = localStorage.getItem(REMEMBERED_IDENTIFIER_KEY);
+    let remembered: string | null = null;
+    try { remembered = window.localStorage.getItem(REMEMBERED_IDENTIFIER_KEY); } catch { /* Optional in private browsing mode. */ }
     if (remembered) {
       setIdentifier(remembered);
       setRememberMe(true);
@@ -37,11 +38,10 @@ export default function LoginPage() {
     setIsLoading(true);
     try {
       await login(identifier, password, needsPin ? pin : undefined);
-      if (rememberMe) {
-        localStorage.setItem(REMEMBERED_IDENTIFIER_KEY, identifier);
-      } else {
-        localStorage.removeItem(REMEMBERED_IDENTIFIER_KEY);
-      }
+      try {
+        if (rememberMe) window.localStorage.setItem(REMEMBERED_IDENTIFIER_KEY, identifier);
+        else window.localStorage.removeItem(REMEMBERED_IDENTIFIER_KEY);
+      } catch { /* Remembering the identifier is optional; do not undo sign-in. */ }
       navigate('/dashboard');
     } catch (err) {
       if (err instanceof ApiError && err.code === 'LOGIN_PIN_REQUIRED') {
