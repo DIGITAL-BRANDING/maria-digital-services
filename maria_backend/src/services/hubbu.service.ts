@@ -20,6 +20,17 @@ function asRecord(value: unknown): HubbuResponse | undefined {
     : undefined;
 }
 
+/** Provider statuses that mean "accepted, still working" - never a rejection. */
+const IN_PROGRESS_STATUSES = new Set(['pending', 'processing', 'queued', 'in_progress', 'in-progress', 'submitted', 'accepted', 'awaiting']);
+/** Statuses the provider uses when it deliberately rejected the request. */
+const REJECTED_STATUSES = new Set(['error', 'failed', 'failure', 'rejected', 'declined']);
+const IN_PROGRESS_MESSAGE = 'Your request is still being processed by the provider. It will appear under Recent requests as soon as it completes - please do not submit it again yet.';
+
+/** A gateway/proxy error (502/504/524...) says nothing about whether the provider finished the job. */
+function isGatewayFailure(httpStatus: number) {
+  return httpStatus >= 500 || httpStatus === 408;
+}
+
 function configured() {
   if (!env.HUBBU_API_KEY) throw new ApiError(503, 'Hubbu verification provider is not configured.', 'PROVIDER_NOT_CONFIGURED');
 }
@@ -54,14 +65,14 @@ async function post(
   try { rawPayload = await response.json(); }
   catch {
     console.error('[hubbu] invalid JSON response', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
-    const ambiguous = response.ok;
+    const ambiguous = response.ok || isGatewayFailure(response.status);
     return { ok: false, ambiguous, message: ambiguous
       ? 'Hubbu may have completed this request, but returned an unreadable response. Check your transaction history before trying again.'
       : 'The verification provider returned an invalid response.', raw: null };
   }
   const payload = asRecord(rawPayload);
   if (!payload) {
-    const ambiguous = response.ok;
+    const ambiguous = response.ok || isGatewayFailure(response.status);
     console.error('[hubbu] unexpected response body', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, bodyType: rawPayload === null ? 'null' : Array.isArray(rawPayload) ? 'array' : typeof rawPayload, elapsedMs: Date.now() - startedAt });
     return { ok: false, ambiguous, message: ambiguous
       ? 'Hubbu may have completed this request, but returned an empty or unexpected response. Check your transaction history before trying again.'
@@ -70,6 +81,12 @@ async function post(
   const data = payload.data ?? {};
   const providerSucceeded = payload.status === true || (typeof payload.status === 'string' && payload.status.toLowerCase() === 'success');
   const ok = response.ok && providerSucceeded;
+  const statusText = typeof payload.status === 'string' ? payload.status.trim().toLowerCase() : '';
+  const explicitlyRejected = payload.status === false || REJECTED_STATUSES.has(statusText);
+  // Never refund (and tell the customer "failed") when the provider only said
+  // "pending/processing", or when a gateway error hides the real outcome - the
+  // slip may well be delivered a moment later. Those stay PENDING for reconciliation.
+  const inProgress = !ok && !explicitlyRejected && (IN_PROGRESS_STATUSES.has(statusText) || isGatewayFailure(response.status));
   const downloadUrl = typeof data.download_url === 'string' ? data.download_url : undefined;
   console.info('[hubbu] response received', {
     path,
@@ -94,6 +111,9 @@ async function post(
       providerCode: payload.code,
       message: payload.message
     });
+  }
+  if (inProgress) {
+    return { ok: false, ambiguous: true, message: IN_PROGRESS_MESSAGE, raw: payload };
   }
   return {
     ok,

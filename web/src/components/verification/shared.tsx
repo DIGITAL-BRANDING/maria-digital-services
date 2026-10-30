@@ -1,5 +1,5 @@
 import { Download, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../../lib/api';
 
 // ── Shared types ────────────────────────────────────────────────
@@ -105,6 +105,18 @@ export function useVerificationPrices() {
 export function useVerificationHistory(serviceKey: string) {
   const [history, setHistory] = useState<VerificationHistory[]>([]);
   const [loading, setLoading] = useState(false);
+  const [watching, setWatching] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!serviceKey) return;
+    try {
+      const result = await api.get<{ status: boolean; data: VerificationHistory[] }>(`/verification/history?service=${encodeURIComponent(serviceKey)}`);
+      setHistory(result.data ?? []);
+    } catch {
+      /* keep what we already show - a failed refresh must not blank the table */
+    }
+  }, [serviceKey]);
+
   useEffect(() => {
     if (!serviceKey) {
       setHistory([]);
@@ -127,7 +139,43 @@ export function useVerificationHistory(serviceKey: string) {
       active = false;
     };
   }, [serviceKey]);
-  return { history, loading };
+
+  // After a request whose outcome we could not confirm (timed out / still
+  // processing), poll "Recent requests" for a couple of minutes so the finished
+  // document appears by itself instead of the customer assuming it failed.
+  useEffect(() => {
+    if (!watching) return;
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 8_000);
+    const stop = window.setTimeout(() => setWatching(false), 150_000);
+    return () => {
+      window.clearInterval(interval);
+      window.clearTimeout(stop);
+    };
+  }, [watching, refresh]);
+
+  return { history, loading, refresh, watch: () => setWatching(true) };
+}
+
+/**
+ * One Idempotency-Key per attempt: kept after a timeout so a retry replays the
+ * original request (no double charge, and the finished slip is returned),
+ * cleared as soon as the server gives a definitive answer.
+ */
+export function useIdempotencyKey() {
+  const ref = useRef<{ key: string; fingerprint: string } | null>(null);
+  return {
+    // `fingerprint` identifies the submitted inputs: if the customer edits them
+    // after a timeout it is a NEW request, so it must get a new key (otherwise
+    // the server would replay the old one).
+    current: (fingerprint = '') => {
+      if (!ref.current || ref.current.fingerprint !== fingerprint) ref.current = { key: crypto.randomUUID(), fingerprint };
+      return ref.current.key;
+    },
+    reset: () => {
+      ref.current = null;
+    }
+  };
 }
 
 // ── Polling for async (ticketed) services ───────────────────────

@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState, type FormEvent } from 'react';
+import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError } from '../../lib/api';
+import { api, ApiError, wasInterrupted } from '../../lib/api';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -12,6 +12,7 @@ import {
   VerificationHistoryView,
   useVerificationPrices,
   useVerificationHistory,
+  useIdempotencyKey,
   money,
   FORM_SECTION_CLASSES,
   FORM_INPUT_CLASSES,
@@ -74,7 +75,7 @@ export default function NinPhoneVerificationPage() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
-  const idempotencyKey = useRef<string | null>(null);
+  const idempotency = useIdempotencyKey();
 
   const demographicLookup = method === 'demographic';
   const phoneTiers = useMemo(() => PHONE_TIERS.filter((tier) => {
@@ -88,7 +89,7 @@ export default function NinPhoneVerificationPage() {
   }), [priceRows]);
   const selectedPhoneTier = phoneTiers.includes(phoneTier) ? phoneTier : phoneTiers[0] ?? 'premium';
   const serviceKey = method === 'phone' ? PHONE_KEY[selectedPhoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
+  const { history, loading: loadingHistory, watch } = useVerificationHistory(serviceKey);
   const price = useMemo(() => (serviceKey ? prices[serviceKey] : undefined), [serviceKey, prices]);
 
   function prepare(event: FormEvent) {
@@ -108,28 +109,30 @@ export default function NinPhoneVerificationPage() {
     setShowPin(false);
     setBusy(true);
     setMessage('');
-    idempotencyKey.current ??= crypto.randomUUID();
     try {
       const path = demographicLookup ? '/verification/nin/by-demographic' : method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
       const body = demographicLookup
         ? { firstname, lastname, gender, dob, pin }
         : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
-      const result = await api.post<{
+      const result = await api.postSlip<{
         status: boolean;
         pending?: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>(path, body, true, 60_000, idempotencyKey.current);
+      }>(path, body, idempotency.current(JSON.stringify(body)));
       if (result.pending) {
         setMessage(`${result.message} Reference: ${result.data?.reference ?? 'check your transaction history'}. Please do not submit this request again yet.`);
+        watch();
         return;
       }
-      idempotencyKey.current = null;
+      idempotency.reset();
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');
     } catch (error) {
       // Keep the idempotency key after a browser/network timeout to prevent a duplicate provider call.
+      if (wasInterrupted(error)) watch();
+      else idempotency.reset();
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);

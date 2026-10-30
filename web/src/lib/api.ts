@@ -46,6 +46,20 @@ export function clearTokens() {
   writeStorage(REFRESH_KEY, null);
 }
 
+/** Slip/verification calls can legitimately take over a minute at the provider. */
+export const SLIP_REQUEST_TIMEOUT_MS = 110_000;
+
+export const REQUEST_INTERRUPTED = 'REQUEST_INTERRUPTED';
+
+export const INTERRUPTED_MESSAGE =
+  'This is taking longer than usual, but your request may still complete. Please do NOT submit it again - check "Recent requests" below in a minute (it refreshes automatically), and your document will appear there once it is ready.';
+
+/** Browsers word a cancelled/timed-out fetch differently ("The user aborted a request", "signal timed out", "Load failed"...). */
+function isInterruption(error: unknown) {
+  if (!(error instanceof Error) || error instanceof ApiError) return false;
+  return error.name === 'AbortError' || error.name === 'TimeoutError' || error.name === 'TypeError';
+}
+
 export class ApiError extends Error {
   status: number;
   code?: string;
@@ -58,9 +72,9 @@ export class ApiError extends Error {
 
 async function request<T>(
   path: string,
-  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number; idempotencyKey?: string } = {}
+  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number; idempotencyKey?: string; interruptible?: boolean } = {}
 ): Promise<T> {
-  const { method = 'GET', body, auth = true, timeoutMs = 20_000, idempotencyKey } = options;
+  const { method = 'GET', body, auth = true, timeoutMs = 20_000, idempotencyKey, interruptible = false } = options;
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (auth) {
@@ -93,15 +107,32 @@ async function request<T>(
     }
 
     return payload as T;
+  } catch (error) {
+    // The request may well have reached the server and succeeded - never show
+    // the browser's raw "user aborted a request" wording as if it had failed.
+    if (interruptible && isInterruption(error)) throw new ApiError(INTERRUPTED_MESSAGE, 0, REQUEST_INTERRUPTED);
+    throw error;
   } finally {
     timeout.clear();
   }
+}
+
+/** True when a request was cut off on our side (timeout/network) - the outcome is unknown, not a failure. */
+export function wasInterrupted(error: unknown) {
+  return error instanceof ApiError && error.code === REQUEST_INTERRUPTED;
 }
 
 export const api = {
   get: <T>(path: string, auth = true) => request<T>(path, { method: 'GET', auth }),
   post: <T>(path: string, body?: unknown, auth = true, timeoutMs = 20_000, idempotencyKey?: string) =>
     request<T>(path, { method: 'POST', body, auth, timeoutMs, idempotencyKey }),
+  /**
+   * For purchases that call a slow upstream provider (NIN/BVN slips...): waits
+   * long enough for the provider, and reports a cut-off as "outcome unknown"
+   * (see wasInterrupted) rather than a failure.
+   */
+  postSlip: <T>(path: string, body: unknown, idempotencyKey?: string) =>
+    request<T>(path, { method: 'POST', body, timeoutMs: SLIP_REQUEST_TIMEOUT_MS, idempotencyKey, interruptible: true }),
   document: async (path: string) => {
     const token = getAccessToken();
     const timeout = timeoutSignal(90_000);

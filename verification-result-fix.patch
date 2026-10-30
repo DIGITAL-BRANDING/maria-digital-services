@@ -1,0 +1,721 @@
+From 6709a1dfd330ff727fc3a52d25757124ad84d4f5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 09:18:41 +0100
+Subject: [PATCH] Fix verification result presentation (false failures, 'user
+ aborted request')
+
+Backend: a provider response that does not prove failure - 'pending/processing'
+status, 5xx/408 gateway errors, unreadable body (Hubbu) or a 45s timeout /
+gateway error (K-Tech) - is now treated as outcome-unknown: the transaction
+stays PENDING (no refund, no 'failed') and is flagged on
+/admin/provider-reconciliation. Explicit rejections still fail and refund.
+
+Web: slip pages waited only 20s while the provider can take ~45s+, so the
+browser aborted ('The user aborted a request') while the server went on to
+succeed. Slip calls now wait 110s, report a cut-off as 'still processing -
+do not resubmit' instead of an error, send a per-input Idempotency-Key so a
+retry replays rather than double-bills, and poll Recent requests so the
+finished document appears by itself.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015YoLAo63RFk6PcWruuMD9h
+---
+ .../services/__tests__/hubbu.outcome.test.ts  | 71 +++++++++++++++++++
+ maria_backend/src/services/hubbu.service.ts   | 24 ++++++-
+ maria_backend/src/services/ktech.service.ts   | 12 ++++
+ .../src/services/verification.service.ts      | 10 +++
+ web/src/components/verification/shared.tsx    | 52 +++++++++++++-
+ web/src/lib/api.ts                            | 35 ++++++++-
+ web/src/pages/VerificationPage.tsx            | 49 +++++++++++--
+ .../verification/BvnVerificationPage.tsx      | 20 ++++--
+ .../DemographicVerificationPage.tsx           | 19 +++--
+ .../verification/NinPhoneVerificationPage.tsx | 19 ++---
+ .../pages/verification/PhoneMultiplePage.tsx  | 19 +++--
+ 11 files changed, 299 insertions(+), 31 deletions(-)
+ create mode 100644 maria_backend/src/services/__tests__/hubbu.outcome.test.ts
+
+diff --git a/maria_backend/src/services/__tests__/hubbu.outcome.test.ts b/maria_backend/src/services/__tests__/hubbu.outcome.test.ts
+new file mode 100644
+index 0000000..00e3157
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/hubbu.outcome.test.ts
+@@ -0,0 +1,71 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++/**
++ * Regression tests for "provider dashboard says success, customer is told it
++ * failed": a response that does not prove failure (still processing, gateway
++ * timeout, unreadable body) must come back `ambiguous` - which keeps the
++ * transaction PENDING and un-refunded - never as a plain failure.
++ */
++vi.mock('../../config/env.js', () => ({ env: { HUBBU_API_KEY: 'test-key', HUBBU_BASE_URL: 'https://hubbu.test' } }));
++
++const { hubbuService } = await import('../hubbu.service.js');
++
++function mockFetch(response: Response | Error) {
++  vi.stubGlobal('fetch', vi.fn(async () => {
++    if (response instanceof Error) throw response;
++    return response;
++  }));
++}
++const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
++
++afterEach(() => vi.unstubAllGlobals());
++
++describe('hubbu outcome mapping', () => {
++  it('success with data is ok', async () => {
++    mockFetch(json({ status: true, message: 'ok', data: { result: { a: 1 }, pdf_base64: 'JVBERi0=' } }));
++    const r = await hubbuService.ninByNin('12345678901', 'premium');
++    expect(r.ok).toBe(true);
++    expect(r.ambiguous).toBeUndefined();
++  });
++
++  it.each(['pending', 'processing', 'queued', 'In_Progress'])('status "%s" is ambiguous, not a failure', async (status) => {
++    mockFetch(json({ status, message: 'working' }));
++    const r = await hubbuService.ninByNin('12345678901', 'premium');
++    expect(r.ok).toBe(false);
++    expect(r.ambiguous).toBe(true);
++  });
++
++  it.each([502, 504, 524, 408])('HTTP %i with an HTML body is ambiguous', async (code) => {
++    mockFetch(new Response('<html>gateway timeout</html>', { status: code }));
++    const r = await hubbuService.bvnSlip('12345678901', 'premium');
++    expect(r.ambiguous).toBe(true);
++  });
++
++  it('HTTP 504 with a JSON body that has no status is ambiguous', async () => {
++    mockFetch(json({ message: 'upstream timeout' }, 504));
++    expect((await hubbuService.ninByNin('12345678901', 'premium')).ambiguous).toBe(true);
++  });
++
++  it('a network timeout is ambiguous', async () => {
++    mockFetch(Object.assign(new Error('timed out'), { name: 'TimeoutError' }));
++    expect((await hubbuService.ninByNin('12345678901', 'premium')).ambiguous).toBe(true);
++  });
++
++  it('an explicit rejection stays a plain failure (refundable)', async () => {
++    mockFetch(json({ status: false, message: 'NIN not found' }, 422));
++    const r = await hubbuService.ninByNin('12345678901', 'premium');
++    expect(r.ok).toBe(false);
++    expect(r.ambiguous).toBeFalsy();
++    expect(r.message).toBe('NIN not found');
++  });
++
++  it('an explicit rejection delivered with HTTP 500 is still a plain failure', async () => {
++    mockFetch(json({ status: false, message: 'Provider error' }, 500));
++    expect((await hubbuService.ninByNin('12345678901', 'premium')).ambiguous).toBeFalsy();
++  });
++
++  it('status "error" with a 4xx is a plain failure', async () => {
++    mockFetch(json({ status: 'error', message: 'Invalid slip type' }, 400));
++    expect((await hubbuService.ninByNin('12345678901', 'premium')).ambiguous).toBeFalsy();
++  });
++});
+diff --git a/maria_backend/src/services/hubbu.service.ts b/maria_backend/src/services/hubbu.service.ts
+index a707ed7..7e394ef 100644
+--- a/maria_backend/src/services/hubbu.service.ts
++++ b/maria_backend/src/services/hubbu.service.ts
+@@ -20,6 +20,17 @@ function asRecord(value: unknown): HubbuResponse | undefined {
+     : undefined;
+ }
+ 
++/** Provider statuses that mean "accepted, still working" - never a rejection. */
++const IN_PROGRESS_STATUSES = new Set(['pending', 'processing', 'queued', 'in_progress', 'in-progress', 'submitted', 'accepted', 'awaiting']);
++/** Statuses the provider uses when it deliberately rejected the request. */
++const REJECTED_STATUSES = new Set(['error', 'failed', 'failure', 'rejected', 'declined']);
++const IN_PROGRESS_MESSAGE = 'Your request is still being processed by the provider. It will appear under Recent requests as soon as it completes - please do not submit it again yet.';
++
++/** A gateway/proxy error (502/504/524...) says nothing about whether the provider finished the job. */
++function isGatewayFailure(httpStatus: number) {
++  return httpStatus >= 500 || httpStatus === 408;
++}
++
+ function configured() {
+   if (!env.HUBBU_API_KEY) throw new ApiError(503, 'Hubbu verification provider is not configured.', 'PROVIDER_NOT_CONFIGURED');
+ }
+@@ -54,14 +65,14 @@ async function post(
+   try { rawPayload = await response.json(); }
+   catch {
+     console.error('[hubbu] invalid JSON response', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
+-    const ambiguous = response.ok;
++    const ambiguous = response.ok || isGatewayFailure(response.status);
+     return { ok: false, ambiguous, message: ambiguous
+       ? 'Hubbu may have completed this request, but returned an unreadable response. Check your transaction history before trying again.'
+       : 'The verification provider returned an invalid response.', raw: null };
+   }
+   const payload = asRecord(rawPayload);
+   if (!payload) {
+-    const ambiguous = response.ok;
++    const ambiguous = response.ok || isGatewayFailure(response.status);
+     console.error('[hubbu] unexpected response body', { path, method: context.method ?? body.method, reference: context.reference, httpStatus: response.status, bodyType: rawPayload === null ? 'null' : Array.isArray(rawPayload) ? 'array' : typeof rawPayload, elapsedMs: Date.now() - startedAt });
+     return { ok: false, ambiguous, message: ambiguous
+       ? 'Hubbu may have completed this request, but returned an empty or unexpected response. Check your transaction history before trying again.'
+@@ -70,6 +81,12 @@ async function post(
+   const data = payload.data ?? {};
+   const providerSucceeded = payload.status === true || (typeof payload.status === 'string' && payload.status.toLowerCase() === 'success');
+   const ok = response.ok && providerSucceeded;
++  const statusText = typeof payload.status === 'string' ? payload.status.trim().toLowerCase() : '';
++  const explicitlyRejected = payload.status === false || REJECTED_STATUSES.has(statusText);
++  // Never refund (and tell the customer "failed") when the provider only said
++  // "pending/processing", or when a gateway error hides the real outcome - the
++  // slip may well be delivered a moment later. Those stay PENDING for reconciliation.
++  const inProgress = !ok && !explicitlyRejected && (IN_PROGRESS_STATUSES.has(statusText) || isGatewayFailure(response.status));
+   const downloadUrl = typeof data.download_url === 'string' ? data.download_url : undefined;
+   console.info('[hubbu] response received', {
+     path,
+@@ -95,6 +112,9 @@ async function post(
+       message: payload.message
+     });
+   }
++  if (inProgress) {
++    return { ok: false, ambiguous: true, message: IN_PROGRESS_MESSAGE, raw: payload };
++  }
+   return {
+     ok,
+     message: payload.message || (ok ? 'Verification successful' : 'The verification provider could not complete this request.'),
+diff --git a/maria_backend/src/services/ktech.service.ts b/maria_backend/src/services/ktech.service.ts
+index 80751c1..71662f2 100644
+--- a/maria_backend/src/services/ktech.service.ts
++++ b/maria_backend/src/services/ktech.service.ts
+@@ -196,11 +196,23 @@ export class KtechService {
+       });
+     } catch (error) {
+       console.error(`[ktech] network error calling ${path}:`, error);
++      // Our 45s timeout firing means K-Tech may still have produced the slip -
++      // refunding here is how a customer ended up charged-by-provider but shown
++      // "failed". Keep it pending; only a plain connection failure is a safe refund.
++      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
++      if (timedOut) {
++        return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: null };
++      }
+       return { ok: false, message: 'Could not reach the verification provider - please try again shortly', raw: null };
+     }
+ 
+     const data = (await response.json().catch(() => ({}))) as KtechResponse;
+ 
++    if (!response.ok && (response.status >= 500 || response.status === 408) && (data as { status?: unknown }).status !== false) {
++      console.error(`[ktech] gateway/server error on slip lookup (path=${path}, http=${response.status}) - outcome unknown, leaving pending`);
++      return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: data };
++    }
++
+     if (!response.ok || data.status !== true) {
+       // `sentFields` = the NAMES of the body fields we sent (never values, they are personal data).
+       // When K-Tech complains about a missing parameter this shows at a glance whether we sent it.
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index 09c5bf6..2586669 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -15,6 +15,7 @@ import {
+ } from './techhub.service.js';
+ import { ktechService, type KtechNinSlipTier } from './ktech.service.js';
+ import { hubbuService } from './hubbu.service.js';
++import { flagPendingReconciliation } from './provider-reconciliation.service.js';
+ 
+ type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
+ async function providerForService(service: VerificationServiceKey): Promise<IdentityProvider> {
+@@ -359,6 +360,15 @@ async function purchaseSlip(params: {
+         } as Prisma.InputJsonValue
+       }
+     });
++    // Put it on /admin/provider-reconciliation so an admin who sees it as
++    // successful on the provider's dashboard can settle it (and one who
++    // doesn't can refund it) - without this it sat PENDING with nobody alerted.
++    await flagPendingReconciliation({
++      transactionId: debit.transaction.id,
++      provider: params.provider,
++      providerMessage: provider.message,
++      rawStatus: provider.raw
++    }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
+     return {
+       status: false,
+       pending: true,
+diff --git a/web/src/components/verification/shared.tsx b/web/src/components/verification/shared.tsx
+index 26e198c..f42647e 100644
+--- a/web/src/components/verification/shared.tsx
++++ b/web/src/components/verification/shared.tsx
+@@ -1,5 +1,5 @@
+ import { Download, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
+-import { useEffect, useState } from 'react';
++import { useCallback, useEffect, useRef, useState } from 'react';
+ import { api } from '../../lib/api';
+ 
+ // ── Shared types ────────────────────────────────────────────────
+@@ -105,6 +105,18 @@ export function useVerificationPrices() {
+ export function useVerificationHistory(serviceKey: string) {
+   const [history, setHistory] = useState<VerificationHistory[]>([]);
+   const [loading, setLoading] = useState(false);
++  const [watching, setWatching] = useState(false);
++
++  const refresh = useCallback(async () => {
++    if (!serviceKey) return;
++    try {
++      const result = await api.get<{ status: boolean; data: VerificationHistory[] }>(`/verification/history?service=${encodeURIComponent(serviceKey)}`);
++      setHistory(result.data ?? []);
++    } catch {
++      /* keep what we already show - a failed refresh must not blank the table */
++    }
++  }, [serviceKey]);
++
+   useEffect(() => {
+     if (!serviceKey) {
+       setHistory([]);
+@@ -127,7 +139,43 @@ export function useVerificationHistory(serviceKey: string) {
+       active = false;
+     };
+   }, [serviceKey]);
+-  return { history, loading };
++
++  // After a request whose outcome we could not confirm (timed out / still
++  // processing), poll "Recent requests" for a couple of minutes so the finished
++  // document appears by itself instead of the customer assuming it failed.
++  useEffect(() => {
++    if (!watching) return;
++    void refresh();
++    const interval = window.setInterval(() => void refresh(), 8_000);
++    const stop = window.setTimeout(() => setWatching(false), 150_000);
++    return () => {
++      window.clearInterval(interval);
++      window.clearTimeout(stop);
++    };
++  }, [watching, refresh]);
++
++  return { history, loading, refresh, watch: () => setWatching(true) };
++}
++
++/**
++ * One Idempotency-Key per attempt: kept after a timeout so a retry replays the
++ * original request (no double charge, and the finished slip is returned),
++ * cleared as soon as the server gives a definitive answer.
++ */
++export function useIdempotencyKey() {
++  const ref = useRef<{ key: string; fingerprint: string } | null>(null);
++  return {
++    // `fingerprint` identifies the submitted inputs: if the customer edits them
++    // after a timeout it is a NEW request, so it must get a new key (otherwise
++    // the server would replay the old one).
++    current: (fingerprint = '') => {
++      if (!ref.current || ref.current.fingerprint !== fingerprint) ref.current = { key: crypto.randomUUID(), fingerprint };
++      return ref.current.key;
++    },
++    reset: () => {
++      ref.current = null;
++    }
++  };
+ }
+ 
+ // ── Polling for async (ticketed) services ───────────────────────
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index caa4cc4..d0644a4 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -46,6 +46,20 @@ export function clearTokens() {
+   writeStorage(REFRESH_KEY, null);
+ }
+ 
++/** Slip/verification calls can legitimately take over a minute at the provider. */
++export const SLIP_REQUEST_TIMEOUT_MS = 110_000;
++
++export const REQUEST_INTERRUPTED = 'REQUEST_INTERRUPTED';
++
++export const INTERRUPTED_MESSAGE =
++  'This is taking longer than usual, but your request may still complete. Please do NOT submit it again - check "Recent requests" below in a minute (it refreshes automatically), and your document will appear there once it is ready.';
++
++/** Browsers word a cancelled/timed-out fetch differently ("The user aborted a request", "signal timed out", "Load failed"...). */
++function isInterruption(error: unknown) {
++  if (!(error instanceof Error) || error instanceof ApiError) return false;
++  return error.name === 'AbortError' || error.name === 'TimeoutError' || error.name === 'TypeError';
++}
++
+ export class ApiError extends Error {
+   status: number;
+   code?: string;
+@@ -58,9 +72,9 @@ export class ApiError extends Error {
+ 
+ async function request<T>(
+   path: string,
+-  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number; idempotencyKey?: string } = {}
++  options: { method?: string; body?: unknown; auth?: boolean; timeoutMs?: number; idempotencyKey?: string; interruptible?: boolean } = {}
+ ): Promise<T> {
+-  const { method = 'GET', body, auth = true, timeoutMs = 20_000, idempotencyKey } = options;
++  const { method = 'GET', body, auth = true, timeoutMs = 20_000, idempotencyKey, interruptible = false } = options;
+ 
+   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+   if (auth) {
+@@ -93,15 +107,32 @@ async function request<T>(
+     }
+ 
+     return payload as T;
++  } catch (error) {
++    // The request may well have reached the server and succeeded - never show
++    // the browser's raw "user aborted a request" wording as if it had failed.
++    if (interruptible && isInterruption(error)) throw new ApiError(INTERRUPTED_MESSAGE, 0, REQUEST_INTERRUPTED);
++    throw error;
+   } finally {
+     timeout.clear();
+   }
+ }
+ 
++/** True when a request was cut off on our side (timeout/network) - the outcome is unknown, not a failure. */
++export function wasInterrupted(error: unknown) {
++  return error instanceof ApiError && error.code === REQUEST_INTERRUPTED;
++}
++
+ export const api = {
+   get: <T>(path: string, auth = true) => request<T>(path, { method: 'GET', auth }),
+   post: <T>(path: string, body?: unknown, auth = true, timeoutMs = 20_000, idempotencyKey?: string) =>
+     request<T>(path, { method: 'POST', body, auth, timeoutMs, idempotencyKey }),
++  /**
++   * For purchases that call a slow upstream provider (NIN/BVN slips...): waits
++   * long enough for the provider, and reports a cut-off as "outcome unknown"
++   * (see wasInterrupted) rather than a failure.
++   */
++  postSlip: <T>(path: string, body: unknown, idempotencyKey?: string) =>
++    request<T>(path, { method: 'POST', body, timeoutMs: SLIP_REQUEST_TIMEOUT_MS, idempotencyKey, interruptible: true }),
+   document: async (path: string) => {
+     const token = getAccessToken();
+     const timeout = timeoutSignal(90_000);
+diff --git a/web/src/pages/VerificationPage.tsx b/web/src/pages/VerificationPage.tsx
+index 62b989a..0fe6ef7 100644
+--- a/web/src/pages/VerificationPage.tsx
++++ b/web/src/pages/VerificationPage.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useMemo, useState, type FormEvent } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+ import { useNavigate } from 'react-router-dom';
+ import {
+   Fingerprint,
+@@ -16,7 +16,7 @@ import {
+   Clock,
+ } from 'lucide-react';
+ import AppShell from '../components/AppShell';
+-import { api, ApiError } from '../lib/api';
++import { api, ApiError, wasInterrupted } from '../lib/api';
+ import { PinConfirmDialog } from '../components/PinConfirmDialog';
+ 
+ type Mode = 'nin' | 'bvn' | 'delink';
+@@ -165,6 +165,30 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
+   }, [selected, tier, prices, values.validation_type]);
+   const selectedServiceKey = selected ? (selected.id === 'validation' ? validationServiceKey(values.validation_type) : keyFor(selected, tier)) : '';
+ 
++  const slipKey = useRef<{ key: string; fingerprint: string } | null>(null);
++  // A new key whenever the submitted inputs change - after a timeout an edited form is a NEW request.
++  const slipKeyFor = (fingerprint: string) => {
++    if (slipKey.current?.fingerprint !== fingerprint) slipKey.current = { key: crypto.randomUUID(), fingerprint };
++    return slipKey.current.key;
++  };
++  const [watching, setWatching] = useState(false);
++  const refreshHistory = useCallback(async () => {
++    if (!selectedServiceKey) return;
++    try {
++      const result = await api.get<{ status: boolean; data: VerificationHistory[] }>(`/verification/history?service=${encodeURIComponent(selectedServiceKey)}`);
++      setHistory(result.data ?? []);
++    } catch { /* keep the table we already have */ }
++  }, [selectedServiceKey]);
++  // After a request whose outcome is unknown (timeout / still processing),
++  // poll Recent requests so the finished document shows up by itself.
++  useEffect(() => {
++    if (!watching) return;
++    void refreshHistory();
++    const interval = window.setInterval(() => void refreshHistory(), 8_000);
++    const stop = window.setTimeout(() => setWatching(false), 150_000);
++    return () => { window.clearInterval(interval); window.clearTimeout(stop); };
++  }, [watching, refreshHistory]);
++
+   useEffect(() => {
+     if (!selectedServiceKey) {
+       setHistory([]);
+@@ -217,11 +241,24 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
+     setMessage('');
+     try {
+       const data = { ...values, ...(selected.tiers ? { tier } : {}), pin };
+-      const result = await api.post<{
++      type SubmitResult = {
+         status: boolean;
++        pending?: boolean;
+         message: string;
+-      data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
+-      }>(selected.path, data);
++        data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
++      };
++      const isSlip = !selected.async && selected.id !== 'license-onboarding';
++      // Slips wait on a slow upstream provider: allow it ample time and send a
++      // stable key so a retry after a timeout replays the request, not re-bills it.
++      const result = isSlip
++        ? await api.postSlip<SubmitResult>(selected.path, data, slipKeyFor(JSON.stringify([selected.path, { ...data, pin: undefined }])))
++        : await api.post<SubmitResult>(selected.path, data);
++      if (isSlip && result.pending) {
++        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
++        setWatching(true);
++        return;
++      }
++      slipKey.current = null;
+       if (!result.status) throw new Error(result.message);
+ 
+       if (selected.id === 'license-onboarding') {
+@@ -245,6 +282,8 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
+         setMessage(result.message || 'Done - your document is ready below.');
+       }
+     } catch (error) {
++      if (wasInterrupted(error)) setWatching(true);
++      else slipKey.current = null;
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+diff --git a/web/src/pages/verification/BvnVerificationPage.tsx b/web/src/pages/verification/BvnVerificationPage.tsx
+index 13e4dee..1b15e0d 100644
+--- a/web/src/pages/verification/BvnVerificationPage.tsx
++++ b/web/src/pages/verification/BvnVerificationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2, Terminal } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -11,6 +11,7 @@ import {
+   VerificationHistoryView,
+   useVerificationPrices,
+   useVerificationHistory,
++  useIdempotencyKey,
+   money,
+   FORM_SECTION_CLASSES,
+   FORM_INPUT_CLASSES,
+@@ -40,7 +41,8 @@ export default function BvnVerificationPage() {
+   const [message, setMessage] = useState('');
+   const [result, setResult] = useState<SlipResult | null>(null);
+ 
+-  const { history, loading: loadingHistory } = useVerificationHistory(TIER_KEY[tier]);
++  const { history, loading: loadingHistory, watch } = useVerificationHistory(TIER_KEY[tier]);
++  const idempotency = useIdempotencyKey();
+   const price = useMemo(() => prices[TIER_KEY[tier]], [tier, prices]);
+ 
+   function prepare(event: FormEvent) {
+@@ -53,15 +55,25 @@ export default function BvnVerificationPage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.post<{
++      const result = await api.postSlip<{
+         status: boolean;
++        pending?: boolean;
+         message: string;
+         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>('/verification/bvn/slip', { bvn, tier, pin });
++      }>('/verification/bvn/slip', { bvn, tier, pin }, idempotency.current(`${bvn}|${tier}`));
++      if (result.pending) {
++        // Not a failure: the provider has not confirmed yet. Keep the key so a retry replays this request.
++        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
++        watch();
++        return;
++      }
++      idempotency.reset();
+       if (!result.status) throw new Error(result.message);
+       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+       setMessage(result.message || 'Done - your document is ready below.');
+     } catch (error) {
++      if (wasInterrupted(error)) watch();
++      else idempotency.reset();
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+diff --git a/web/src/pages/verification/DemographicVerificationPage.tsx b/web/src/pages/verification/DemographicVerificationPage.tsx
+index b06b36f..3088543 100644
+--- a/web/src/pages/verification/DemographicVerificationPage.tsx
++++ b/web/src/pages/verification/DemographicVerificationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -11,6 +11,7 @@ import {
+   VerificationHistoryView,
+   useVerificationPrices,
+   useVerificationHistory,
++  useIdempotencyKey,
+   money,
+   TILE_CLASSES,
+   TILE_SELECTED_CLASSES,
+@@ -48,7 +49,8 @@ type Gender = '' | 'MALE' | 'FEMALE';
+ 
+ export default function DemographicVerificationPage() {
+   const { prices } = useVerificationPrices();
+-  const { history, loading: loadingHistory } = useVerificationHistory('NIN_DEMOGRAPHIC');
++  const { history, loading: loadingHistory, watch } = useVerificationHistory('NIN_DEMOGRAPHIC');
++  const idempotency = useIdempotencyKey();
+   const price = prices['NIN_DEMOGRAPHIC'];
+ 
+   // Purely a visual pick — Techhub's nin_by_demo.php takes no tier
+@@ -82,8 +84,9 @@ export default function DemographicVerificationPage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.post<{
++      const result = await api.postSlip<{
+         status: boolean;
++        pending?: boolean;
+         message: string;
+         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+       }>('/verification/nin/by-demographic', {
+@@ -92,11 +95,19 @@ export default function DemographicVerificationPage() {
+         dob,
+         gender: gender || undefined,
+         pin,
+-      });
++      }, idempotency.current(`${firstname}|${lastname}|${dob}|${gender}`));
++      if (result.pending) {
++        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
++        watch();
++        return;
++      }
++      idempotency.reset();
+       if (!result.status) throw new Error(result.message);
+       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+       setMessage(result.message || 'Done - your document is ready below.');
+     } catch (error) {
++      if (wasInterrupted(error)) watch();
++      else idempotency.reset();
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+diff --git a/web/src/pages/verification/NinPhoneVerificationPage.tsx b/web/src/pages/verification/NinPhoneVerificationPage.tsx
+index 5ea5bd7..78ec1f5 100644
+--- a/web/src/pages/verification/NinPhoneVerificationPage.tsx
++++ b/web/src/pages/verification/NinPhoneVerificationPage.tsx
+@@ -1,7 +1,7 @@
+-import { useMemo, useRef, useState, type FormEvent } from 'react';
++import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -12,6 +12,7 @@ import {
+   VerificationHistoryView,
+   useVerificationPrices,
+   useVerificationHistory,
++  useIdempotencyKey,
+   money,
+   FORM_SECTION_CLASSES,
+   FORM_INPUT_CLASSES,
+@@ -74,7 +75,7 @@ export default function NinPhoneVerificationPage() {
+   const [busy, setBusy] = useState(false);
+   const [message, setMessage] = useState('');
+   const [result, setResult] = useState<SlipResult | null>(null);
+-  const idempotencyKey = useRef<string | null>(null);
++  const idempotency = useIdempotencyKey();
+ 
+   const demographicLookup = method === 'demographic';
+   const phoneTiers = useMemo(() => PHONE_TIERS.filter((tier) => {
+@@ -88,7 +89,7 @@ export default function NinPhoneVerificationPage() {
+   }), [priceRows]);
+   const selectedPhoneTier = phoneTiers.includes(phoneTier) ? phoneTier : phoneTiers[0] ?? 'premium';
+   const serviceKey = method === 'phone' ? PHONE_KEY[selectedPhoneTier] : demographicLookup ? 'NIN_DEMOGRAPHIC' : NIN_KEY[ninTier];
+-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
++  const { history, loading: loadingHistory, watch } = useVerificationHistory(serviceKey);
+   const price = useMemo(() => (serviceKey ? prices[serviceKey] : undefined), [serviceKey, prices]);
+ 
+   function prepare(event: FormEvent) {
+@@ -108,28 +109,30 @@ export default function NinPhoneVerificationPage() {
+     setShowPin(false);
+     setBusy(true);
+     setMessage('');
+-    idempotencyKey.current ??= crypto.randomUUID();
+     try {
+       const path = demographicLookup ? '/verification/nin/by-demographic' : method === 'nin' ? '/verification/nin/by-nin' : '/verification/nin/by-phone';
+       const body = demographicLookup
+         ? { firstname, lastname, gender, dob, pin }
+         : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
+-      const result = await api.post<{
++      const result = await api.postSlip<{
+         status: boolean;
+         pending?: boolean;
+         message: string;
+         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>(path, body, true, 60_000, idempotencyKey.current);
++      }>(path, body, idempotency.current(JSON.stringify(body)));
+       if (result.pending) {
+         setMessage(`${result.message} Reference: ${result.data?.reference ?? 'check your transaction history'}. Please do not submit this request again yet.`);
++        watch();
+         return;
+       }
+-      idempotencyKey.current = null;
++      idempotency.reset();
+       if (!result.status) throw new Error(result.message);
+       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+       setMessage(result.message || 'Done - your document is ready below.');
+     } catch (error) {
+       // Keep the idempotency key after a browser/network timeout to prevent a duplicate provider call.
++      if (wasInterrupted(error)) watch();
++      else idempotency.reset();
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+diff --git a/web/src/pages/verification/PhoneMultiplePage.tsx b/web/src/pages/verification/PhoneMultiplePage.tsx
+index a6259f3..5a472ba 100644
+--- a/web/src/pages/verification/PhoneMultiplePage.tsx
++++ b/web/src/pages/verification/PhoneMultiplePage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -12,6 +12,7 @@ import {
+   VerificationHistoryView,
+   useVerificationPrices,
+   useVerificationHistory,
++  useIdempotencyKey,
+   money,
+   FORM_SECTION_CLASSES,
+   FORM_INPUT_CLASSES,
+@@ -56,7 +57,8 @@ export default function PhoneMultiplePage() {
+   const safeTier = phoneTiers.includes(tier) ? tier : phoneTiers[0] ?? 'premium';
+ 
+   const serviceKey = PHONE_KEY[safeTier];
+-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
++  const { history, loading: loadingHistory, watch } = useVerificationHistory(serviceKey);
++  const idempotency = useIdempotencyKey();
+   const price = prices[serviceKey];
+ 
+   function prepare(event: FormEvent) {
+@@ -69,15 +71,24 @@ export default function PhoneMultiplePage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.post<{
++      const result = await api.postSlip<{
+         status: boolean;
++        pending?: boolean;
+         message: string;
+         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, true, 60_000);
++      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, idempotency.current(`${phone}|${safeTier}`));
++      if (result.pending) {
++        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
++        watch();
++        return;
++      }
++      idempotency.reset();
+       if (!result.status) throw new Error(result.message);
+       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+       setMessage(result.message || 'Done - your document is ready below.');
+     } catch (error) {
++      if (wasInterrupted(error)) watch();
++      else idempotency.reset();
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+-- 
+2.43.0
+

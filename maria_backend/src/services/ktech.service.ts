@@ -196,10 +196,22 @@ export class KtechService {
       });
     } catch (error) {
       console.error(`[ktech] network error calling ${path}:`, error);
+      // Our 45s timeout firing means K-Tech may still have produced the slip -
+      // refunding here is how a customer ended up charged-by-provider but shown
+      // "failed". Keep it pending; only a plain connection failure is a safe refund.
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      if (timedOut) {
+        return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: null };
+      }
       return { ok: false, message: 'Could not reach the verification provider - please try again shortly', raw: null };
     }
 
     const data = (await response.json().catch(() => ({}))) as KtechResponse;
+
+    if (!response.ok && (response.status >= 500 || response.status === 408) && (data as { status?: unknown }).status !== false) {
+      console.error(`[ktech] gateway/server error on slip lookup (path=${path}, http=${response.status}) - outcome unknown, leaving pending`);
+      return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: data };
+    }
 
     if (!response.ok || data.status !== true) {
       // `sentFields` = the NAMES of the body fields we sent (never values, they are personal data).

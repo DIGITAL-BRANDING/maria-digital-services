@@ -15,6 +15,7 @@ import {
 } from './techhub.service.js';
 import { ktechService, type KtechNinSlipTier } from './ktech.service.js';
 import { hubbuService } from './hubbu.service.js';
+import { flagPendingReconciliation } from './provider-reconciliation.service.js';
 
 type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
 async function providerForService(service: VerificationServiceKey): Promise<IdentityProvider> {
@@ -359,6 +360,15 @@ async function purchaseSlip(params: {
         } as Prisma.InputJsonValue
       }
     });
+    // Put it on /admin/provider-reconciliation so an admin who sees it as
+    // successful on the provider's dashboard can settle it (and one who
+    // doesn't can refund it) - without this it sat PENDING with nobody alerted.
+    await flagPendingReconciliation({
+      transactionId: debit.transaction.id,
+      provider: params.provider,
+      providerMessage: provider.message,
+      rawStatus: provider.raw
+    }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
     return {
       status: false,
       pending: true,

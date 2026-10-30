@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2, Terminal } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError } from '../../lib/api';
+import { api, ApiError, wasInterrupted } from '../../lib/api';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -11,6 +11,7 @@ import {
   VerificationHistoryView,
   useVerificationPrices,
   useVerificationHistory,
+  useIdempotencyKey,
   money,
   FORM_SECTION_CLASSES,
   FORM_INPUT_CLASSES,
@@ -40,7 +41,8 @@ export default function BvnVerificationPage() {
   const [message, setMessage] = useState('');
   const [result, setResult] = useState<SlipResult | null>(null);
 
-  const { history, loading: loadingHistory } = useVerificationHistory(TIER_KEY[tier]);
+  const { history, loading: loadingHistory, watch } = useVerificationHistory(TIER_KEY[tier]);
+  const idempotency = useIdempotencyKey();
   const price = useMemo(() => prices[TIER_KEY[tier]], [tier, prices]);
 
   function prepare(event: FormEvent) {
@@ -53,15 +55,25 @@ export default function BvnVerificationPage() {
     setBusy(true);
     setMessage('');
     try {
-      const result = await api.post<{
+      const result = await api.postSlip<{
         status: boolean;
+        pending?: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>('/verification/bvn/slip', { bvn, tier, pin });
+      }>('/verification/bvn/slip', { bvn, tier, pin }, idempotency.current(`${bvn}|${tier}`));
+      if (result.pending) {
+        // Not a failure: the provider has not confirmed yet. Keep the key so a retry replays this request.
+        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+        watch();
+        return;
+      }
+      idempotency.reset();
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');
     } catch (error) {
+      if (wasInterrupted(error)) watch();
+      else idempotency.reset();
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);

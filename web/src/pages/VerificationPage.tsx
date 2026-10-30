@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Fingerprint,
@@ -16,7 +16,7 @@ import {
   Clock,
 } from 'lucide-react';
 import AppShell from '../components/AppShell';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, wasInterrupted } from '../lib/api';
 import { PinConfirmDialog } from '../components/PinConfirmDialog';
 
 type Mode = 'nin' | 'bvn' | 'delink';
@@ -165,6 +165,30 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
   }, [selected, tier, prices, values.validation_type]);
   const selectedServiceKey = selected ? (selected.id === 'validation' ? validationServiceKey(values.validation_type) : keyFor(selected, tier)) : '';
 
+  const slipKey = useRef<{ key: string; fingerprint: string } | null>(null);
+  // A new key whenever the submitted inputs change - after a timeout an edited form is a NEW request.
+  const slipKeyFor = (fingerprint: string) => {
+    if (slipKey.current?.fingerprint !== fingerprint) slipKey.current = { key: crypto.randomUUID(), fingerprint };
+    return slipKey.current.key;
+  };
+  const [watching, setWatching] = useState(false);
+  const refreshHistory = useCallback(async () => {
+    if (!selectedServiceKey) return;
+    try {
+      const result = await api.get<{ status: boolean; data: VerificationHistory[] }>(`/verification/history?service=${encodeURIComponent(selectedServiceKey)}`);
+      setHistory(result.data ?? []);
+    } catch { /* keep the table we already have */ }
+  }, [selectedServiceKey]);
+  // After a request whose outcome is unknown (timeout / still processing),
+  // poll Recent requests so the finished document shows up by itself.
+  useEffect(() => {
+    if (!watching) return;
+    void refreshHistory();
+    const interval = window.setInterval(() => void refreshHistory(), 8_000);
+    const stop = window.setTimeout(() => setWatching(false), 150_000);
+    return () => { window.clearInterval(interval); window.clearTimeout(stop); };
+  }, [watching, refreshHistory]);
+
   useEffect(() => {
     if (!selectedServiceKey) {
       setHistory([]);
@@ -217,11 +241,24 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
     setMessage('');
     try {
       const data = { ...values, ...(selected.tiers ? { tier } : {}), pin };
-      const result = await api.post<{
+      type SubmitResult = {
         status: boolean;
+        pending?: boolean;
         message: string;
-      data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
-      }>(selected.path, data);
+        data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
+      };
+      const isSlip = !selected.async && selected.id !== 'license-onboarding';
+      // Slips wait on a slow upstream provider: allow it ample time and send a
+      // stable key so a retry after a timeout replays the request, not re-bills it.
+      const result = isSlip
+        ? await api.postSlip<SubmitResult>(selected.path, data, slipKeyFor(JSON.stringify([selected.path, { ...data, pin: undefined }])))
+        : await api.post<SubmitResult>(selected.path, data);
+      if (isSlip && result.pending) {
+        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+        setWatching(true);
+        return;
+      }
+      slipKey.current = null;
       if (!result.status) throw new Error(result.message);
 
       if (selected.id === 'license-onboarding') {
@@ -245,6 +282,8 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
         setMessage(result.message || 'Done - your document is ready below.');
       }
     } catch (error) {
+      if (wasInterrupted(error)) setWatching(true);
+      else slipKey.current = null;
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);

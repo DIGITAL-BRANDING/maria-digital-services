@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError } from '../../lib/api';
+import { api, ApiError, wasInterrupted } from '../../lib/api';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -12,6 +12,7 @@ import {
   VerificationHistoryView,
   useVerificationPrices,
   useVerificationHistory,
+  useIdempotencyKey,
   money,
   FORM_SECTION_CLASSES,
   FORM_INPUT_CLASSES,
@@ -56,7 +57,8 @@ export default function PhoneMultiplePage() {
   const safeTier = phoneTiers.includes(tier) ? tier : phoneTiers[0] ?? 'premium';
 
   const serviceKey = PHONE_KEY[safeTier];
-  const { history, loading: loadingHistory } = useVerificationHistory(serviceKey);
+  const { history, loading: loadingHistory, watch } = useVerificationHistory(serviceKey);
+  const idempotency = useIdempotencyKey();
   const price = prices[serviceKey];
 
   function prepare(event: FormEvent) {
@@ -69,15 +71,24 @@ export default function PhoneMultiplePage() {
     setBusy(true);
     setMessage('');
     try {
-      const result = await api.post<{
+      const result = await api.postSlip<{
         status: boolean;
+        pending?: boolean;
         message: string;
         data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, true, 60_000);
+      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, idempotency.current(`${phone}|${safeTier}`));
+      if (result.pending) {
+        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+        watch();
+        return;
+      }
+      idempotency.reset();
       if (!result.status) throw new Error(result.message);
       setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
       setMessage(result.message || 'Done - your document is ready below.');
     } catch (error) {
+      if (wasInterrupted(error)) watch();
+      else idempotency.reset();
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);
