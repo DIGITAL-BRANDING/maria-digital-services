@@ -4,7 +4,7 @@ import { api } from '../../lib/api';
 
 // ── Shared types ────────────────────────────────────────────────
 export type PriceRow = { service: string; unitPrice: number; isActive: boolean; provider?: string };
-export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; reference: string };
+export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; document_url?: string; reference: string };
 export type AsyncResult = { ticket_id: string; reference: string };
 export type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
 export type VerificationHistory = {
@@ -326,9 +326,40 @@ export function DetailsOverviewGrid({ entries }: { entries: [string, unknown][] 
   );
 }
 
-function SlipDownloadAction({ pdfBase64, pdfUrl, reference }: { pdfBase64: string | null; pdfUrl: string | null; reference: string }) {
+export function SlipDownloadAction({ pdfBase64, pdfUrl, reference, documentUrl }: { pdfBase64: string | null; pdfUrl: string | null; reference: string; documentUrl?: string | null }) {
   const cleanBase64 = pdfBase64?.replace(/^data:application\/pdf;base64,/i, '') ?? null;
   const href = cleanBase64 ? `data:application/pdf;base64,${cleanBase64}` : pdfUrl?.startsWith('https://') ? pdfUrl : null;
+  const [opening, setOpening] = useState(false);
+  const [openError, setOpenError] = useState('');
+
+  // Some providers (Hubbu) confirm with a download link instead of the PDF itself.
+  // The server fetches it for the owner from the document endpoint - the same one
+  // "Recent requests" uses - so the customer never sees "no PDF" for a slip that exists.
+  if (!href && documentUrl) {
+    const open = async () => {
+      setOpening(true);
+      setOpenError('');
+      const tab = window.open('', '_blank');
+      try {
+        const blob = await api.document(documentUrl);
+        if (tab) tab.location.href = URL.createObjectURL(blob);
+        else window.location.href = URL.createObjectURL(blob);
+      } catch (error) {
+        tab?.close();
+        setOpenError(error instanceof Error ? error.message : 'Could not open the slip. Try "Retrieve PDF" under Recent requests.');
+      } finally {
+        setOpening(false);
+      }
+    };
+    return (
+      <>
+        <button type="button" onClick={() => void open()} disabled={opening} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 py-3 font-display font-semibold text-ink disabled:opacity-60">
+          {opening ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />} Download PDF slip
+        </button>
+        {openError && <p className="mt-2 font-body text-xs text-ember-600">{openError}</p>}
+      </>
+    );
+  }
 
   if (!href) {
     return (
@@ -434,7 +465,7 @@ export function SlipResultView({ result, message, onDone }: { result: SlipResult
           is a raw base64 string rather than a nested object, rendered that
           entire base64 blob as one unreadable "Photo: /9j/4AAQ..." row. */}
       {result.user_data && <DigitalSlipPreview data={result.user_data} />}
-      <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} />
+      <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} documentUrl={result.document_url} />
 
       <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
         Done

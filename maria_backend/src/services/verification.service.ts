@@ -212,6 +212,9 @@ export async function listVerificationPricesForAdmin() {
 export type SlipPurchaseResult = {
   status: boolean;
   pending?: boolean;
+  /** Background mode: the provider call is still running - poll GET /verification/slip/:reference. */
+  processing?: boolean;
+  transactionId?: string;
   message: string;
   reference: string;
   userData?: Record<string, unknown>;
@@ -251,7 +254,15 @@ async function purchaseSlip(params: {
   pii: Record<string, unknown>;
   idempotencyKey?: string;
   call: (reference: string) => Promise<TechhubSlipResult>;
+  /**
+   * Debit, then return right away while the provider call finishes in the
+   * background (the customer polls GET /verification/slip/:reference). Without
+   * it the HTTP request stays open for the provider's whole response time,
+   * which browsers/proxies cut off on slow lookups.
+   */
+  background?: boolean;
 }): Promise<SlipPurchaseResult> {
+  const startedAt = Date.now();
   const price = await getVerificationPrice(params.service);
 
   const debit = await debitWallet({
@@ -270,6 +281,7 @@ async function purchaseSlip(params: {
     // above) - fixed and known up front, no balance-delta correction needed.
     costKobo: price.providerCostKobo
   });
+  const debitedAfterMs = Date.now() - startedAt;
 
   if (debit.reused && debit.transaction.status !== TransactionStatus.PENDING) {
     const metadata = debit.transaction.metadata as Record<string, unknown> | null;
@@ -278,6 +290,7 @@ async function purchaseSlip(params: {
       status: debit.transaction.status === TransactionStatus.SUCCESS,
       message: 'Transaction already processed',
       reference: debit.reference,
+      transactionId: debit.transaction.id,
       userData: pii?.user_data,
       pdfBase64: pii?.pdf_base64,
       pdfUrl: pii?.pdf_url,
@@ -286,110 +299,239 @@ async function purchaseSlip(params: {
   }
 
   if (debit.reused && debit.transaction.status === TransactionStatus.PENDING) {
+    const reusedMetadata = debit.transaction.metadata as Record<string, unknown> | null;
     return {
       status: false,
       pending: true,
+      // Still running (as opposed to parked for admin review): the caller keeps polling.
+      processing: reusedMetadata?.provider_outcome !== 'unknown',
+      transactionId: debit.transaction.id,
       message: 'This request is still being checked. Review transaction history before trying again.',
       reference: debit.reference,
       balanceAfter: koboToNaira(debit.transaction.balanceAfterKobo)
     };
   }
 
-  const provider = await params.call(debit.reference);
-
-  if (provider.ok) {
-    const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
-    await prisma.transaction.update({
-      where: { id: debit.transaction.id },
-      data: {
-        status: TransactionStatus.SUCCESS,
-        provider: params.provider,
-        metadata: {
-          service: params.service,
-          ...params.operational,
-          unit_price: price.unitPrice,
-          pii: mergeSealedPII(existingMetadata?.pii, {
-            ...params.pii,
-            user_data: provider.userData,
-            pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
-            pdf_url: provider.pdfUrl,
-            hubbu_download_token: provider.downloadToken
-          })
-        } as Prisma.InputJsonValue
-      }
-    });
-
-    // Techhub quotes one flat rate per slip family, already stored as
-    // price.providerCostKobo above - no balance-delta correction available
-    // or needed (unlike Alrahuz data/airtime).
-    await recordProviderDebit({
+  const settle = async (): Promise<SlipPurchaseResult> => {
+    const providerStartedAt = Date.now();
+    const provider = await params.call(debit.reference);
+    const providerMs = Date.now() - providerStartedAt;
+    console.info('[slip-timing] provider responded', {
+      service: params.service,
       provider: params.provider,
-      amountKobo: price.providerCostKobo,
-      relatedTransactionId: debit.transaction.id,
-      description: params.description
-    }).catch((error) => {
-      console.error('[provider-ledger] failed to record debit for', debit.transaction.id, error);
-    });
-
-    return {
-      status: true,
-      message: provider.message,
       reference: debit.reference,
-      userData: provider.userData,
-      pdfBase64: provider.pdfBase64,
-      pdfUrl: provider.pdfUrl,
-      downloadToken: provider.downloadToken,
-      balanceAfter: debit.balanceAfter
-    };
-  }
+      providerMs,
+      ok: provider.ok,
+      ambiguous: Boolean(provider.ambiguous)
+    });
 
-  if (provider.ambiguous) {
-    // Hubbu may have fulfilled the request despite a timeout, malformed
-    // response, or dropped connection. Keep it pending for reconciliation;
-    // refunding could give the customer both the slip and their money back.
+    if (provider.ok) {
+      const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
+      await prisma.transaction.update({
+        where: { id: debit.transaction.id },
+        data: {
+          status: TransactionStatus.SUCCESS,
+          provider: params.provider,
+          metadata: {
+            service: params.service,
+            ...params.operational,
+            unit_price: price.unitPrice,
+            pii: mergeSealedPII(existingMetadata?.pii, {
+              ...params.pii,
+              user_data: provider.userData,
+              pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
+              pdf_url: provider.pdfUrl,
+              hubbu_download_token: provider.downloadToken
+            })
+          } as Prisma.InputJsonValue
+        }
+      });
+
+      // Techhub quotes one flat rate per slip family, already stored as
+      // price.providerCostKobo above - no balance-delta correction available
+      // or needed (unlike Alrahuz data/airtime).
+      await recordProviderDebit({
+        provider: params.provider,
+        amountKobo: price.providerCostKobo,
+        relatedTransactionId: debit.transaction.id,
+        description: params.description
+      }).catch((error) => {
+        console.error('[provider-ledger] failed to record debit for', debit.transaction.id, error);
+      });
+
+      return {
+        status: true,
+        message: provider.message,
+        reference: debit.reference,
+        transactionId: debit.transaction.id,
+        userData: provider.userData,
+        pdfBase64: provider.pdfBase64,
+        pdfUrl: provider.pdfUrl,
+        downloadToken: provider.downloadToken,
+        balanceAfter: debit.balanceAfter
+      };
+    }
+
+    if (provider.ambiguous) {
+      // Hubbu may have fulfilled the request despite a timeout, malformed
+      // response, or dropped connection. Keep it pending for reconciliation;
+      // refunding could give the customer both the slip and their money back.
+      await prisma.transaction.update({
+        where: { id: debit.transaction.id },
+        data: {
+          provider: params.provider,
+          metadata: {
+            service: params.service,
+            ...params.operational,
+            unit_price: price.unitPrice,
+            provider_outcome: 'unknown',
+            pii: sealPII(params.pii)
+          } as Prisma.InputJsonValue
+        }
+      });
+      // Put it on /admin/provider-reconciliation so an admin who sees it as
+      // successful on the provider's dashboard can settle it (and one who
+      // doesn't can refund it) - without this it sat PENDING with nobody alerted.
+      await flagPendingReconciliation({
+        transactionId: debit.transaction.id,
+        provider: params.provider,
+        providerMessage: provider.message,
+        rawStatus: provider.raw
+      }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
+      return {
+        status: false,
+        pending: true,
+        transactionId: debit.transaction.id,
+        message: provider.message,
+        reference: debit.reference,
+        balanceAfter: debit.balanceAfter
+      };
+    }
+
     await prisma.transaction.update({
       where: { id: debit.transaction.id },
       data: {
+        status: TransactionStatus.FAILED,
         provider: params.provider,
+        // Keep the provider's own reason so the polling endpoint can show the
+        // customer WHY it failed (e.g. "NIN not found"), not a generic message.
         metadata: {
-          service: params.service,
-          ...params.operational,
-          unit_price: price.unitPrice,
-          provider_outcome: 'unknown',
-          pii: sealPII(params.pii)
+          ...((debit.transaction.metadata as Record<string, unknown> | null) ?? {}),
+          failure_message: String(provider.message ?? '').slice(0, 300)
         } as Prisma.InputJsonValue
       }
     });
-    // Put it on /admin/provider-reconciliation so an admin who sees it as
-    // successful on the provider's dashboard can settle it (and one who
-    // doesn't can refund it) - without this it sat PENDING with nobody alerted.
-    await flagPendingReconciliation({
-      transactionId: debit.transaction.id,
-      provider: params.provider,
-      providerMessage: provider.message,
-      rawStatus: provider.raw
-    }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
+    const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
+
     return {
       status: false,
-      pending: true,
       message: provider.message,
       reference: debit.reference,
-      balanceAfter: debit.balanceAfter
+      transactionId: debit.transaction.id,
+      balanceAfter: koboToNaira(refunded.balanceAfterKobo)
     };
-  }
+  };
 
-  await prisma.transaction.update({
-    where: { id: debit.transaction.id },
-    data: { status: TransactionStatus.FAILED, provider: params.provider }
-  });
-  const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
+  const finish = async (): Promise<SlipPurchaseResult> => {
+    const result = await settle();
+    // One grep-able line per request so a slow one can be pinned on a stage:
+    // our own DB work (debit) vs the provider vs everything after it.
+    console.info('[slip-timing]', {
+      service: params.service,
+      provider: params.provider,
+      reference: debit.reference,
+      outcome: result.status ? 'success' : result.pending ? 'pending' : 'failed',
+      debitMs: debitedAfterMs,
+      totalMs: Date.now() - startedAt,
+      background: Boolean(params.background)
+    });
+    return result;
+  };
 
+  if (!params.background) return finish();
+
+  void finish().catch((error) => settleUnexpectedFailure(params, debit, error));
   return {
     status: false,
-    message: provider.message,
+    pending: true,
+    processing: true,
+    message: 'Verification in progress',
     reference: debit.reference,
-    balanceAfter: koboToNaira(refunded.balanceAfterKobo)
+    transactionId: debit.transaction.id,
+    balanceAfter: debit.balanceAfter
   };
+}
+
+/**
+ * A background settle() threw (DB hiccup after the provider answered, provider
+ * client misconfigured, ...). Nothing else is awaiting it, so without this the
+ * customer would poll "processing" forever. A configuration error means the
+ * provider never saw the request - refund. Anything else is unknown: park it
+ * for reconciliation rather than refund a slip that may have been issued.
+ */
+async function settleUnexpectedFailure(
+  params: { userId: string; provider: IdentityProvider },
+  debit: { transaction: { id: string } },
+  error: unknown
+) {
+  console.error('[slip] background settle failed', debit.transaction.id, error);
+  try {
+    const current = await prisma.transaction.findUnique({ where: { id: debit.transaction.id } });
+    if (!current || current.status !== TransactionStatus.PENDING) return;
+    const neverReachedProvider = error instanceof ApiError && /NOT_CONFIGURED$/.test(error.code ?? '');
+    if (neverReachedProvider) {
+      const metadata = (current.metadata as Record<string, unknown> | null) ?? {};
+      await prisma.transaction.update({
+        where: { id: current.id },
+        data: { status: TransactionStatus.FAILED, provider: params.provider, metadata: { ...metadata, failure_message: 'This service is temporarily unavailable.' } as Prisma.InputJsonValue }
+      });
+      await refundWallet({ transactionId: current.id, userId: params.userId });
+      return;
+    }
+    const metadata = (current.metadata as Record<string, unknown> | null) ?? {};
+    await prisma.transaction.update({
+      where: { id: current.id },
+      data: { provider: params.provider, metadata: { ...metadata, provider_outcome: 'unknown' } as Prisma.InputJsonValue }
+    });
+    await flagPendingReconciliation({ transactionId: current.id, provider: params.provider, providerMessage: error instanceof Error ? error.message : String(error) });
+  } catch (inner) {
+    console.error('[slip] could not record background failure', debit.transaction.id, inner);
+  }
+}
+
+export type SlipStatus =
+  | { state: 'processing' }
+  | { state: 'review'; message: string }
+  | { state: 'success'; reference: string; transactionId: string; userData?: Record<string, unknown>; pdfBase64?: string; pdfUrl?: string }
+  | { state: 'failed'; message: string };
+
+/**
+ * What the customer's page polls after a background slip purchase. Scoped to
+ * the owner and to slip transactions only. The document bytes are sent once,
+ * when the request has succeeded; while it is processing this is a tiny reply.
+ */
+export async function getSlipStatus(params: { userId: string; reference: string }): Promise<SlipStatus> {
+  const transaction = await prisma.transaction.findFirst({
+    where: {
+      userId: params.userId,
+      reference: params.reference,
+      type: { in: [TransactionType.NIN_VERIFICATION, TransactionType.BVN_VERIFICATION] }
+    }
+  });
+  if (!transaction) throw new ApiError(404, 'Request not found', 'TRANSACTION_NOT_FOUND');
+  const metadata = transaction.metadata as Record<string, unknown> | null;
+
+  if (transaction.status === TransactionStatus.SUCCESS) {
+    const pii = openPII<{ user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string }>(metadata?.pii);
+    return { state: 'success', reference: transaction.reference, transactionId: transaction.id, userData: pii?.user_data, pdfBase64: pii?.pdf_base64, pdfUrl: pii?.pdf_url };
+  }
+  if (transaction.status === TransactionStatus.PENDING) {
+    return metadata?.provider_outcome === 'unknown'
+      ? { state: 'review', message: 'We could not confirm this request with the provider yet. Our team has been alerted and will settle it - if it did not succeed, your payment is refunded. Please do not submit it again.' }
+      : { state: 'processing' };
+  }
+  const reason = typeof metadata?.failure_message === 'string' && metadata.failure_message ? `${metadata.failure_message}. ` : '';
+  return { state: 'failed', message: `${reason}Your payment has been refunded to your wallet.` };
 }
 
 const NIN_SLIP_SERVICE_BY_TIER: Record<KtechNinSlipTier, VerificationServiceKey> = {
@@ -414,7 +556,7 @@ const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> =
   standard: 'BVN_SLIP_STANDARD'
 };
 
-export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string }) {
+export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string; background?: boolean }) {
   // K-Tech supports the information tier on its NIN-by-NIN endpoint. Keep
   // this slip separate from demographic lookup, which has its own form/API.
   if (params.tier === 'information') ktechService.assertConfigured();
@@ -429,6 +571,7 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
     operational: { mode: 'by_nin', tier: params.tier, provider },
     pii: { nin: params.nin },
     idempotencyKey: params.idempotencyKey,
+    background: params.background,
     call: (reference) => params.tier === 'information'
       ? ktechService.ninPersonalInformation({ nin: params.nin }, reference)
       : provider === 'ktech'
@@ -444,6 +587,7 @@ export async function purchaseNinByPhone(params: {
   phone: string;
   tier: NinPhoneTier;
   idempotencyKey?: string;
+  background?: boolean;
 }) {
   const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
@@ -461,6 +605,7 @@ export async function purchaseNinByPhone(params: {
     operational: { mode: 'by_phone', tier: params.tier, provider },
     pii: { phone: params.phone },
     idempotencyKey: params.idempotencyKey,
+    background: params.background,
     call: (reference) =>
       params.tier === 'information'
         ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
@@ -481,6 +626,7 @@ export function purchaseNinByDemographic(params: {
   dob: string;
   gender?: string;
   idempotencyKey?: string;
+  background?: boolean;
 }) {
   return providerForService('NIN_DEMOGRAPHIC').then(async (provider) => {
   if (provider === 'hubbu') hubbuService.assertConfigured();
@@ -498,6 +644,7 @@ export function purchaseNinByDemographic(params: {
       gender: params.gender
     },
     idempotencyKey: params.idempotencyKey,
+    background: params.background,
     call: () => provider === 'hubbu'
       ? hubbuService.ninByDemographic({ first_name: params.firstname, last_name: params.lastname, dob: params.dob, gender: params.gender ?? '' })
       : techhubService.ninByDemographic({
@@ -510,7 +657,7 @@ export function purchaseNinByDemographic(params: {
   });
 }
 
-export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string }) {
+export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string; background?: boolean }) {
   const service = BVN_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
   if (provider === 'hubbu') hubbuService.assertConfigured();
@@ -523,6 +670,7 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
     operational: { tier: params.tier, provider },
     pii: { bvn: params.bvn },
     idempotencyKey: params.idempotencyKey,
+    background: params.background,
     call: (reference) =>
       provider === 'ktech'
         ? ktechService.bvnSlip(params.bvn, params.tier, reference)

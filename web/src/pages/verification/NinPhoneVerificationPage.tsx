@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError, wasInterrupted } from '../../lib/api';
+import { runSlipFlow } from '../../lib/slip';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -114,26 +114,7 @@ export default function NinPhoneVerificationPage() {
       const body = demographicLookup
         ? { firstname, lastname, gender, dob, pin }
         : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
-      const result = await api.postSlip<{
-        status: boolean;
-        pending?: boolean;
-        message: string;
-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>(path, body, idempotency.current(JSON.stringify(body)));
-      if (result.pending) {
-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'check your transaction history'}. Please do not submit this request again yet.`);
-        watch();
-        return;
-      }
-      idempotency.reset();
-      if (!result.status) throw new Error(result.message);
-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
-      setMessage(result.message || 'Done - your document is ready below.');
-    } catch (error) {
-      // Keep the idempotency key after a browser/network timeout to prevent a duplicate provider call.
-      if (wasInterrupted(error)) watch();
-      else idempotency.reset();
-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+      await runSlipFlow({ path, body, fingerprint: JSON.stringify({ ...body, pin: undefined }), idempotency, setMessage, setResult, watch });
     } finally {
       setBusy(false);
     }

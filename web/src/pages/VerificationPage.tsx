@@ -16,8 +16,10 @@ import {
   Clock,
 } from 'lucide-react';
 import AppShell from '../components/AppShell';
-import { api, ApiError, wasInterrupted } from '../lib/api';
+import { api, ApiError } from '../lib/api';
+import { runSlipFlow } from '../lib/slip';
 import { PinConfirmDialog } from '../components/PinConfirmDialog';
+import { SlipDownloadAction } from '../components/verification/shared';
 
 type Mode = 'nin' | 'bvn' | 'delink';
 type Item = {
@@ -108,7 +110,7 @@ function validationServiceKey(validationType?: string) {
 const money = (amount?: number) =>
   amount === undefined ? 'Price loading…' : `₦${amount.toLocaleString('en-NG', { maximumFractionDigits: 2 })}`;
 
-type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; reference: string };
+type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; document_url?: string; reference: string };
 type AsyncResult = { ticket_id: string; reference: string };
 type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
 type VerificationHistory = {
@@ -243,22 +245,29 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
       const data = { ...values, ...(selected.tiers ? { tier } : {}), pin };
       type SubmitResult = {
         status: boolean;
-        pending?: boolean;
         message: string;
         data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
       };
       const isSlip = !selected.async && selected.id !== 'license-onboarding';
-      // Slips wait on a slow upstream provider: allow it ample time and send a
-      // stable key so a retry after a timeout replays the request, not re-bills it.
-      const result = isSlip
-        ? await api.postSlip<SubmitResult>(selected.path, data, slipKeyFor(JSON.stringify([selected.path, { ...data, pin: undefined }])))
-        : await api.post<SubmitResult>(selected.path, data);
-      if (isSlip && result.pending) {
-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
-        setWatching(true);
+      if (isSlip) {
+        // Debit + answer fast, then poll for the provider's result (see lib/slip.ts).
+        await runSlipFlow({
+          path: selected.path,
+          body: data,
+          fingerprint: JSON.stringify([selected.path, { ...data, pin: undefined }]),
+          idempotency: { current: slipKeyFor, reset: () => { slipKey.current = null; } },
+          setMessage,
+          setResult: (r) => {
+            const nestedPdf = r.user_data
+              ? (Object.entries(r.user_data).find(([key, entry]) => /pdf|base64/i.test(key) && typeof entry === 'string')?.[1] as string | undefined)
+              : undefined;
+            setSlipResult({ ...r, pdf_base64: r.pdf_base64 ?? nestedPdf });
+          },
+          watch: () => setWatching(true)
+        });
         return;
       }
-      slipKey.current = null;
+      const result = await api.post<SubmitResult>(selected.path, data);
       if (!result.status) throw new Error(result.message);
 
       if (selected.id === 'license-onboarding') {
@@ -282,8 +291,6 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
         setMessage(result.message || 'Done - your document is ready below.');
       }
     } catch (error) {
-      if (wasInterrupted(error)) setWatching(true);
-      else slipKey.current = null;
       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
     } finally {
       setBusy(false);
@@ -579,9 +586,7 @@ function SlipResultView({ result, message, onDone }: { result: SlipResult; messa
       )}
 
       {!pdfHref && (
-        <p className="mt-4 rounded-xl border border-gold-500/30 bg-gold-500/10 p-3 font-body text-sm text-ink-600">
-          The provider confirmed this request, but did not return a downloadable PDF. Keep the reference above and contact support; do not submit or pay for the request again.
-        </p>
+        <SlipDownloadAction pdfBase64={null} pdfUrl={null} reference={result.reference} documentUrl={result.document_url} />
       )}
 
       <button onClick={onDone} className="mt-3 w-full rounded-xl border border-parchment-line py-2.5 font-body text-sm text-ink-600">

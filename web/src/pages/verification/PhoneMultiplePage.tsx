@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError, wasInterrupted } from '../../lib/api';
+import { runSlipFlow } from '../../lib/slip';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -71,25 +71,7 @@ export default function PhoneMultiplePage() {
     setBusy(true);
     setMessage('');
     try {
-      const result = await api.postSlip<{
-        status: boolean;
-        pending?: boolean;
-        message: string;
-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, idempotency.current(`${phone}|${safeTier}`));
-      if (result.pending) {
-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
-        watch();
-        return;
-      }
-      idempotency.reset();
-      if (!result.status) throw new Error(result.message);
-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
-      setMessage(result.message || 'Done - your document is ready below.');
-    } catch (error) {
-      if (wasInterrupted(error)) watch();
-      else idempotency.reset();
-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+      await runSlipFlow({ path: '/verification/nin/by-phone', body: { phone, tier: safeTier, pin }, fingerprint: `${phone}|${safeTier}`, idempotency, setMessage, setResult, watch });
     } finally {
       setBusy(false);
     }

@@ -196,10 +196,18 @@ export class TechhubService {
       response = await fetch(`${this.baseUrl()}/${path}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: this.apiKey(), ...body })
+        body: JSON.stringify({ api_key: this.apiKey(), ...body }),
+        // Without a limit a hung upstream socket would hold the request (and
+        // the customer) indefinitely. Techhub normally answers well within 15s.
+        signal: AbortSignal.timeout(60_000)
       });
     } catch (error) {
       console.error(`[techhub] network error calling ${path}:`, error);
+      // Our timeout firing does not prove Techhub did nothing - keep it pending, never refund blindly.
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      if (timedOut) {
+        return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: null };
+      }
       return { ok: false, message: 'Could not reach the verification provider - please try again shortly', raw: null };
     }
 

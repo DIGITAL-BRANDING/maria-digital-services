@@ -15,6 +15,7 @@ import {
   checkPersonalizationStatus,
   listServiceTickets,
   listVerificationPrices,
+  getSlipStatus,
   purchaseBvnSlip,
   purchaseNinByDemographic,
   purchaseNinByNin,
@@ -49,13 +50,21 @@ const ninValidationType = z.enum([
   'update_records'
 ]);
 
+/** `?async=1` - answer as soon as the wallet is debited; the page polls GET /slip/:reference. */
+function wantsBackground(req: Request) {
+  return req.query.async === '1';
+}
+
 function slipResponse(result: Awaited<ReturnType<typeof purchaseNinByNin>>) {
   return {
     status: result.status,
     pending: result.pending ?? false,
+    processing: result.processing ?? false,
     message: result.message,
     data: {
       reference: result.reference,
+      transaction_id: result.transactionId ?? null,
+      document_url: result.transactionId ? `/transactions/${encodeURIComponent(result.transactionId)}/document` : null,
       user_data: result.userData ?? null,
       pdf_base64: result.pdfBase64 ?? null,
       pdf_url: result.pdfUrl ?? null,
@@ -234,6 +243,27 @@ verificationRoutes.get('/service-history', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ status: true, data });
 });
+verificationRoutes.get('/slip/:reference', async (req, res) => {
+  const reference = z.string().trim().min(1).max(80).parse(req.params.reference);
+  const result = await getSlipStatus({ userId: req.user!.id, reference });
+  res.set('Cache-Control', 'no-store');
+  if (result.state === 'success') {
+    return res.json({
+      status: true,
+      state: 'success',
+      data: {
+        reference: result.reference,
+        transaction_id: result.transactionId,
+        document_url: `/transactions/${encodeURIComponent(result.transactionId)}/document`,
+        user_data: result.userData ?? null,
+        pdf_base64: result.pdfBase64 ?? null,
+        pdf_url: result.pdfUrl ?? null
+      }
+    });
+  }
+  res.json({ status: result.state !== 'failed', state: result.state, message: 'message' in result ? result.message : undefined });
+});
+
 verificationRoutes.post('/nin/by-nin', async (req, res) => {
   const body = z.object({ nin: z.string().trim().length(11), tier: ninSlipTier, ...pinField }).parse(req.body);
   await requirePinConfirmation(req.user!.id, body.pin);
@@ -241,7 +271,8 @@ verificationRoutes.post('/nin/by-nin', async (req, res) => {
     userId: req.user!.id,
     nin: body.nin,
     tier: body.tier,
-    idempotencyKey: idempotencyKeyFrom(req)
+    idempotencyKey: idempotencyKeyFrom(req),
+    background: wantsBackground(req)
   });
   res.json(slipResponse(result));
 });
@@ -253,7 +284,8 @@ verificationRoutes.post('/nin/by-phone', async (req, res) => {
     userId: req.user!.id,
     phone: body.phone,
     tier: body.tier,
-    idempotencyKey: idempotencyKeyFrom(req)
+    idempotencyKey: idempotencyKeyFrom(req),
+    background: wantsBackground(req)
   });
   res.json(slipResponse(result));
 });
@@ -275,7 +307,8 @@ verificationRoutes.post('/nin/by-demographic', async (req, res) => {
     lastname: body.lastname,
     dob: body.dob,
     gender: body.gender,
-    idempotencyKey: idempotencyKeyFrom(req)
+    idempotencyKey: idempotencyKeyFrom(req),
+    background: wantsBackground(req)
   });
   res.json(slipResponse(result));
 });
@@ -287,7 +320,8 @@ verificationRoutes.post('/bvn/slip', async (req, res) => {
     userId: req.user!.id,
     bvn: body.bvn,
     tier: body.tier,
-    idempotencyKey: idempotencyKeyFrom(req)
+    idempotencyKey: idempotencyKeyFrom(req),
+    background: wantsBackground(req)
   });
   res.json(slipResponse(result));
 });

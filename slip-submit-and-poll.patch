@@ -1,0 +1,1224 @@
+From 14fe9a5161caffafd109b85a0757e8367d302aa1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 22:50:54 +0100
+Subject: [PATCH] Slip verification: submit-then-poll, stage timing logs,
+ document fallback
+
+Backend: slip purchases accept ?async=1 - the wallet is debited and the
+reference returned immediately while the provider call settles in the
+background; GET /verification/slip/:reference reports processing / success /
+failed (with the provider's reason) / review. Unexpected background errors are
+parked for reconciliation (or refunded when the request never left). Every
+request logs a [slip-timing] line (debit vs provider vs total) so slow stages
+can be identified; Techhub gets a 60s timeout that keeps the outcome unknown
+instead of refunding. Responses now carry a document_url for providers that
+confirm with a download link instead of an inline PDF.
+
+Web: all slip pages share runSlipFlow - submit, poll every 1.5s with a live
+'verifying' message, show the result as soon as it is ready, never an open
+request a browser/proxy can cut. The PDF button falls back to the owner's
+document endpoint when no inline PDF came back.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015YoLAo63RFk6PcWruuMD9h
+---
+ .../src/routes/verification.routes.ts         |  42 ++-
+ .../__tests__/slip-background.test.ts         | 148 +++++++++
+ maria_backend/src/services/techhub.service.ts |  10 +-
+ .../src/services/verification.service.ts      | 294 +++++++++++++-----
+ web/src/components/verification/shared.tsx    |  37 ++-
+ web/src/lib/slip.ts                           | 149 +++++++++
+ web/src/pages/VerificationPage.tsx            |  39 ++-
+ .../verification/BvnVerificationPage.tsx      |  23 +-
+ .../DemographicVerificationPage.tsx           |  33 +-
+ .../verification/NinPhoneVerificationPage.tsx |  23 +-
+ .../pages/verification/PhoneMultiplePage.tsx  |  22 +-
+ 11 files changed, 634 insertions(+), 186 deletions(-)
+ create mode 100644 maria_backend/src/services/__tests__/slip-background.test.ts
+ create mode 100644 web/src/lib/slip.ts
+
+diff --git a/maria_backend/src/routes/verification.routes.ts b/maria_backend/src/routes/verification.routes.ts
+index 2fb736a..ad8e803 100644
+--- a/maria_backend/src/routes/verification.routes.ts
++++ b/maria_backend/src/routes/verification.routes.ts
+@@ -15,6 +15,7 @@ import {
+   checkPersonalizationStatus,
+   listServiceTickets,
+   listVerificationPrices,
++  getSlipStatus,
+   purchaseBvnSlip,
+   purchaseNinByDemographic,
+   purchaseNinByNin,
+@@ -49,13 +50,21 @@ const ninValidationType = z.enum([
+   'update_records'
+ ]);
+ 
++/** `?async=1` - answer as soon as the wallet is debited; the page polls GET /slip/:reference. */
++function wantsBackground(req: Request) {
++  return req.query.async === '1';
++}
++
+ function slipResponse(result: Awaited<ReturnType<typeof purchaseNinByNin>>) {
+   return {
+     status: result.status,
+     pending: result.pending ?? false,
++    processing: result.processing ?? false,
+     message: result.message,
+     data: {
+       reference: result.reference,
++      transaction_id: result.transactionId ?? null,
++      document_url: result.transactionId ? `/transactions/${encodeURIComponent(result.transactionId)}/document` : null,
+       user_data: result.userData ?? null,
+       pdf_base64: result.pdfBase64 ?? null,
+       pdf_url: result.pdfUrl ?? null,
+@@ -234,6 +243,27 @@ verificationRoutes.get('/service-history', async (req, res) => {
+   res.set('Cache-Control', 'no-store');
+   res.json({ status: true, data });
+ });
++verificationRoutes.get('/slip/:reference', async (req, res) => {
++  const reference = z.string().trim().min(1).max(80).parse(req.params.reference);
++  const result = await getSlipStatus({ userId: req.user!.id, reference });
++  res.set('Cache-Control', 'no-store');
++  if (result.state === 'success') {
++    return res.json({
++      status: true,
++      state: 'success',
++      data: {
++        reference: result.reference,
++        transaction_id: result.transactionId,
++        document_url: `/transactions/${encodeURIComponent(result.transactionId)}/document`,
++        user_data: result.userData ?? null,
++        pdf_base64: result.pdfBase64 ?? null,
++        pdf_url: result.pdfUrl ?? null
++      }
++    });
++  }
++  res.json({ status: result.state !== 'failed', state: result.state, message: 'message' in result ? result.message : undefined });
++});
++
+ verificationRoutes.post('/nin/by-nin', async (req, res) => {
+   const body = z.object({ nin: z.string().trim().length(11), tier: ninSlipTier, ...pinField }).parse(req.body);
+   await requirePinConfirmation(req.user!.id, body.pin);
+@@ -241,7 +271,8 @@ verificationRoutes.post('/nin/by-nin', async (req, res) => {
+     userId: req.user!.id,
+     nin: body.nin,
+     tier: body.tier,
+-    idempotencyKey: idempotencyKeyFrom(req)
++    idempotencyKey: idempotencyKeyFrom(req),
++    background: wantsBackground(req)
+   });
+   res.json(slipResponse(result));
+ });
+@@ -253,7 +284,8 @@ verificationRoutes.post('/nin/by-phone', async (req, res) => {
+     userId: req.user!.id,
+     phone: body.phone,
+     tier: body.tier,
+-    idempotencyKey: idempotencyKeyFrom(req)
++    idempotencyKey: idempotencyKeyFrom(req),
++    background: wantsBackground(req)
+   });
+   res.json(slipResponse(result));
+ });
+@@ -275,7 +307,8 @@ verificationRoutes.post('/nin/by-demographic', async (req, res) => {
+     lastname: body.lastname,
+     dob: body.dob,
+     gender: body.gender,
+-    idempotencyKey: idempotencyKeyFrom(req)
++    idempotencyKey: idempotencyKeyFrom(req),
++    background: wantsBackground(req)
+   });
+   res.json(slipResponse(result));
+ });
+@@ -287,7 +320,8 @@ verificationRoutes.post('/bvn/slip', async (req, res) => {
+     userId: req.user!.id,
+     bvn: body.bvn,
+     tier: body.tier,
+-    idempotencyKey: idempotencyKeyFrom(req)
++    idempotencyKey: idempotencyKeyFrom(req),
++    background: wantsBackground(req)
+   });
+   res.json(slipResponse(result));
+ });
+diff --git a/maria_backend/src/services/__tests__/slip-background.test.ts b/maria_backend/src/services/__tests__/slip-background.test.ts
+new file mode 100644
+index 0000000..2c48eb1
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/slip-background.test.ts
+@@ -0,0 +1,148 @@
++import { describe, expect, it, vi } from 'vitest';
++
++/** Background slip processing: respond after the debit, settle later, report via getSlipStatus. */
++
++vi.mock('@prisma/client', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('@prisma/client')>();
++  const echoEnum = new Proxy({}, { get: (_target, prop) => prop });
++  class PrismaClientKnownRequestError extends Error {
++    code: string;
++    constructor(message: string, opts: { code: string }) {
++      super(message);
++      this.code = opts.code;
++    }
++  }
++  return {
++    ...actual,
++    TransactionStatus: echoEnum,
++    TransactionType: echoEnum,
++    Prisma: { ...((actual as Record<string, unknown>).Prisma as Record<string, unknown>), PrismaClientKnownRequestError }
++  };
++});
++
++vi.mock('../../lib/prisma.js', async () => {
++  const { createFakePrisma } = await import('../../test-utils/fake-prisma.js');
++  const fake = createFakePrisma();
++  return { prisma: fake.api };
++});
++
++vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedValue(undefined) }));
++vi.mock('../provider-ledger.service.js', () => ({ recordProviderDebit: vi.fn().mockResolvedValue(undefined) }));
++
++vi.mock('../provider-reconciliation.service.js', () => ({ flagPendingReconciliation: vi.fn().mockResolvedValue(undefined) }));
++
++const bvnSlip = vi.fn();
++vi.mock('../ktech.service.js', () => ({ ktechService: { bvnSlip: vi.fn(), assertConfigured: vi.fn() } }));
++vi.mock('../hubbu.service.js', () => ({ hubbuService: { bvnSlip: vi.fn(), assertConfigured: vi.fn() } }));
++vi.mock('../techhub.service.js', () => ({ techhubService: { bvnSlip } }));
++
++const { prisma } = await import('../../lib/prisma.js');
++const { flagPendingReconciliation } = await import('../provider-reconciliation.service.js');
++const { purchaseBvnSlip, getSlipStatus } = await import('../verification.service.js');
++const { ApiError } = await import('../../middleware/error.js');
++
++let n = 0;
++async function seedUser(balanceNaira: number) {
++  n += 1;
++  const id = `slip-user-${n}`;
++  await prisma.user.create({
++    data: { id, walletBalanceKobo: BigInt(Math.round(balanceNaira * 100)), fullName: `T ${n}`, email: `s${n}@example.test`, phone: `+23482222${String(n).padStart(4, '0')}`, referralCode: `SLIP${n}` }
++  });
++  return id;
++}
++async function balanceOf(id: string) {
++  return Number((await prisma.user.findUniqueOrThrow({ where: { id } })).walletBalanceKobo) / 100;
++}
++/** Let the un-awaited background settle finish. */
++const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
++
++describe('background slip processing', () => {
++  it('answers right after the debit, then reports success once the provider finishes', async () => {
++    let finish!: (value: unknown) => void;
++    bvnSlip.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
++    const userId = await seedUser(5000);
++
++    const started = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true });
++    expect(started).toMatchObject({ status: false, pending: true, processing: true });
++    expect(await balanceOf(userId)).toBeLessThan(5000);
++    expect(await getSlipStatus({ userId, reference: started.reference })).toEqual({ state: 'processing' });
++
++    finish({ ok: true, message: 'done', userData: { first_name: 'JOHN' }, pdfBase64: 'JVBERi0=', raw: {} });
++    await flush();
++
++    const status = await getSlipStatus({ userId, reference: started.reference });
++    expect(status).toMatchObject({ state: 'success', pdfBase64: 'JVBERi0=', userData: { first_name: 'JOHN' } });
++  });
++
++  it('refunds and returns the provider reason when the provider rejects it', async () => {
++    bvnSlip.mockResolvedValue({ ok: false, message: 'BVN not found', raw: {} });
++    const userId = await seedUser(5000);
++    const started = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true });
++    await flush();
++
++    const status = await getSlipStatus({ userId, reference: started.reference });
++    expect(status).toMatchObject({ state: 'failed' });
++    expect((status as { message: string }).message).toContain('BVN not found');
++    expect(await balanceOf(userId)).toBe(5000);
++  });
++
++  it('keeps an unconfirmed result for review (no refund) and flags it', async () => {
++    bvnSlip.mockResolvedValue({ ok: false, ambiguous: true, message: 'maybe', raw: null });
++    const userId = await seedUser(5000);
++    const started = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true });
++    await flush();
++
++    expect((await getSlipStatus({ userId, reference: started.reference })).state).toBe('review');
++    expect(await balanceOf(userId)).toBeLessThan(5000);
++    expect(flagPendingReconciliation).toHaveBeenCalled();
++  });
++
++  it('refunds when the provider client is not configured (request never left)', async () => {
++    bvnSlip.mockRejectedValue(new ApiError(500, 'no key', 'TECHHUB_NOT_CONFIGURED'));
++    const userId = await seedUser(5000);
++    const started = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true });
++    await flush();
++
++    expect((await getSlipStatus({ userId, reference: started.reference })).state).toBe('failed');
++    expect(await balanceOf(userId)).toBe(5000);
++  });
++
++  it('parks an unexpected error for review instead of refunding blindly', async () => {
++    bvnSlip.mockRejectedValue(new Error('socket hang up'));
++    const userId = await seedUser(5000);
++    const started = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true });
++    await flush();
++
++    expect((await getSlipStatus({ userId, reference: started.reference })).state).toBe('review');
++    expect(await balanceOf(userId)).toBeLessThan(5000);
++  });
++
++  it('a retry with the same key while still running reports processing, without a second debit or provider call', async () => {
++    bvnSlip.mockReturnValue(new Promise(() => undefined));
++    const userId = await seedUser(5000);
++    bvnSlip.mockClear();
++    const first = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true, idempotencyKey: 'k1' });
++    const after = await balanceOf(userId);
++    const second = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium', background: true, idempotencyKey: 'k1' });
++    expect(second).toMatchObject({ reference: first.reference, processing: true });
++    expect(await balanceOf(userId)).toBe(after);
++    expect(bvnSlip).toHaveBeenCalledTimes(1);
++  });
++
++  it('foreground mode still returns the final result in one call', async () => {
++    bvnSlip.mockResolvedValue({ ok: true, message: 'ok', pdfBase64: 'JVBERi0=', raw: {} });
++    const userId = await seedUser(5000);
++    const result = await purchaseBvnSlip({ userId, bvn: '12345678901', tier: 'premium' });
++    expect(result).toMatchObject({ status: true, pdfBase64: 'JVBERi0=' });
++    expect(result.processing).toBeUndefined();
++  });
++
++  it('does not show another customer\'s request', async () => {
++    bvnSlip.mockResolvedValue({ ok: true, message: 'ok', pdfBase64: 'JVBERi0=', raw: {} });
++    const owner = await seedUser(5000);
++    const other = await seedUser(5000);
++    const started = await purchaseBvnSlip({ userId: owner, bvn: '12345678901', tier: 'premium', background: true });
++    await flush();
++    await expect(getSlipStatus({ userId: other, reference: started.reference })).rejects.toThrow(/not found/i);
++  });
++});
+diff --git a/maria_backend/src/services/techhub.service.ts b/maria_backend/src/services/techhub.service.ts
+index 5c97c4a..756ce2b 100644
+--- a/maria_backend/src/services/techhub.service.ts
++++ b/maria_backend/src/services/techhub.service.ts
+@@ -196,10 +196,18 @@ export class TechhubService {
+       response = await fetch(`${this.baseUrl()}/${path}`, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ api_key: this.apiKey(), ...body })
++        body: JSON.stringify({ api_key: this.apiKey(), ...body }),
++        // Without a limit a hung upstream socket would hold the request (and
++        // the customer) indefinitely. Techhub normally answers well within 15s.
++        signal: AbortSignal.timeout(60_000)
+       });
+     } catch (error) {
+       console.error(`[techhub] network error calling ${path}:`, error);
++      // Our timeout firing does not prove Techhub did nothing - keep it pending, never refund blindly.
++      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
++      if (timedOut) {
++        return { ok: false, ambiguous: true, message: 'The provider is taking longer than usual and may still complete this request. It will appear under Recent requests - please do not submit it again yet.', raw: null };
++      }
+       return { ok: false, message: 'Could not reach the verification provider - please try again shortly', raw: null };
+     }
+ 
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index 2586669..9aa38f4 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -212,6 +212,9 @@ export async function listVerificationPricesForAdmin() {
+ export type SlipPurchaseResult = {
+   status: boolean;
+   pending?: boolean;
++  /** Background mode: the provider call is still running - poll GET /verification/slip/:reference. */
++  processing?: boolean;
++  transactionId?: string;
+   message: string;
+   reference: string;
+   userData?: Record<string, unknown>;
+@@ -251,7 +254,15 @@ async function purchaseSlip(params: {
+   pii: Record<string, unknown>;
+   idempotencyKey?: string;
+   call: (reference: string) => Promise<TechhubSlipResult>;
++  /**
++   * Debit, then return right away while the provider call finishes in the
++   * background (the customer polls GET /verification/slip/:reference). Without
++   * it the HTTP request stays open for the provider's whole response time,
++   * which browsers/proxies cut off on slow lookups.
++   */
++  background?: boolean;
+ }): Promise<SlipPurchaseResult> {
++  const startedAt = Date.now();
+   const price = await getVerificationPrice(params.service);
+ 
+   const debit = await debitWallet({
+@@ -270,6 +281,7 @@ async function purchaseSlip(params: {
+     // above) - fixed and known up front, no balance-delta correction needed.
+     costKobo: price.providerCostKobo
+   });
++  const debitedAfterMs = Date.now() - startedAt;
+ 
+   if (debit.reused && debit.transaction.status !== TransactionStatus.PENDING) {
+     const metadata = debit.transaction.metadata as Record<string, unknown> | null;
+@@ -278,6 +290,7 @@ async function purchaseSlip(params: {
+       status: debit.transaction.status === TransactionStatus.SUCCESS,
+       message: 'Transaction already processed',
+       reference: debit.reference,
++      transactionId: debit.transaction.id,
+       userData: pii?.user_data,
+       pdfBase64: pii?.pdf_base64,
+       pdfUrl: pii?.pdf_url,
+@@ -286,112 +299,241 @@ async function purchaseSlip(params: {
+   }
+ 
+   if (debit.reused && debit.transaction.status === TransactionStatus.PENDING) {
++    const reusedMetadata = debit.transaction.metadata as Record<string, unknown> | null;
+     return {
+       status: false,
+       pending: true,
++      // Still running (as opposed to parked for admin review): the caller keeps polling.
++      processing: reusedMetadata?.provider_outcome !== 'unknown',
++      transactionId: debit.transaction.id,
+       message: 'This request is still being checked. Review transaction history before trying again.',
+       reference: debit.reference,
+       balanceAfter: koboToNaira(debit.transaction.balanceAfterKobo)
+     };
+   }
+ 
+-  const provider = await params.call(debit.reference);
++  const settle = async (): Promise<SlipPurchaseResult> => {
++    const providerStartedAt = Date.now();
++    const provider = await params.call(debit.reference);
++    const providerMs = Date.now() - providerStartedAt;
++    console.info('[slip-timing] provider responded', {
++      service: params.service,
++      provider: params.provider,
++      reference: debit.reference,
++      providerMs,
++      ok: provider.ok,
++      ambiguous: Boolean(provider.ambiguous)
++    });
+ 
+-  if (provider.ok) {
+-    const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
+-    await prisma.transaction.update({
+-      where: { id: debit.transaction.id },
+-      data: {
+-        status: TransactionStatus.SUCCESS,
++    if (provider.ok) {
++      const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
++      await prisma.transaction.update({
++        where: { id: debit.transaction.id },
++        data: {
++          status: TransactionStatus.SUCCESS,
++          provider: params.provider,
++          metadata: {
++            service: params.service,
++            ...params.operational,
++            unit_price: price.unitPrice,
++            pii: mergeSealedPII(existingMetadata?.pii, {
++              ...params.pii,
++              user_data: provider.userData,
++              pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
++              pdf_url: provider.pdfUrl,
++              hubbu_download_token: provider.downloadToken
++            })
++          } as Prisma.InputJsonValue
++        }
++      });
++
++      // Techhub quotes one flat rate per slip family, already stored as
++      // price.providerCostKobo above - no balance-delta correction available
++      // or needed (unlike Alrahuz data/airtime).
++      await recordProviderDebit({
+         provider: params.provider,
+-        metadata: {
+-          service: params.service,
+-          ...params.operational,
+-          unit_price: price.unitPrice,
+-          pii: mergeSealedPII(existingMetadata?.pii, {
+-            ...params.pii,
+-            user_data: provider.userData,
+-            pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
+-            pdf_url: provider.pdfUrl,
+-            hubbu_download_token: provider.downloadToken
+-          })
+-        } as Prisma.InputJsonValue
+-      }
+-    });
++        amountKobo: price.providerCostKobo,
++        relatedTransactionId: debit.transaction.id,
++        description: params.description
++      }).catch((error) => {
++        console.error('[provider-ledger] failed to record debit for', debit.transaction.id, error);
++      });
+ 
+-    // Techhub quotes one flat rate per slip family, already stored as
+-    // price.providerCostKobo above - no balance-delta correction available
+-    // or needed (unlike Alrahuz data/airtime).
+-    await recordProviderDebit({
+-      provider: params.provider,
+-      amountKobo: price.providerCostKobo,
+-      relatedTransactionId: debit.transaction.id,
+-      description: params.description
+-    }).catch((error) => {
+-      console.error('[provider-ledger] failed to record debit for', debit.transaction.id, error);
+-    });
++      return {
++        status: true,
++        message: provider.message,
++        reference: debit.reference,
++        transactionId: debit.transaction.id,
++        userData: provider.userData,
++        pdfBase64: provider.pdfBase64,
++        pdfUrl: provider.pdfUrl,
++        downloadToken: provider.downloadToken,
++        balanceAfter: debit.balanceAfter
++      };
++    }
+ 
+-    return {
+-      status: true,
+-      message: provider.message,
+-      reference: debit.reference,
+-      userData: provider.userData,
+-      pdfBase64: provider.pdfBase64,
+-      pdfUrl: provider.pdfUrl,
+-      downloadToken: provider.downloadToken,
+-      balanceAfter: debit.balanceAfter
+-    };
+-  }
++    if (provider.ambiguous) {
++      // Hubbu may have fulfilled the request despite a timeout, malformed
++      // response, or dropped connection. Keep it pending for reconciliation;
++      // refunding could give the customer both the slip and their money back.
++      await prisma.transaction.update({
++        where: { id: debit.transaction.id },
++        data: {
++          provider: params.provider,
++          metadata: {
++            service: params.service,
++            ...params.operational,
++            unit_price: price.unitPrice,
++            provider_outcome: 'unknown',
++            pii: sealPII(params.pii)
++          } as Prisma.InputJsonValue
++        }
++      });
++      // Put it on /admin/provider-reconciliation so an admin who sees it as
++      // successful on the provider's dashboard can settle it (and one who
++      // doesn't can refund it) - without this it sat PENDING with nobody alerted.
++      await flagPendingReconciliation({
++        transactionId: debit.transaction.id,
++        provider: params.provider,
++        providerMessage: provider.message,
++        rawStatus: provider.raw
++      }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
++      return {
++        status: false,
++        pending: true,
++        transactionId: debit.transaction.id,
++        message: provider.message,
++        reference: debit.reference,
++        balanceAfter: debit.balanceAfter
++      };
++    }
+ 
+-  if (provider.ambiguous) {
+-    // Hubbu may have fulfilled the request despite a timeout, malformed
+-    // response, or dropped connection. Keep it pending for reconciliation;
+-    // refunding could give the customer both the slip and their money back.
+     await prisma.transaction.update({
+       where: { id: debit.transaction.id },
+       data: {
++        status: TransactionStatus.FAILED,
+         provider: params.provider,
++        // Keep the provider's own reason so the polling endpoint can show the
++        // customer WHY it failed (e.g. "NIN not found"), not a generic message.
+         metadata: {
+-          service: params.service,
+-          ...params.operational,
+-          unit_price: price.unitPrice,
+-          provider_outcome: 'unknown',
+-          pii: sealPII(params.pii)
++          ...((debit.transaction.metadata as Record<string, unknown> | null) ?? {}),
++          failure_message: String(provider.message ?? '').slice(0, 300)
+         } as Prisma.InputJsonValue
+       }
+     });
+-    // Put it on /admin/provider-reconciliation so an admin who sees it as
+-    // successful on the provider's dashboard can settle it (and one who
+-    // doesn't can refund it) - without this it sat PENDING with nobody alerted.
+-    await flagPendingReconciliation({
+-      transactionId: debit.transaction.id,
+-      provider: params.provider,
+-      providerMessage: provider.message,
+-      rawStatus: provider.raw
+-    }).catch((error) => console.error('[reconcile] failed to flag ambiguous slip', debit.transaction.id, error));
++    const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
++
+     return {
+       status: false,
+-      pending: true,
+       message: provider.message,
+       reference: debit.reference,
+-      balanceAfter: debit.balanceAfter
++      transactionId: debit.transaction.id,
++      balanceAfter: koboToNaira(refunded.balanceAfterKobo)
+     };
+-  }
++  };
+ 
+-  await prisma.transaction.update({
+-    where: { id: debit.transaction.id },
+-    data: { status: TransactionStatus.FAILED, provider: params.provider }
+-  });
+-  const refunded = await refundWallet({ transactionId: debit.transaction.id, userId: params.userId });
++  const finish = async (): Promise<SlipPurchaseResult> => {
++    const result = await settle();
++    // One grep-able line per request so a slow one can be pinned on a stage:
++    // our own DB work (debit) vs the provider vs everything after it.
++    console.info('[slip-timing]', {
++      service: params.service,
++      provider: params.provider,
++      reference: debit.reference,
++      outcome: result.status ? 'success' : result.pending ? 'pending' : 'failed',
++      debitMs: debitedAfterMs,
++      totalMs: Date.now() - startedAt,
++      background: Boolean(params.background)
++    });
++    return result;
++  };
++
++  if (!params.background) return finish();
+ 
++  void finish().catch((error) => settleUnexpectedFailure(params, debit, error));
+   return {
+     status: false,
+-    message: provider.message,
++    pending: true,
++    processing: true,
++    message: 'Verification in progress',
+     reference: debit.reference,
+-    balanceAfter: koboToNaira(refunded.balanceAfterKobo)
++    transactionId: debit.transaction.id,
++    balanceAfter: debit.balanceAfter
+   };
+ }
+ 
++/**
++ * A background settle() threw (DB hiccup after the provider answered, provider
++ * client misconfigured, ...). Nothing else is awaiting it, so without this the
++ * customer would poll "processing" forever. A configuration error means the
++ * provider never saw the request - refund. Anything else is unknown: park it
++ * for reconciliation rather than refund a slip that may have been issued.
++ */
++async function settleUnexpectedFailure(
++  params: { userId: string; provider: IdentityProvider },
++  debit: { transaction: { id: string } },
++  error: unknown
++) {
++  console.error('[slip] background settle failed', debit.transaction.id, error);
++  try {
++    const current = await prisma.transaction.findUnique({ where: { id: debit.transaction.id } });
++    if (!current || current.status !== TransactionStatus.PENDING) return;
++    const neverReachedProvider = error instanceof ApiError && /NOT_CONFIGURED$/.test(error.code ?? '');
++    if (neverReachedProvider) {
++      const metadata = (current.metadata as Record<string, unknown> | null) ?? {};
++      await prisma.transaction.update({
++        where: { id: current.id },
++        data: { status: TransactionStatus.FAILED, provider: params.provider, metadata: { ...metadata, failure_message: 'This service is temporarily unavailable.' } as Prisma.InputJsonValue }
++      });
++      await refundWallet({ transactionId: current.id, userId: params.userId });
++      return;
++    }
++    const metadata = (current.metadata as Record<string, unknown> | null) ?? {};
++    await prisma.transaction.update({
++      where: { id: current.id },
++      data: { provider: params.provider, metadata: { ...metadata, provider_outcome: 'unknown' } as Prisma.InputJsonValue }
++    });
++    await flagPendingReconciliation({ transactionId: current.id, provider: params.provider, providerMessage: error instanceof Error ? error.message : String(error) });
++  } catch (inner) {
++    console.error('[slip] could not record background failure', debit.transaction.id, inner);
++  }
++}
++
++export type SlipStatus =
++  | { state: 'processing' }
++  | { state: 'review'; message: string }
++  | { state: 'success'; reference: string; transactionId: string; userData?: Record<string, unknown>; pdfBase64?: string; pdfUrl?: string }
++  | { state: 'failed'; message: string };
++
++/**
++ * What the customer's page polls after a background slip purchase. Scoped to
++ * the owner and to slip transactions only. The document bytes are sent once,
++ * when the request has succeeded; while it is processing this is a tiny reply.
++ */
++export async function getSlipStatus(params: { userId: string; reference: string }): Promise<SlipStatus> {
++  const transaction = await prisma.transaction.findFirst({
++    where: {
++      userId: params.userId,
++      reference: params.reference,
++      type: { in: [TransactionType.NIN_VERIFICATION, TransactionType.BVN_VERIFICATION] }
++    }
++  });
++  if (!transaction) throw new ApiError(404, 'Request not found', 'TRANSACTION_NOT_FOUND');
++  const metadata = transaction.metadata as Record<string, unknown> | null;
++
++  if (transaction.status === TransactionStatus.SUCCESS) {
++    const pii = openPII<{ user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string }>(metadata?.pii);
++    return { state: 'success', reference: transaction.reference, transactionId: transaction.id, userData: pii?.user_data, pdfBase64: pii?.pdf_base64, pdfUrl: pii?.pdf_url };
++  }
++  if (transaction.status === TransactionStatus.PENDING) {
++    return metadata?.provider_outcome === 'unknown'
++      ? { state: 'review', message: 'We could not confirm this request with the provider yet. Our team has been alerted and will settle it - if it did not succeed, your payment is refunded. Please do not submit it again.' }
++      : { state: 'processing' };
++  }
++  const reason = typeof metadata?.failure_message === 'string' && metadata.failure_message ? `${metadata.failure_message}. ` : '';
++  return { state: 'failed', message: `${reason}Your payment has been refunded to your wallet.` };
++}
++
+ const NIN_SLIP_SERVICE_BY_TIER: Record<KtechNinSlipTier, VerificationServiceKey> = {
+   information: 'NIN_SLIP_INFORMATION',
+   premium: 'NIN_SLIP_PREMIUM',
+@@ -414,7 +556,7 @@ const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> =
+   standard: 'BVN_SLIP_STANDARD'
+ };
+ 
+-export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string }) {
++export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string; background?: boolean }) {
+   // K-Tech supports the information tier on its NIN-by-NIN endpoint. Keep
+   // this slip separate from demographic lookup, which has its own form/API.
+   if (params.tier === 'information') ktechService.assertConfigured();
+@@ -429,6 +571,7 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
+     operational: { mode: 'by_nin', tier: params.tier, provider },
+     pii: { nin: params.nin },
+     idempotencyKey: params.idempotencyKey,
++    background: params.background,
+     call: (reference) => params.tier === 'information'
+       ? ktechService.ninPersonalInformation({ nin: params.nin }, reference)
+       : provider === 'ktech'
+@@ -444,6 +587,7 @@ export async function purchaseNinByPhone(params: {
+   phone: string;
+   tier: NinPhoneTier;
+   idempotencyKey?: string;
++  background?: boolean;
+ }) {
+   const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
+   const provider: IdentityProvider = await providerForService(service);
+@@ -461,6 +605,7 @@ export async function purchaseNinByPhone(params: {
+     operational: { mode: 'by_phone', tier: params.tier, provider },
+     pii: { phone: params.phone },
+     idempotencyKey: params.idempotencyKey,
++    background: params.background,
+     call: (reference) =>
+       params.tier === 'information'
+         ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
+@@ -481,6 +626,7 @@ export function purchaseNinByDemographic(params: {
+   dob: string;
+   gender?: string;
+   idempotencyKey?: string;
++  background?: boolean;
+ }) {
+   return providerForService('NIN_DEMOGRAPHIC').then(async (provider) => {
+   if (provider === 'hubbu') hubbuService.assertConfigured();
+@@ -498,6 +644,7 @@ export function purchaseNinByDemographic(params: {
+       gender: params.gender
+     },
+     idempotencyKey: params.idempotencyKey,
++    background: params.background,
+     call: () => provider === 'hubbu'
+       ? hubbuService.ninByDemographic({ first_name: params.firstname, last_name: params.lastname, dob: params.dob, gender: params.gender ?? '' })
+       : techhubService.ninByDemographic({
+@@ -510,7 +657,7 @@ export function purchaseNinByDemographic(params: {
+   });
+ }
+ 
+-export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string }) {
++export async function purchaseBvnSlip(params: { userId: string; bvn: string; tier: TechhubBvnTier; idempotencyKey?: string; background?: boolean }) {
+   const service = BVN_SLIP_SERVICE_BY_TIER[params.tier];
+   const provider: IdentityProvider = await providerForService(service);
+   if (provider === 'hubbu') hubbuService.assertConfigured();
+@@ -523,6 +670,7 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
+     operational: { tier: params.tier, provider },
+     pii: { bvn: params.bvn },
+     idempotencyKey: params.idempotencyKey,
++    background: params.background,
+     call: (reference) =>
+       provider === 'ktech'
+         ? ktechService.bvnSlip(params.bvn, params.tier, reference)
+diff --git a/web/src/components/verification/shared.tsx b/web/src/components/verification/shared.tsx
+index f42647e..4228dcb 100644
+--- a/web/src/components/verification/shared.tsx
++++ b/web/src/components/verification/shared.tsx
+@@ -4,7 +4,7 @@ import { api } from '../../lib/api';
+ 
+ // ── Shared types ────────────────────────────────────────────────
+ export type PriceRow = { service: string; unitPrice: number; isActive: boolean; provider?: string };
+-export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; reference: string };
++export type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; document_url?: string; reference: string };
+ export type AsyncResult = { ticket_id: string; reference: string };
+ export type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
+ export type VerificationHistory = {
+@@ -326,9 +326,40 @@ export function DetailsOverviewGrid({ entries }: { entries: [string, unknown][]
+   );
+ }
+ 
+-function SlipDownloadAction({ pdfBase64, pdfUrl, reference }: { pdfBase64: string | null; pdfUrl: string | null; reference: string }) {
++export function SlipDownloadAction({ pdfBase64, pdfUrl, reference, documentUrl }: { pdfBase64: string | null; pdfUrl: string | null; reference: string; documentUrl?: string | null }) {
+   const cleanBase64 = pdfBase64?.replace(/^data:application\/pdf;base64,/i, '') ?? null;
+   const href = cleanBase64 ? `data:application/pdf;base64,${cleanBase64}` : pdfUrl?.startsWith('https://') ? pdfUrl : null;
++  const [opening, setOpening] = useState(false);
++  const [openError, setOpenError] = useState('');
++
++  // Some providers (Hubbu) confirm with a download link instead of the PDF itself.
++  // The server fetches it for the owner from the document endpoint - the same one
++  // "Recent requests" uses - so the customer never sees "no PDF" for a slip that exists.
++  if (!href && documentUrl) {
++    const open = async () => {
++      setOpening(true);
++      setOpenError('');
++      const tab = window.open('', '_blank');
++      try {
++        const blob = await api.document(documentUrl);
++        if (tab) tab.location.href = URL.createObjectURL(blob);
++        else window.location.href = URL.createObjectURL(blob);
++      } catch (error) {
++        tab?.close();
++        setOpenError(error instanceof Error ? error.message : 'Could not open the slip. Try "Retrieve PDF" under Recent requests.');
++      } finally {
++        setOpening(false);
++      }
++    };
++    return (
++      <>
++        <button type="button" onClick={() => void open()} disabled={opening} className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 py-3 font-display font-semibold text-ink disabled:opacity-60">
++          {opening ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />} Download PDF slip
++        </button>
++        {openError && <p className="mt-2 font-body text-xs text-ember-600">{openError}</p>}
++      </>
++    );
++  }
+ 
+   if (!href) {
+     return (
+@@ -434,7 +465,7 @@ export function SlipResultView({ result, message, onDone }: { result: SlipResult
+           is a raw base64 string rather than a nested object, rendered that
+           entire base64 blob as one unreadable "Photo: /9j/4AAQ..." row. */}
+       {result.user_data && <DigitalSlipPreview data={result.user_data} />}
+-      <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} />
++      <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} documentUrl={result.document_url} />
+ 
+       <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
+         Done
+diff --git a/web/src/lib/slip.ts b/web/src/lib/slip.ts
+new file mode 100644
+index 0000000..3e10a38
+--- /dev/null
++++ b/web/src/lib/slip.ts
+@@ -0,0 +1,149 @@
++import { api, ApiError, REQUEST_INTERRUPTED, INTERRUPTED_MESSAGE, wasInterrupted } from './api';
++
++export type SlipResultData = {
++  user_data?: Record<string, unknown>;
++  pdf_base64?: string;
++  pdf_url?: string;
++  document_url?: string;
++  reference: string;
++};
++
++export type SlipOutcome =
++  | { kind: 'success'; result: SlipResultData; message: string }
++  /** Not confirmed yet - nothing was lost; the request is (or will be) in Recent requests. Do not resubmit. */
++  | { kind: 'review'; message: string; reference?: string }
++  | { kind: 'failed'; message: string };
++
++type SubmitResponse = {
++  status: boolean;
++  pending?: boolean;
++  processing?: boolean;
++  message: string;
++  data?: { reference: string; document_url?: string | null; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
++};
++type StatusResponse = {
++  status: boolean;
++  state: 'processing' | 'review' | 'success' | 'failed';
++  message?: string;
++  data?: { reference: string; document_url?: string | null; user_data?: Record<string, unknown> | null; pdf_base64?: string | null; pdf_url?: string | null };
++};
++
++const POLL_FAST_MS = 1_500;
++const POLL_SLOW_MS = 3_000;
++const GIVE_UP_AFTER_MS = 4 * 60_000;
++const MAX_CONSECUTIVE_POLL_ERRORS = 8;
++const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
++
++/**
++ * Submit-then-poll for slip purchases (NIN / BVN). The server debits the wallet
++ * and answers within a second or two; the provider call finishes in the
++ * background and this polls for the result. So the request that waits on the
++ * provider is never an open HTTP call that a browser, proxy or mobile network
++ * can cut off - and the lookup completes even if this tab is closed.
++ *
++ * Throws only when the submit itself was cut off before we learned the
++ * reference (the caller keeps its Idempotency-Key so a retry replays it).
++ */
++export async function submitSlip(
++  path: string,
++  body: unknown,
++  idempotencyKey: string,
++  onProgress?: (elapsedSeconds: number) => void
++): Promise<SlipOutcome> {
++  let submitted: SubmitResponse;
++  try {
++    submitted = await api.post<SubmitResponse>(`${path}?async=1`, body, true, 30_000, idempotencyKey);
++  } catch (error) {
++    if (error instanceof ApiError || !(error instanceof Error)) throw error;
++    // Cut off before we saw the answer: the debit may or may not have happened.
++    throw new ApiError(INTERRUPTED_MESSAGE, 0, REQUEST_INTERRUPTED);
++  }
++
++  const reference = submitted.data?.reference;
++
++  // Older/synchronous answer: the result is already final.
++  if (!submitted.processing) {
++    if (submitted.pending) return { kind: 'review', message: submitted.message, reference };
++    if (!submitted.status) return { kind: 'failed', message: submitted.message };
++    return { kind: 'success', message: submitted.message, result: toResult(submitted.data, reference) };
++  }
++  if (!reference) return { kind: 'review', message: 'Your request was accepted. Check Recent requests in a moment.' };
++
++  const startedAt = Date.now();
++  let consecutiveErrors = 0;
++  for (;;) {
++    const elapsed = Date.now() - startedAt;
++    onProgress?.(Math.floor(elapsed / 1000));
++    if (elapsed > GIVE_UP_AFTER_MS) {
++      return { kind: 'review', reference, message: 'This is taking longer than usual. Your request is still being processed - it will appear under Recent requests when it is ready. Please do not submit it again.' };
++    }
++    await sleep(elapsed < 30_000 ? POLL_FAST_MS : POLL_SLOW_MS);
++    try {
++      const status = await api.get<StatusResponse>(`/verification/slip/${encodeURIComponent(reference)}`);
++      consecutiveErrors = 0;
++      if (status.state === 'processing') continue;
++      if (status.state === 'success') return { kind: 'success', message: 'Verification successful', result: toResult(status.data, reference) };
++      if (status.state === 'review') return { kind: 'review', reference, message: status.message ?? 'We are confirming this request with the provider.' };
++      return { kind: 'failed', message: status.message ?? 'The request could not be completed. Your payment has been refunded.' };
++    } catch (error) {
++      // A definitive "no such request" will not fix itself; a blip on a mobile network will.
++      if (error instanceof ApiError && error.status === 404) return { kind: 'failed', message: error.message };
++      consecutiveErrors += 1;
++      if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
++        return { kind: 'review', reference, message: 'We lost connection while checking your request. It is still being processed - check Recent requests shortly. Please do not submit it again.' };
++      }
++    }
++  }
++}
++
++function toResult(data: SubmitResponse['data'] | StatusResponse['data'], reference?: string): SlipResultData {
++  return {
++    user_data: data?.user_data ?? undefined,
++    pdf_base64: data?.pdf_base64 ?? undefined,
++    pdf_url: data?.pdf_url ?? undefined,
++    document_url: data?.document_url ?? undefined,
++    reference: data?.reference ?? reference ?? ''
++  };
++}
++
++type KeyStore = { current: (fingerprint: string) => string; reset: () => void };
++
++/**
++ * The whole submit -> wait -> show-outcome sequence every slip page shares, so
++ * they all behave the same way: a live "verifying" message, the result as soon
++ * as it is ready, and - when we could not confirm an outcome - a clear
++ * "do not resubmit" message plus polling of Recent requests, never a bare error.
++ */
++export async function runSlipFlow(opts: {
++  path: string;
++  body: unknown;
++  fingerprint: string;
++  idempotency: KeyStore;
++  setMessage: (message: string) => void;
++  setResult: (result: SlipResultData) => void;
++  /** Start polling Recent requests (outcome unknown). */
++  watch: () => void;
++}) {
++  const { idempotency, setMessage } = opts;
++  try {
++    const outcome = await submitSlip(opts.path, opts.body, idempotency.current(opts.fingerprint), (seconds) =>
++      setMessage(seconds < 4 ? 'Verifying with the provider…' : `Verifying with the provider… ${seconds}s. Please keep this page open.`)
++    );
++    if (outcome.kind === 'success') {
++      idempotency.reset();
++      opts.setResult(outcome.result);
++      setMessage(outcome.message || 'Done - your document is ready below.');
++    } else if (outcome.kind === 'review') {
++      // Keep the key: resubmitting the same details replays this request instead of charging again.
++      opts.watch();
++      setMessage(outcome.reference ? `${outcome.message} Reference: ${outcome.reference}.` : outcome.message);
++    } else {
++      idempotency.reset();
++      setMessage(outcome.message);
++    }
++  } catch (error) {
++    if (wasInterrupted(error)) opts.watch();
++    else idempotency.reset();
++    setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++  }
++}
+diff --git a/web/src/pages/VerificationPage.tsx b/web/src/pages/VerificationPage.tsx
+index 0fe6ef7..4b156e2 100644
+--- a/web/src/pages/VerificationPage.tsx
++++ b/web/src/pages/VerificationPage.tsx
+@@ -16,8 +16,10 @@ import {
+   Clock,
+ } from 'lucide-react';
+ import AppShell from '../components/AppShell';
+-import { api, ApiError, wasInterrupted } from '../lib/api';
++import { api, ApiError } from '../lib/api';
++import { runSlipFlow } from '../lib/slip';
+ import { PinConfirmDialog } from '../components/PinConfirmDialog';
++import { SlipDownloadAction } from '../components/verification/shared';
+ 
+ type Mode = 'nin' | 'bvn' | 'delink';
+ type Item = {
+@@ -108,7 +110,7 @@ function validationServiceKey(validationType?: string) {
+ const money = (amount?: number) =>
+   amount === undefined ? 'Price loading…' : `₦${amount.toLocaleString('en-NG', { maximumFractionDigits: 2 })}`;
+ 
+-type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; reference: string };
++type SlipResult = { user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; document_url?: string; reference: string };
+ type AsyncResult = { ticket_id: string; reference: string };
+ type TicketStatus = { ticket_id: string; status: 'pending' | 'success' | 'failed'; response: Record<string, unknown> | null };
+ type VerificationHistory = {
+@@ -243,22 +245,29 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
+       const data = { ...values, ...(selected.tiers ? { tier } : {}), pin };
+       type SubmitResult = {
+         status: boolean;
+-        pending?: boolean;
+         message: string;
+         data?: { reference: string; tracking_id?: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string; ticket_id?: string };
+       };
+       const isSlip = !selected.async && selected.id !== 'license-onboarding';
+-      // Slips wait on a slow upstream provider: allow it ample time and send a
+-      // stable key so a retry after a timeout replays the request, not re-bills it.
+-      const result = isSlip
+-        ? await api.postSlip<SubmitResult>(selected.path, data, slipKeyFor(JSON.stringify([selected.path, { ...data, pin: undefined }])))
+-        : await api.post<SubmitResult>(selected.path, data);
+-      if (isSlip && result.pending) {
+-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+-        setWatching(true);
++      if (isSlip) {
++        // Debit + answer fast, then poll for the provider's result (see lib/slip.ts).
++        await runSlipFlow({
++          path: selected.path,
++          body: data,
++          fingerprint: JSON.stringify([selected.path, { ...data, pin: undefined }]),
++          idempotency: { current: slipKeyFor, reset: () => { slipKey.current = null; } },
++          setMessage,
++          setResult: (r) => {
++            const nestedPdf = r.user_data
++              ? (Object.entries(r.user_data).find(([key, entry]) => /pdf|base64/i.test(key) && typeof entry === 'string')?.[1] as string | undefined)
++              : undefined;
++            setSlipResult({ ...r, pdf_base64: r.pdf_base64 ?? nestedPdf });
++          },
++          watch: () => setWatching(true)
++        });
+         return;
+       }
+-      slipKey.current = null;
++      const result = await api.post<SubmitResult>(selected.path, data);
+       if (!result.status) throw new Error(result.message);
+ 
+       if (selected.id === 'license-onboarding') {
+@@ -282,8 +291,6 @@ export default function VerificationPage({ mode }: { mode: Mode }) {
+         setMessage(result.message || 'Done - your document is ready below.');
+       }
+     } catch (error) {
+-      if (wasInterrupted(error)) setWatching(true);
+-      else slipKey.current = null;
+       setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+     } finally {
+       setBusy(false);
+@@ -579,9 +586,7 @@ function SlipResultView({ result, message, onDone }: { result: SlipResult; messa
+       )}
+ 
+       {!pdfHref && (
+-        <p className="mt-4 rounded-xl border border-gold-500/30 bg-gold-500/10 p-3 font-body text-sm text-ink-600">
+-          The provider confirmed this request, but did not return a downloadable PDF. Keep the reference above and contact support; do not submit or pay for the request again.
+-        </p>
++        <SlipDownloadAction pdfBase64={null} pdfUrl={null} reference={result.reference} documentUrl={result.document_url} />
+       )}
+ 
+       <button onClick={onDone} className="mt-3 w-full rounded-xl border border-parchment-line py-2.5 font-body text-sm text-ink-600">
+diff --git a/web/src/pages/verification/BvnVerificationPage.tsx b/web/src/pages/verification/BvnVerificationPage.tsx
+index 1b15e0d..2d20aa4 100644
+--- a/web/src/pages/verification/BvnVerificationPage.tsx
++++ b/web/src/pages/verification/BvnVerificationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2, Terminal } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError, wasInterrupted } from '../../lib/api';
++import { runSlipFlow } from '../../lib/slip';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -55,26 +55,7 @@ export default function BvnVerificationPage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.postSlip<{
+-        status: boolean;
+-        pending?: boolean;
+-        message: string;
+-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>('/verification/bvn/slip', { bvn, tier, pin }, idempotency.current(`${bvn}|${tier}`));
+-      if (result.pending) {
+-        // Not a failure: the provider has not confirmed yet. Keep the key so a retry replays this request.
+-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+-        watch();
+-        return;
+-      }
+-      idempotency.reset();
+-      if (!result.status) throw new Error(result.message);
+-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+-      setMessage(result.message || 'Done - your document is ready below.');
+-    } catch (error) {
+-      if (wasInterrupted(error)) watch();
+-      else idempotency.reset();
+-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++      await runSlipFlow({ path: '/verification/bvn/slip', body: { bvn, tier, pin }, fingerprint: `${bvn}|${tier}`, idempotency, setMessage, setResult, watch });
+     } finally {
+       setBusy(false);
+     }
+diff --git a/web/src/pages/verification/DemographicVerificationPage.tsx b/web/src/pages/verification/DemographicVerificationPage.tsx
+index 3088543..8068dfb 100644
+--- a/web/src/pages/verification/DemographicVerificationPage.tsx
++++ b/web/src/pages/verification/DemographicVerificationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError, wasInterrupted } from '../../lib/api';
++import { runSlipFlow } from '../../lib/slip';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -84,31 +84,12 @@ export default function DemographicVerificationPage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.postSlip<{
+-        status: boolean;
+-        pending?: boolean;
+-        message: string;
+-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>('/verification/nin/by-demographic', {
+-        firstname,
+-        lastname,
+-        dob,
+-        gender: gender || undefined,
+-        pin,
+-      }, idempotency.current(`${firstname}|${lastname}|${dob}|${gender}`));
+-      if (result.pending) {
+-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+-        watch();
+-        return;
+-      }
+-      idempotency.reset();
+-      if (!result.status) throw new Error(result.message);
+-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+-      setMessage(result.message || 'Done - your document is ready below.');
+-    } catch (error) {
+-      if (wasInterrupted(error)) watch();
+-      else idempotency.reset();
+-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++      await runSlipFlow({
++        path: '/verification/nin/by-demographic',
++        body: { firstname, lastname, dob, gender: gender || undefined, pin },
++        fingerprint: `${firstname}|${lastname}|${dob}|${gender}`,
++        idempotency, setMessage, setResult, watch
++      });
+     } finally {
+       setBusy(false);
+     }
+diff --git a/web/src/pages/verification/NinPhoneVerificationPage.tsx b/web/src/pages/verification/NinPhoneVerificationPage.tsx
+index 78ec1f5..c35a20f 100644
+--- a/web/src/pages/verification/NinPhoneVerificationPage.tsx
++++ b/web/src/pages/verification/NinPhoneVerificationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError, wasInterrupted } from '../../lib/api';
++import { runSlipFlow } from '../../lib/slip';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -114,26 +114,7 @@ export default function NinPhoneVerificationPage() {
+       const body = demographicLookup
+         ? { firstname, lastname, gender, dob, pin }
+         : method === 'nin' ? { nin: idValue, tier: ninTier, pin } : { phone: idValue, tier: selectedPhoneTier, pin };
+-      const result = await api.postSlip<{
+-        status: boolean;
+-        pending?: boolean;
+-        message: string;
+-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>(path, body, idempotency.current(JSON.stringify(body)));
+-      if (result.pending) {
+-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'check your transaction history'}. Please do not submit this request again yet.`);
+-        watch();
+-        return;
+-      }
+-      idempotency.reset();
+-      if (!result.status) throw new Error(result.message);
+-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+-      setMessage(result.message || 'Done - your document is ready below.');
+-    } catch (error) {
+-      // Keep the idempotency key after a browser/network timeout to prevent a duplicate provider call.
+-      if (wasInterrupted(error)) watch();
+-      else idempotency.reset();
+-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++      await runSlipFlow({ path, body, fingerprint: JSON.stringify({ ...body, pin: undefined }), idempotency, setMessage, setResult, watch });
+     } finally {
+       setBusy(false);
+     }
+diff --git a/web/src/pages/verification/PhoneMultiplePage.tsx b/web/src/pages/verification/PhoneMultiplePage.tsx
+index 5a472ba..3d67e95 100644
+--- a/web/src/pages/verification/PhoneMultiplePage.tsx
++++ b/web/src/pages/verification/PhoneMultiplePage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError, wasInterrupted } from '../../lib/api';
++import { runSlipFlow } from '../../lib/slip';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -71,25 +71,7 @@ export default function PhoneMultiplePage() {
+     setBusy(true);
+     setMessage('');
+     try {
+-      const result = await api.postSlip<{
+-        status: boolean;
+-        pending?: boolean;
+-        message: string;
+-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
+-      }>('/verification/nin/by-phone', { phone, tier: safeTier, pin }, idempotency.current(`${phone}|${safeTier}`));
+-      if (result.pending) {
+-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
+-        watch();
+-        return;
+-      }
+-      idempotency.reset();
+-      if (!result.status) throw new Error(result.message);
+-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
+-      setMessage(result.message || 'Done - your document is ready below.');
+-    } catch (error) {
+-      if (wasInterrupted(error)) watch();
+-      else idempotency.reset();
+-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
++      await runSlipFlow({ path: '/verification/nin/by-phone', body: { phone, tier: safeTier, pin }, fingerprint: `${phone}|${safeTier}`, idempotency, setMessage, setResult, watch });
+     } finally {
+       setBusy(false);
+     }
+-- 
+2.43.0
+

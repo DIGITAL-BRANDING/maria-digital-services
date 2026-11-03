@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError, wasInterrupted } from '../../lib/api';
+import { runSlipFlow } from '../../lib/slip';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -84,31 +84,12 @@ export default function DemographicVerificationPage() {
     setBusy(true);
     setMessage('');
     try {
-      const result = await api.postSlip<{
-        status: boolean;
-        pending?: boolean;
-        message: string;
-        data?: { reference: string; user_data?: Record<string, unknown>; pdf_base64?: string; pdf_url?: string };
-      }>('/verification/nin/by-demographic', {
-        firstname,
-        lastname,
-        dob,
-        gender: gender || undefined,
-        pin,
-      }, idempotency.current(`${firstname}|${lastname}|${dob}|${gender}`));
-      if (result.pending) {
-        setMessage(`${result.message} Reference: ${result.data?.reference ?? 'see Recent requests'}.`);
-        watch();
-        return;
-      }
-      idempotency.reset();
-      if (!result.status) throw new Error(result.message);
-      setResult({ user_data: result.data?.user_data, pdf_base64: result.data?.pdf_base64, pdf_url: result.data?.pdf_url, reference: result.data?.reference ?? '' });
-      setMessage(result.message || 'Done - your document is ready below.');
-    } catch (error) {
-      if (wasInterrupted(error)) watch();
-      else idempotency.reset();
-      setMessage(error instanceof ApiError ? error.message : error instanceof Error ? error.message : 'Request failed.');
+      await runSlipFlow({
+        path: '/verification/nin/by-demographic',
+        body: { firstname, lastname, dob, gender: gender || undefined, pin },
+        fingerprint: `${firstname}|${lastname}|${dob}|${gender}`,
+        idempotency, setMessage, setResult, watch
+      });
     } finally {
       setBusy(false);
     }
