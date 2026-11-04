@@ -1,0 +1,975 @@
+diff --git a/maria_backend/src/routes/verification.routes.ts b/maria_backend/src/routes/verification.routes.ts
+index ad8e803..b3d6c31 100644
+--- a/maria_backend/src/routes/verification.routes.ts
++++ b/maria_backend/src/routes/verification.routes.ts
+@@ -8,6 +8,7 @@ import { listTinCertificateHistory, listTinCertificatePrices, submitTinCertifica
+ import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
+ import { prisma } from '../lib/prisma.js';
+ import {
++  BULK_SUBMIT_MAX,
+   checkBvnRetrievalStatus,
+   checkDelinkingStatus,
+   checkIpeClearanceStatus,
+@@ -23,7 +24,9 @@ import {
+   submitBvnRetrieval,
+   submitDelinking,
+   submitIpeClearance,
++  submitIpeClearanceBulk,
+   submitNinValidation,
++  submitNinValidationBulk,
+   submitPersonalization
+ } from '../services/verification.service.js';
+ 
+@@ -364,6 +367,26 @@ verificationRoutes.get('/nin-validation/:ticketId', async (req, res) => {
+   res.json({ status: true, data: { ticket_id: result.ticketId, status: result.status, response: result.response } });
+ });
+ 
++// Bulk: one PIN confirmation covers the whole batch; each NIN is debited and
++// submitted separately (see runBulkSubmit in verification.service.ts).
++verificationRoutes.post('/nin-validation/bulk', async (req, res) => {
++  const body = z
++    .object({
++      nins: z.array(z.string().trim().regex(/^\d{11}$/, 'Each NIN must be exactly 11 digits')).min(1).max(BULK_SUBMIT_MAX),
++      validation_type: ninValidationType.optional(),
++      ...pinField
++    })
++    .parse(req.body);
++  await requirePinConfirmation(req.user!.id, body.pin);
++  const summary = await submitNinValidationBulk({
++    userId: req.user!.id,
++    nins: body.nins,
++    validationType: body.validation_type,
++    idempotencyKey: idempotencyKeyFrom(req)
++  });
++  res.json({ status: true, message: summary.message, data: summary });
++});
++
+ verificationRoutes.post('/personalization', async (req, res) => {
+   const body = z.object({ tracking_id: z.string().trim().min(1).max(50), ...pinField }).parse(req.body);
+   await requirePinConfirmation(req.user!.id, body.pin);
+@@ -439,6 +462,22 @@ verificationRoutes.get('/ipe-clearance/:ticketId', async (req, res) => {
+   res.json({ status: true, data: { ticket_id: result.ticketId, status: result.status, response: result.response } });
+ });
+ 
++verificationRoutes.post('/ipe-clearance/bulk', async (req, res) => {
++  const body = z
++    .object({
++      tracking_ids: z.array(z.string().trim().min(1).max(20)).min(1).max(BULK_SUBMIT_MAX),
++      ...pinField
++    })
++    .parse(req.body);
++  await requirePinConfirmation(req.user!.id, body.pin);
++  const summary = await submitIpeClearanceBulk({
++    userId: req.user!.id,
++    trackingIds: body.tracking_ids,
++    idempotencyKey: idempotencyKeyFrom(req)
++  });
++  res.json({ status: true, message: summary.message, data: summary });
++});
++
+ // ── CAC Services (manual — no provider API) ────────────────────────
+ 
+ verificationRoutes.get('/tin/prices', async (_req, res) => {
+diff --git a/maria_backend/src/services/__tests__/bulk-submit.test.ts b/maria_backend/src/services/__tests__/bulk-submit.test.ts
+new file mode 100644
+index 0000000..84cabd5
+--- /dev/null
++++ b/maria_backend/src/services/__tests__/bulk-submit.test.ts
+@@ -0,0 +1,178 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++/**
++ * Same mocking approach as ipe-clearance.test.ts: in-memory fake Prisma plus
++ * an echo-Proxy for enums. These tests cover the bulk fan-out only; the
++ * single-item submit underneath (debit, refund, provider routing) has its own
++ * coverage in ipe-clearance.test.ts.
++ */
++vi.mock('@prisma/client', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('@prisma/client')>();
++  const echoEnum = new Proxy({}, { get: (_target, prop) => prop });
++  class PrismaClientKnownRequestError extends Error {
++    code: string;
++    constructor(message: string, opts: { code: string }) {
++      super(message);
++      this.code = opts.code;
++    }
++  }
++  return {
++    ...actual,
++    TransactionStatus: echoEnum,
++    TransactionType: echoEnum,
++    Prisma: { ...((actual as Record<string, unknown>).Prisma as Record<string, unknown>), PrismaClientKnownRequestError }
++  };
++});
++
++vi.mock('../../lib/prisma.js', async () => {
++  const { createFakePrisma } = await import('../../test-utils/fake-prisma.js');
++  const fake = createFakePrisma();
++  return { prisma: fake.api };
++});
++
++vi.mock('../notification.service.js', () => ({ notifyUser: vi.fn().mockResolvedValue(undefined) }));
++vi.mock('../provider-ledger.service.js', () => ({ recordProviderDebit: vi.fn().mockResolvedValue(undefined) }));
++
++const submitIpeClearanceMock = vi.fn();
++const checkIpeClearanceMock = vi.fn();
++vi.mock('../ktech.service.js', () => ({
++  ktechService: { submitIpeClearance: submitIpeClearanceMock, checkIpeClearance: checkIpeClearanceMock }
++}));
++vi.mock('../techhub.service.js', () => ({
++  techhubService: {
++    submitIpeClearance: vi.fn(() => {
++      throw new Error('IPE Clearance must not call Techhub - it is pinned to K-Tech');
++    }),
++    checkIpeClearance: vi.fn(() => {
++      throw new Error('IPE Clearance must not call Techhub - it is pinned to K-Tech');
++    })
++  }
++}));
++
++const { prisma } = await import('../../lib/prisma.js');
++const { submitIpeClearanceBulk, getVerificationPrice } = await import('../verification.service.js');
++
++let userCounter = 0;
++async function seedUser(balanceKobo: bigint) {
++  userCounter += 1;
++  const id = `bulk-user-${userCounter}`;
++  await prisma.user.create({
++    data: {
++      id,
++      walletBalanceKobo: balanceKobo,
++      fullName: `Bulk User ${userCounter}`,
++      email: `bulk-user-${userCounter}@example.test`,
++      phone: `+23482222${String(userCounter).padStart(4, '0')}`,
++      referralCode: `BULKREF${userCounter}`
++    }
++  });
++  return id;
++}
++
++async function balanceKoboOf(userId: string) {
++  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
++  return user.walletBalanceKobo;
++}
++
++/** getVerificationPrice returns naira; the wallet works in kobo. */
++async function unitKobo() {
++  const price = await getVerificationPrice('IPE_CLEARANCE');
++  return BigInt(Math.round(price.unitPrice * 100));
++}
++
++let ticketCounter = 0;
++beforeEach(() => {
++  submitIpeClearanceMock.mockReset();
++  checkIpeClearanceMock.mockReset();
++  submitIpeClearanceMock.mockImplementation(async (trackingId: string) => {
++    ticketCounter += 1;
++    if (trackingId.startsWith('REJECT')) {
++      return { ok: false, message: 'Provider rejected the tracking ID', raw: {} };
++    }
++    return { ok: true, ticketId: `TICKET-${ticketCounter}`, message: 'submitted', raw: {} };
++  });
++});
++
++describe('IPE Clearance bulk submit', () => {
++  it('debits and submits every unique tracking ID as its own ticket', async () => {
++    const price = await unitKobo();
++    const userId = await seedUser(price * 10n);
++
++    const summary = await submitIpeClearanceBulk({
++      userId,
++      trackingIds: ['TRACK001', 'TRACK002', 'TRACK003'],
++      idempotencyKey: 'batch-happy-1'
++    });
++
++    expect(summary.submitted_count).toBe(3);
++    expect(summary.failed_count).toBe(0);
++    expect(summary.skipped_count).toBe(0);
++    const ticketIds = summary.results.map((r) => r.ticket_id);
++    expect(new Set(ticketIds).size).toBe(3);
++    expect(submitIpeClearanceMock).toHaveBeenCalledTimes(3);
++    expect(await balanceKoboOf(userId)).toBe(price * 7n);
++  });
++
++  it('charges a duplicated line only once', async () => {
++    const price = await unitKobo();
++    const userId = await seedUser(price * 10n);
++
++    const summary = await submitIpeClearanceBulk({
++      userId,
++      trackingIds: ['DUP000001', 'DUP000001', 'DUP000002'],
++      idempotencyKey: 'batch-dup-1'
++    });
++
++    expect(summary.submitted_count).toBe(2);
++    expect(summary.skipped_count).toBe(1);
++    expect(submitIpeClearanceMock).toHaveBeenCalledTimes(2);
++    expect(await balanceKoboOf(userId)).toBe(price * 8n);
++  });
++
++  it('stops at the balance limit and never charges past it', async () => {
++    const price = await unitKobo();
++    const userId = await seedUser(price * 2n);
++
++    const summary = await submitIpeClearanceBulk({
++      userId,
++      trackingIds: ['FUND00001', 'FUND00002', 'FUND00003', 'FUND00004'],
++      idempotencyKey: 'batch-funds-1'
++    });
++
++    expect(summary.submitted_count).toBe(2);
++    expect(summary.failed_count + summary.skipped_count).toBe(2);
++    expect(await balanceKoboOf(userId)).toBe(0n);
++    expect(summary.message).toMatch(/submitted/);
++  });
++
++  it('refunds a line the provider rejects and reports it as failed', async () => {
++    const price = await unitKobo();
++    const userId = await seedUser(price * 5n);
++
++    const summary = await submitIpeClearanceBulk({
++      userId,
++      trackingIds: ['GOOD00001', 'REJECT0001'],
++      idempotencyKey: 'batch-reject-1'
++    });
++
++    expect(summary.submitted_count).toBe(1);
++    expect(summary.failed_count).toBe(1);
++    const rejected = summary.results.find((r) => r.input === 'REJECT0001');
++    expect(rejected?.status).toBe('failed');
++    // Only the accepted line stays charged.
++    expect(await balanceKoboOf(userId)).toBe(price * 4n);
++  });
++
++  it('replays the same batch key without charging twice', async () => {
++    const price = await unitKobo();
++    const userId = await seedUser(price * 10n);
++    const input = { userId, trackingIds: ['REPLAY001', 'REPLAY002'], idempotencyKey: 'batch-replay-1' };
++
++    const first = await submitIpeClearanceBulk(input);
++    const second = await submitIpeClearanceBulk(input);
++
++    expect(first.results.map((r) => r.ticket_id)).toEqual(second.results.map((r) => r.ticket_id));
++    expect(submitIpeClearanceMock).toHaveBeenCalledTimes(2);
++    expect(await balanceKoboOf(userId)).toBe(price * 8n);
++  });
++});
+diff --git a/maria_backend/src/services/verification.service.ts b/maria_backend/src/services/verification.service.ts
+index 9aa38f4..421f17d 100644
+--- a/maria_backend/src/services/verification.service.ts
++++ b/maria_backend/src/services/verification.service.ts
+@@ -1,3 +1,4 @@
++import { createHash, randomUUID } from 'node:crypto';
+ import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
+ import { koboToNaira } from '../lib/money.js';
+ import { mergeSealedPII, openPII, sealPII } from '../lib/pii.js';
+@@ -970,7 +971,10 @@ async function settleAsyncTransaction(
+ 
+   if (refundable) {
+     await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
++    await notifyAsyncResult(transaction, 'failed', result.response);
+   } else {
++    // Non-refundable: one specific notice that explains why the charge stands.
++    // The generic "update" notice is deliberately NOT sent on top of it.
+     await notifyUser({
+       userId: transaction.userId,
+       type: 'WALLET',
+@@ -979,7 +983,6 @@ async function settleAsyncTransaction(
+       data: { transactionId: transaction.id }
+     });
+   }
+-  await notifyAsyncResult(transaction, 'failed', result.response);
+   return { ticketId: result.ticketId, status: 'failed', response: result.response };
+ }
+ 
+@@ -1127,20 +1130,158 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
+ // this flow was built against, and is the one actually being used in
+ // production - it is not switched by the general NIN/BVN provider setting.
+ export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
+-  return asyncProviderForService('IPE_CLEARANCE').then((provider) => submitAsyncService({
++  // Hard-pinned to K-Tech. Do NOT route this through asyncProviderForService:
++  // that reads the IPE_CLEARANCE pricing row's `provider` column, which
++  // defaults to 'techhub', so IPE requests were silently going to Techhub.
++  const provider = 'ktech' as const;
++  return submitAsyncService({
+     userId: params.userId, service: 'IPE_CLEARANCE', provider,
+     description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
+     idempotencyKey: params.idempotencyKey,
+-    call: (reference) => provider === 'ktech'
+-      ? ktechService.submitIpeClearance(params.trackingId, reference)
+-      : techhubService.submitIpeClearance(params.trackingId)
+-  }));
++    call: (reference) => ktechService.submitIpeClearance(params.trackingId, reference)
++  });
+ }
+ export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
+   return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
+     provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
+ }
+ 
++// ── Bulk submit (NIN Validation + IPE Clearance) ───────────────────
++// Each line is sent through the SAME single-item submit used by the
++// one-at-a-time form. That means every line gets its own wallet debit, its
++// own ticket, its own refund if the provider rejects it at submit time, and
++// the same provider routing (NIN Validation follows the admin's provider
++// setting, IPE stays pinned to K-Tech). Neither provider documents a batch
++// endpoint, so the fan-out happens here, on our side.
++export const BULK_SUBMIT_MAX = 50;
++const BULK_CONCURRENCY = 4;
++
++export type BulkSubmitItemResult = {
++  input: string;
++  status: 'submitted' | 'failed' | 'skipped';
++  ticket_id: string | null;
++  reference: string | null;
++  message: string;
++};
++
++export type BulkSubmitSummary = {
++  results: BulkSubmitItemResult[];
++  submitted_count: number;
++  failed_count: number;
++  skipped_count: number;
++  balance_after: number | null;
++  message: string;
++};
++
++/**
++ * Per-line idempotency key derived from the batch key. Re-sending the same
++ * batch (same Idempotency-Key header, e.g. after a dropped connection) replays
++ * each line's original request instead of debiting again. The hash keeps the
++ * value inside the provider's 8-128 character limit.
++ */
++function bulkItemIdempotencyKey(batchKey: string | undefined, index: number, input: string) {
++  return createHash('sha256').update(`${batchKey ?? randomUUID()}:${index}:${input}`).digest('hex');
++}
++
++async function runBulkSubmit(params: {
++  inputs: string[];
++  idempotencyKey?: string;
++  submitOne: (input: string, idempotencyKey: string) => Promise<AsyncSubmitResult>;
++}): Promise<BulkSubmitSummary> {
++  const results: BulkSubmitItemResult[] = new Array(params.inputs.length);
++  const queue: number[] = [];
++  const seen = new Set<string>();
++
++  params.inputs.forEach((input, index) => {
++    if (seen.has(input)) {
++      results[index] = {
++        input,
++        status: 'skipped',
++        ticket_id: null,
++        reference: null,
++        message: 'Duplicate line in this batch - skipped so it is not charged twice.'
++      };
++      return;
++    }
++    seen.add(input);
++    queue.push(index);
++  });
++
++  let stoppedMessage: string | null = null;
++  let balanceAfter: number | null = null;
++  let cursor = 0;
++
++  const worker = async () => {
++    while (cursor < queue.length) {
++      const index = queue[cursor++];
++      const input = params.inputs[index];
++
++      if (stoppedMessage) {
++        results[index] = { input, status: 'skipped', ticket_id: null, reference: null, message: stoppedMessage };
++        continue;
++      }
++
++      try {
++        const submitted = await params.submitOne(input, bulkItemIdempotencyKey(params.idempotencyKey, index, input));
++        balanceAfter = submitted.balanceAfter;
++        results[index] = {
++          input,
++          status: 'submitted',
++          ticket_id: submitted.ticketId,
++          reference: submitted.reference,
++          message: 'Submitted - track it in Recent requests below.'
++        };
++      } catch (error) {
++        // Out of money: every remaining line would fail the same way, so stop
++        // here rather than hammer the provider. The line that hit the limit
++        // was never debited (the debit is what raised the error).
++        if (error instanceof ApiError && error.code === 'INSUFFICIENT_BALANCE') {
++          stoppedMessage = 'Not submitted - wallet balance ran out. Top up and submit the remaining lines.';
++        }
++        results[index] = {
++          input,
++          status: 'failed',
++          ticket_id: null,
++          reference: null,
++          message: error instanceof Error ? error.message : 'Submission failed.'
++        };
++      }
++    }
++  };
++
++  await Promise.all(Array.from({ length: Math.min(BULK_CONCURRENCY, queue.length) }, () => worker()));
++
++  const submittedCount = results.filter((r) => r.status === 'submitted').length;
++  const failedCount = results.filter((r) => r.status === 'failed').length;
++  const skippedCount = results.filter((r) => r.status === 'skipped').length;
++
++  return {
++    results,
++    submitted_count: submittedCount,
++    failed_count: failedCount,
++    skipped_count: skippedCount,
++    balance_after: balanceAfter,
++    message: `${submittedCount} submitted, ${failedCount} failed, ${skippedCount} skipped.`
++  };
++}
++
++export function submitNinValidationBulk(params: { userId: string; nins: string[]; validationType?: string; idempotencyKey?: string }) {
++  return runBulkSubmit({
++    inputs: params.nins,
++    idempotencyKey: params.idempotencyKey,
++    submitOne: (nin, idempotencyKey) =>
++      submitNinValidation({ userId: params.userId, nin, validationType: params.validationType, idempotencyKey })
++  });
++}
++
++export function submitIpeClearanceBulk(params: { userId: string; trackingIds: string[]; idempotencyKey?: string }) {
++  return runBulkSubmit({
++    inputs: params.trackingIds,
++    idempotencyKey: params.idempotencyKey,
++    submitOne: (trackingId, idempotencyKey) => submitIpeClearance({ userId: params.userId, trackingId, idempotencyKey })
++  });
++}
++
+ export type ServiceTicketEntry = {
+   transaction_id: string;
+   reference: string;
+diff --git a/web/src/components/verification/shared.tsx b/web/src/components/verification/shared.tsx
+index 4228dcb..66efd5b 100644
+--- a/web/src/components/verification/shared.tsx
++++ b/web/src/components/verification/shared.tsx
+@@ -1,4 +1,4 @@
+-import { Download, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
++import { Download, Layers, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
+ import { useCallback, useEffect, useRef, useState } from 'react';
+ import { api } from '../../lib/api';
+ 
+@@ -873,3 +873,125 @@ export function SlipIcon({ variant }: { variant: SlipIconVariant }) {
+     </svg>
+   );
+ }
++
++// ── Bulk submit (NIN Validation, IPE Clearance) ─────────────────────
++// The backend accepts up to BULK_MAX_ITEMS lines per request. Each line is
++// its own debit, ticket and refund on the server, so the UI only has to
++// collect lines, show the total, and list what happened to each one.
++export const BULK_MAX_ITEMS = 50;
++
++export type BulkSubmitItemResult = {
++  input: string;
++  status: 'submitted' | 'failed' | 'skipped';
++  ticket_id: string | null;
++  reference: string | null;
++  message: string;
++};
++
++export type BulkSubmitSummary = {
++  results: BulkSubmitItemResult[];
++  submitted_count: number;
++  failed_count: number;
++  skipped_count: number;
++  balance_after: number | null;
++  message: string;
++};
++
++/** Splits pasted text on newlines, commas, semicolons or spaces, then de-duplicates. */
++export function parseBulkLines(text: string, isValid: (line: string) => boolean) {
++  const tokens = text.split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
++  const unique = [...new Set(tokens)];
++  return {
++    total: tokens.length,
++    duplicates: tokens.length - unique.length,
++    valid: unique.filter(isValid),
++    invalid: unique.filter((t) => !isValid(t)),
++  };
++}
++
++export function BulkModeToggle({ mode, onChange }: { mode: 'single' | 'bulk'; onChange: (m: 'single' | 'bulk') => void }) {
++  const options = [
++    { value: 'single', label: 'Single Submit' },
++    { value: 'bulk', label: 'Bulk Submit' },
++  ] as const;
++  return (
++    <div role="tablist" className="mt-5 grid grid-cols-2 gap-1 rounded-xl border border-blue-200 bg-blue-50 p-1">
++      {options.map((option) => {
++        const active = mode === option.value;
++        return (
++          <button
++            key={option.value}
++            type="button"
++            role="tab"
++            aria-selected={active}
++            onClick={() => onChange(option.value)}
++            className={`flex items-center justify-center gap-2 rounded-lg py-2.5 font-body text-sm font-semibold transition ${
++              active ? 'bg-[#0b2f73] text-white shadow' : 'text-[#0b2f73]/70 hover:bg-white'
++            }`}
++          >
++            {option.value === 'bulk' && <Layers size={15} />}
++            {option.label}
++          </button>
++        );
++      })}
++    </div>
++  );
++}
++
++/** Shown in place of the single-request result after a bulk submit. */
++export function BulkSubmitResults({ summary, onDone }: { summary: BulkSubmitSummary; onDone: () => void }) {
++  const anySubmitted = summary.submitted_count > 0;
++  return (
++    <div className="mt-6">
++      <div
++        className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
++          anySubmitted ? 'border-success-500/30 bg-success-500/5' : 'border-ember-500/30 bg-ember-500/5'
++        }`}
++      >
++        {anySubmitted ? <CheckCircle2 size={20} className="shrink-0 text-success-500" /> : <XCircle size={20} className="shrink-0 text-ember-500" />}
++        <p className="font-body text-sm font-semibold text-[#0b2f73]">{summary.message}</p>
++      </div>
++
++      <div className="mt-3 max-h-80 overflow-auto rounded-xl border border-blue-100 bg-blue-50">
++        <table className="w-full text-left font-body text-xs">
++          <thead>
++            <tr className="border-b border-blue-100 text-[#0b2f73]/70">
++              {['Entry', 'Result', 'Ticket'].map((h) => (
++                <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">
++                  {h}
++                </th>
++              ))}
++            </tr>
++          </thead>
++          <tbody>
++            {summary.results.map((row, index) => (
++              <tr key={`${row.input}-${index}`} className="border-b border-blue-100 last:border-0">
++                <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{row.input}</td>
++                <td className="px-3 py-2">
++                  <span
++                    className={`mr-2 rounded-full px-2 py-0.5 text-[10px] font-bold ${
++                      row.status === 'submitted' ? 'bg-success-500/15 text-success-600' : row.status === 'failed' ? 'bg-ember-500/15 text-ember-600' : 'bg-blue-100 text-[#0b2f73]/70'
++                    }`}
++                  >
++                    {row.status === 'submitted' ? 'Submitted' : row.status === 'failed' ? 'Failed' : 'Skipped'}
++                  </span>
++                  <span className="text-[#0b2f73]/70">{row.message}</span>
++                </td>
++                <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]/70">{row.ticket_id ?? '—'}</td>
++              </tr>
++            ))}
++          </tbody>
++        </table>
++      </div>
++
++      <p className="mt-2 font-body text-xs text-[#0b2f73]/60">
++        Submitted lines appear in Recent requests below, where you can check their status. Failed lines were not charged.
++      </p>
++
++      <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
++        Done
++      </button>
++    </div>
++  );
++}
++
+diff --git a/web/src/pages/verification/IpeClearancePage.tsx b/web/src/pages/verification/IpeClearancePage.tsx
+index 405a0f6..1e8a863 100644
+--- a/web/src/pages/verification/IpeClearancePage.tsx
++++ b/web/src/pages/verification/IpeClearancePage.tsx
+@@ -1,7 +1,7 @@
+-import { useState, type FormEvent } from 'react';
++import { useMemo, useState, type FormEvent } from 'react';
+ import { Clock, Loader2, Lock, TriangleAlert } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, INTERRUPTED_MESSAGE, SLIP_REQUEST_TIMEOUT_MS, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -12,7 +12,13 @@ import {
+   useVerificationPrices,
+   useServiceTickets,
+   useTicketPolling,
++  useIdempotencyKey,
+   money,
++  BulkModeToggle,
++  BulkSubmitResults,
++  BULK_MAX_ITEMS,
++  parseBulkLines,
++  type BulkSubmitSummary,
+   FORM_SECTION_CLASSES,
+   FORM_INPUT_CLASSES,
+   FORM_HELP_CLASSES,
+@@ -50,8 +56,17 @@ export default function IpeClearancePage() {
+   const [message, setMessage] = useState('');
+   const [asyncResult, setAsyncResult] = useState<AsyncResult | null>(null);
+   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
++  const [mode, setMode] = useState<'single' | 'bulk'>('single');
++  const [bulkText, setBulkText] = useState('');
++  const [bulkSummary, setBulkSummary] = useState<BulkSubmitSummary | null>(null);
++  const idempotency = useIdempotencyKey();
+ 
+   const price = prices['IPE_CLEARANCE'];
++  // Same shape the single form enforces (maxLength 15, alphanumeric tracking IDs).
++  const isTrackingId = (line: string) => /^[A-Za-z0-9]{1,15}$/.test(line);
++  const bulkParse = useMemo(() => parseBulkLines(bulkText, isTrackingId), [bulkText]);
++  const bulkReady = bulkParse.valid.length > 0 && bulkParse.invalid.length === 0 && bulkParse.valid.length <= BULK_MAX_ITEMS;
++  const bulkTotal = price === undefined ? undefined : price * bulkParse.valid.length;
+   const { polling, checkTicket } = useTicketPolling('/verification/ipe-clearance', asyncResult, ticketStatus, setTicketStatus);
+   const { tickets, loading: loadingTickets, refresh: refreshTickets } = useServiceTickets('IPE_CLEARANCE');
+   const [checkingId, setCheckingId] = useState<string | null>(null);
+@@ -72,10 +87,50 @@ export default function IpeClearancePage() {
+ 
+   function prepare(event: FormEvent) {
+     event.preventDefault();
++    if (mode === 'bulk' && !bulkReady) return;
+     setShowPin(true);
+   }
+ 
+-  async function submit(pin: string) {
++  function switchMode(next: 'single' | 'bulk') {
++    setMode(next);
++    setMessage('');
++  }
++
++  async function submitBulk(pin: string) {
++    setShowPin(false);
++    setBusy(true);
++    setMessage('');
++    try {
++      // IPE is pinned to K-Tech on the server; every tracking ID is debited and
++      // submitted on its own. See submitIpeClearanceBulk in verification.service.ts.
++      const result = await api.post<{ status: boolean; message: string; data: BulkSubmitSummary }>(
++        '/verification/ipe-clearance/bulk',
++        { tracking_ids: bulkParse.valid, pin },
++        true,
++        SLIP_REQUEST_TIMEOUT_MS,
++        idempotency.current(bulkParse.valid.join(','))
++      );
++      if (!result.status) throw new Error(result.message);
++      idempotency.reset();
++      setBulkSummary(result.data);
++      void refreshTickets();
++    } catch (error) {
++      if (wasInterrupted(error)) {
++        setMessage(INTERRUPTED_MESSAGE);
++      } else {
++        idempotency.reset();
++        setMessage(error instanceof Error ? error.message : 'Request failed.');
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  function submit(pin: string) {
++    return mode === 'bulk' ? submitBulk(pin) : submitSingle(pin);
++  }
++
++  async function submitSingle(pin: string) {
+     setShowPin(false);
+     setBusy(true);
+     setMessage('');
+@@ -102,7 +157,16 @@ export default function IpeClearancePage() {
+         <PageHeader title="IPE Clearance (Instant)" />
+ 
+         <section className={FORM_SECTION_CLASSES}>
+-          {!asyncResult ? (
++          {bulkSummary ? (
++            <BulkSubmitResults
++              summary={bulkSummary}
++              onDone={() => {
++                setBulkSummary(null);
++                setBulkText('');
++                setMessage('');
++              }}
++            />
++          ) : !asyncResult ? (
+             <form onSubmit={prepare}>
+               <div className="rounded-xl border border-gold-500/40 bg-gold-50 p-4">
+                 <p className="flex items-start gap-2 font-body text-sm font-bold text-amber-900">
+@@ -117,6 +181,8 @@ export default function IpeClearancePage() {
+                 </p>
+               </div>
+ 
++              <BulkModeToggle mode={mode} onChange={switchMode} />
++
+               <StepLabel n={1}>Service Type</StepLabel>
+               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+                 {SERVICE_TYPES.map((s) => (
+@@ -139,22 +205,60 @@ export default function IpeClearancePage() {
+                 ))}
+               </div>
+ 
+-              <StepLabel n={3}>Supply Tracking ID</StepLabel>
+-              <input
+-                required
+-                maxLength={15}
+-                placeholder="Tracking ID (15 characters)"
+-                className={`mt-3 ${FORM_INPUT_CLASSES}`}
+-                value={trackingId}
+-                onChange={(e) => setTrackingId(e.target.value)}
+-              />
+-              <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 15-character alphanumeric Tracking ID (e.g., ABC123456789012)</p>
++              {mode === 'single' ? (
++                <>
++                  <StepLabel n={3}>Supply Tracking ID</StepLabel>
++                  <input
++                    required
++                    maxLength={15}
++                    placeholder="Tracking ID (15 characters)"
++                    className={`mt-3 ${FORM_INPUT_CLASSES}`}
++                    value={trackingId}
++                    onChange={(e) => setTrackingId(e.target.value)}
++                  />
++                  <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 15-character alphanumeric Tracking ID (e.g., ABC123456789012)</p>
++                </>
++              ) : (
++                <>
++                  <StepLabel n={3}>Supply Tracking IDs</StepLabel>
++                  <textarea
++                    required
++                    rows={7}
++                    placeholder={'Enter one Tracking ID per line\nTRACK001\nTRACK002\nTRACK003'}
++                    className={`mt-3 min-h-[160px] resize-y font-mono text-sm ${FORM_INPUT_CLASSES}`}
++                    value={bulkText}
++                    onChange={(e) => setBulkText(e.target.value)}
++                  />
++                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 font-body text-xs text-[#0b2f73]/70">
++                    <span>
++                      IDs entered: <b className={bulkParse.valid.length > BULK_MAX_ITEMS ? 'text-ember-600' : 'text-[#0b2f73]'}>{bulkParse.valid.length}</b> / {BULK_MAX_ITEMS} max
++                      {bulkParse.duplicates > 0 && <span> · {bulkParse.duplicates} duplicate{bulkParse.duplicates > 1 ? 's' : ''} ignored</span>}
++                    </span>
++                    <span>Each ID is charged separately</span>
++                  </div>
++                  {bulkParse.invalid.length > 0 && (
++                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
++                      Fix these entries before submitting (letters and numbers only, up to 15 characters): {bulkParse.invalid.slice(0, 5).join(', ')}
++                      {bulkParse.invalid.length > 5 && ` and ${bulkParse.invalid.length - 5} more`}
++                    </p>
++                  )}
++                  {bulkParse.valid.length > BULK_MAX_ITEMS && (
++                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
++                      You can submit up to {BULK_MAX_ITEMS} tracking IDs at a time. Split the list and submit it in batches.
++                    </p>
++                  )}
++                </>
++              )}
+ 
+               <ConsentCheckbox checked={consent} onChange={setConsent} />
+ 
+               <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+-                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">Service cost: {money(price)}</span>
+-                <button disabled={busy || !consent} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
++                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">
++                  {mode === 'bulk'
++                    ? `Total: ${money(bulkTotal)} (${bulkParse.valid.length} × ${money(price)})`
++                    : `Service cost: ${money(price)}`}
++                </span>
++                <button disabled={busy || !consent || (mode === 'bulk' && !bulkReady)} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
+                   {busy ? <Loader2 size={16} className="animate-spin" /> : 'Submit Verification'}
+                 </button>
+               </div>
+diff --git a/web/src/pages/verification/ValidationPage.tsx b/web/src/pages/verification/ValidationPage.tsx
+index 8f5f011..c8c0959 100644
+--- a/web/src/pages/verification/ValidationPage.tsx
++++ b/web/src/pages/verification/ValidationPage.tsx
+@@ -1,7 +1,7 @@
+ import { useMemo, useState, type FormEvent } from 'react';
+ import { Info, Loader2 } from 'lucide-react';
+ import AppShell from '../../components/AppShell';
+-import { api, ApiError } from '../../lib/api';
++import { api, ApiError, INTERRUPTED_MESSAGE, SLIP_REQUEST_TIMEOUT_MS, wasInterrupted } from '../../lib/api';
+ import { PinConfirmDialog } from '../../components/PinConfirmDialog';
+ import {
+   PageHeader,
+@@ -12,7 +12,13 @@ import {
+   useVerificationPrices,
+   useServiceTickets,
+   useTicketPolling,
++  useIdempotencyKey,
+   money,
++  BulkModeToggle,
++  BulkSubmitResults,
++  BULK_MAX_ITEMS,
++  parseBulkLines,
++  type BulkSubmitSummary,
+   FORM_SECTION_CLASSES,
+   FORM_INPUT_CLASSES,
+   FORM_HELP_CLASSES,
+@@ -58,9 +64,17 @@ export default function ValidationPage() {
+   const [message, setMessage] = useState('');
+   const [asyncResult, setAsyncResult] = useState<AsyncResult | null>(null);
+   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
++  const [mode, setMode] = useState<'single' | 'bulk'>('single');
++  const [bulkText, setBulkText] = useState('');
++  const [bulkSummary, setBulkSummary] = useState<BulkSubmitSummary | null>(null);
++  const idempotency = useIdempotencyKey();
+ 
++  const isNin = (line: string) => /^\d{11}$/.test(line);
++  const bulkParse = useMemo(() => parseBulkLines(bulkText, isNin), [bulkText]);
++  const bulkReady = bulkParse.valid.length > 0 && bulkParse.invalid.length === 0 && bulkParse.valid.length <= BULK_MAX_ITEMS;
+   const serviceKey = DETAILS.find((d) => d.value === detail)!.serviceKey;
+   const price = useMemo(() => prices[serviceKey], [serviceKey, prices]);
++  const bulkTotal = price === undefined ? undefined : price * bulkParse.valid.length;
+   const { polling, checkTicket } = useTicketPolling('/verification/nin-validation', asyncResult, ticketStatus, setTicketStatus);
+ 
+   // One combined "recent requests" table across all four detail types (see
+@@ -86,10 +100,51 @@ export default function ValidationPage() {
+ 
+   function prepare(event: FormEvent) {
+     event.preventDefault();
++    if (mode === 'bulk' && !bulkReady) return;
+     setShowPin(true);
+   }
+ 
+-  async function submit(pin: string) {
++  function switchMode(next: 'single' | 'bulk') {
++    setMode(next);
++    setMessage('');
++  }
++
++  async function submitBulk(pin: string) {
++    setShowPin(false);
++    setBusy(true);
++    setMessage('');
++    try {
++      // One PIN covers the whole batch. The longer timeout lets the server work
++      // through up to 50 provider submissions; the idempotency key means a
++      // retry after a dropped connection replays instead of charging again.
++      const result = await api.post<{ status: boolean; message: string; data: BulkSubmitSummary }>(
++        '/verification/nin-validation/bulk',
++        { nins: bulkParse.valid, validation_type: detail, pin },
++        true,
++        SLIP_REQUEST_TIMEOUT_MS,
++        idempotency.current(`${detail}|${bulkParse.valid.join(',')}`)
++      );
++      if (!result.status) throw new Error(result.message);
++      idempotency.reset();
++      setBulkSummary(result.data);
++      void refreshTickets();
++    } catch (error) {
++      if (wasInterrupted(error)) {
++        setMessage(INTERRUPTED_MESSAGE);
++      } else {
++        idempotency.reset();
++        setMessage(error instanceof Error ? error.message : 'Request failed.');
++      }
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  function submit(pin: string) {
++    return mode === 'bulk' ? submitBulk(pin) : submitSingle(pin);
++  }
++
++  async function submitSingle(pin: string) {
+     setShowPin(false);
+     setBusy(true);
+     setMessage('');
+@@ -125,7 +180,18 @@ export default function ValidationPage() {
+         </button>
+ 
+         <section className={FORM_SECTION_CLASSES}>
+-          {!asyncResult ? (
++          {!asyncResult && !bulkSummary && <BulkModeToggle mode={mode} onChange={switchMode} />}
++
++          {bulkSummary ? (
++            <BulkSubmitResults
++              summary={bulkSummary}
++              onDone={() => {
++                setBulkSummary(null);
++                setBulkText('');
++                setMessage('');
++              }}
++            />
++          ) : !asyncResult ? (
+             <form onSubmit={prepare}>
+               <StepLabel n={1}>Details Needed</StepLabel>
+               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
+@@ -150,23 +216,61 @@ export default function ValidationPage() {
+                 ))}
+               </div>
+ 
+-              <StepLabel n={3}>Supply ID Number</StepLabel>
+-              <input
+-                required
+-                inputMode="numeric"
+-                maxLength={11}
+-                placeholder="NIN Number (11 digits)"
+-                className={`mt-3 ${FORM_INPUT_CLASSES}`}
+-                value={nin}
+-                onChange={(e) => setNin(e.target.value)}
+-              />
+-              <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 11-digit NIN (e.g., 12345678901)</p>
++              {mode === 'single' ? (
++                <>
++                  <StepLabel n={3}>Supply ID Number</StepLabel>
++                  <input
++                    required
++                    inputMode="numeric"
++                    maxLength={11}
++                    placeholder="NIN Number (11 digits)"
++                    className={`mt-3 ${FORM_INPUT_CLASSES}`}
++                    value={nin}
++                    onChange={(e) => setNin(e.target.value)}
++                  />
++                  <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 11-digit NIN (e.g., 12345678901)</p>
++                </>
++              ) : (
++                <>
++                  <StepLabel n={3}>Supply NIN Numbers</StepLabel>
++                  <textarea
++                    required
++                    rows={7}
++                    placeholder={'Enter one NIN per line\n12345678901\n10987654321'}
++                    className={`mt-3 min-h-[160px] resize-y font-mono text-sm ${FORM_INPUT_CLASSES}`}
++                    value={bulkText}
++                    onChange={(e) => setBulkText(e.target.value)}
++                  />
++                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 font-body text-xs text-[#0b2f73]/70">
++                    <span>
++                      NINs entered: <b className={bulkParse.valid.length > BULK_MAX_ITEMS ? 'text-ember-600' : 'text-[#0b2f73]'}>{bulkParse.valid.length}</b> / {BULK_MAX_ITEMS} max
++                      {bulkParse.duplicates > 0 && <span> · {bulkParse.duplicates} duplicate{bulkParse.duplicates > 1 ? 's' : ''} ignored</span>}
++                    </span>
++                    <span>Each NIN is charged separately</span>
++                  </div>
++                  {bulkParse.invalid.length > 0 && (
++                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
++                      Fix these entries before submitting (each must be exactly 11 digits): {bulkParse.invalid.slice(0, 5).join(', ')}
++                      {bulkParse.invalid.length > 5 && ` and ${bulkParse.invalid.length - 5} more`}
++                    </p>
++                  )}
++                  {bulkParse.valid.length > BULK_MAX_ITEMS && (
++                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
++                      You can submit up to {BULK_MAX_ITEMS} NINs at a time. Split the list and submit it in batches.
++                    </p>
++                  )}
++                </>
++              )}
+ 
+               <ConsentCheckbox checked={consent} onChange={setConsent} />
+ 
+               <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+-                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">Service cost: {money(price)}</span>
+-                <button disabled={busy || !consent} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
++                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">
++                  {mode === 'bulk'
++                    ? `Total: ${money(bulkTotal)} (${bulkParse.valid.length} × ${money(price)})`
++                    : `Service cost: ${money(price)}`}
++                </span>
++                <button disabled={busy || !consent || (mode === 'bulk' && !bulkReady)} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
+                   {busy ? <Loader2 size={16} className="animate-spin" /> : 'Submit Verification'}
+                 </button>
+               </div>

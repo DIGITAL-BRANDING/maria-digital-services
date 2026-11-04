@@ -1,7 +1,7 @@
 import { useMemo, useState, type FormEvent } from 'react';
 import { Info, Loader2 } from 'lucide-react';
 import AppShell from '../../components/AppShell';
-import { api, ApiError } from '../../lib/api';
+import { api, ApiError, INTERRUPTED_MESSAGE, SLIP_REQUEST_TIMEOUT_MS, wasInterrupted } from '../../lib/api';
 import { PinConfirmDialog } from '../../components/PinConfirmDialog';
 import {
   PageHeader,
@@ -12,7 +12,13 @@ import {
   useVerificationPrices,
   useServiceTickets,
   useTicketPolling,
+  useIdempotencyKey,
   money,
+  BulkModeToggle,
+  BulkSubmitResults,
+  BULK_MAX_ITEMS,
+  parseBulkLines,
+  type BulkSubmitSummary,
   FORM_SECTION_CLASSES,
   FORM_INPUT_CLASSES,
   FORM_HELP_CLASSES,
@@ -58,9 +64,17 @@ export default function ValidationPage() {
   const [message, setMessage] = useState('');
   const [asyncResult, setAsyncResult] = useState<AsyncResult | null>(null);
   const [ticketStatus, setTicketStatus] = useState<TicketStatus | null>(null);
+  const [mode, setMode] = useState<'single' | 'bulk'>('single');
+  const [bulkText, setBulkText] = useState('');
+  const [bulkSummary, setBulkSummary] = useState<BulkSubmitSummary | null>(null);
+  const idempotency = useIdempotencyKey();
 
+  const isNin = (line: string) => /^\d{11}$/.test(line);
+  const bulkParse = useMemo(() => parseBulkLines(bulkText, isNin), [bulkText]);
+  const bulkReady = bulkParse.valid.length > 0 && bulkParse.invalid.length === 0 && bulkParse.valid.length <= BULK_MAX_ITEMS;
   const serviceKey = DETAILS.find((d) => d.value === detail)!.serviceKey;
   const price = useMemo(() => prices[serviceKey], [serviceKey, prices]);
+  const bulkTotal = price === undefined ? undefined : price * bulkParse.valid.length;
   const { polling, checkTicket } = useTicketPolling('/verification/nin-validation', asyncResult, ticketStatus, setTicketStatus);
 
   // One combined "recent requests" table across all four detail types (see
@@ -86,10 +100,51 @@ export default function ValidationPage() {
 
   function prepare(event: FormEvent) {
     event.preventDefault();
+    if (mode === 'bulk' && !bulkReady) return;
     setShowPin(true);
   }
 
-  async function submit(pin: string) {
+  function switchMode(next: 'single' | 'bulk') {
+    setMode(next);
+    setMessage('');
+  }
+
+  async function submitBulk(pin: string) {
+    setShowPin(false);
+    setBusy(true);
+    setMessage('');
+    try {
+      // One PIN covers the whole batch. The longer timeout lets the server work
+      // through up to 50 provider submissions; the idempotency key means a
+      // retry after a dropped connection replays instead of charging again.
+      const result = await api.post<{ status: boolean; message: string; data: BulkSubmitSummary }>(
+        '/verification/nin-validation/bulk',
+        { nins: bulkParse.valid, validation_type: detail, pin },
+        true,
+        SLIP_REQUEST_TIMEOUT_MS,
+        idempotency.current(`${detail}|${bulkParse.valid.join(',')}`)
+      );
+      if (!result.status) throw new Error(result.message);
+      idempotency.reset();
+      setBulkSummary(result.data);
+      void refreshTickets();
+    } catch (error) {
+      if (wasInterrupted(error)) {
+        setMessage(INTERRUPTED_MESSAGE);
+      } else {
+        idempotency.reset();
+        setMessage(error instanceof Error ? error.message : 'Request failed.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submit(pin: string) {
+    return mode === 'bulk' ? submitBulk(pin) : submitSingle(pin);
+  }
+
+  async function submitSingle(pin: string) {
     setShowPin(false);
     setBusy(true);
     setMessage('');
@@ -125,7 +180,18 @@ export default function ValidationPage() {
         </button>
 
         <section className={FORM_SECTION_CLASSES}>
-          {!asyncResult ? (
+          {!asyncResult && !bulkSummary && <BulkModeToggle mode={mode} onChange={switchMode} />}
+
+          {bulkSummary ? (
+            <BulkSubmitResults
+              summary={bulkSummary}
+              onDone={() => {
+                setBulkSummary(null);
+                setBulkText('');
+                setMessage('');
+              }}
+            />
+          ) : !asyncResult ? (
             <form onSubmit={prepare}>
               <StepLabel n={1}>Details Needed</StepLabel>
               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-3">
@@ -150,23 +216,61 @@ export default function ValidationPage() {
                 ))}
               </div>
 
-              <StepLabel n={3}>Supply ID Number</StepLabel>
-              <input
-                required
-                inputMode="numeric"
-                maxLength={11}
-                placeholder="NIN Number (11 digits)"
-                className={`mt-3 ${FORM_INPUT_CLASSES}`}
-                value={nin}
-                onChange={(e) => setNin(e.target.value)}
-              />
-              <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 11-digit NIN (e.g., 12345678901)</p>
+              {mode === 'single' ? (
+                <>
+                  <StepLabel n={3}>Supply ID Number</StepLabel>
+                  <input
+                    required
+                    inputMode="numeric"
+                    maxLength={11}
+                    placeholder="NIN Number (11 digits)"
+                    className={`mt-3 ${FORM_INPUT_CLASSES}`}
+                    value={nin}
+                    onChange={(e) => setNin(e.target.value)}
+                  />
+                  <p className={`mt-1 ${FORM_HELP_CLASSES}`}>Enter your 11-digit NIN (e.g., 12345678901)</p>
+                </>
+              ) : (
+                <>
+                  <StepLabel n={3}>Supply NIN Numbers</StepLabel>
+                  <textarea
+                    required
+                    rows={7}
+                    placeholder={'Enter one NIN per line\n12345678901\n10987654321'}
+                    className={`mt-3 min-h-[160px] resize-y font-mono text-sm ${FORM_INPUT_CLASSES}`}
+                    value={bulkText}
+                    onChange={(e) => setBulkText(e.target.value)}
+                  />
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 font-body text-xs text-[#0b2f73]/70">
+                    <span>
+                      NINs entered: <b className={bulkParse.valid.length > BULK_MAX_ITEMS ? 'text-ember-600' : 'text-[#0b2f73]'}>{bulkParse.valid.length}</b> / {BULK_MAX_ITEMS} max
+                      {bulkParse.duplicates > 0 && <span> · {bulkParse.duplicates} duplicate{bulkParse.duplicates > 1 ? 's' : ''} ignored</span>}
+                    </span>
+                    <span>Each NIN is charged separately</span>
+                  </div>
+                  {bulkParse.invalid.length > 0 && (
+                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
+                      Fix these entries before submitting (each must be exactly 11 digits): {bulkParse.invalid.slice(0, 5).join(', ')}
+                      {bulkParse.invalid.length > 5 && ` and ${bulkParse.invalid.length - 5} more`}
+                    </p>
+                  )}
+                  {bulkParse.valid.length > BULK_MAX_ITEMS && (
+                    <p className="mt-2 rounded-lg bg-ember-500/10 p-3 font-body text-xs text-ember-600">
+                      You can submit up to {BULK_MAX_ITEMS} NINs at a time. Split the list and submit it in batches.
+                    </p>
+                  )}
+                </>
+              )}
 
               <ConsentCheckbox checked={consent} onChange={setConsent} />
 
               <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">Service cost: {money(price)}</span>
-                <button disabled={busy || !consent} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
+                <span className="rounded-full bg-gold-500/15 px-4 py-2 text-center font-body text-sm font-bold text-gold-700">
+                  {mode === 'bulk'
+                    ? `Total: ${money(bulkTotal)} (${bulkParse.valid.length} × ${money(price)})`
+                    : `Service cost: ${money(price)}`}
+                </span>
+                <button disabled={busy || !consent || (mode === 'bulk' && !bulkReady)} className="flex w-full items-center justify-center gap-2 rounded-xl bg-gold-500 px-6 py-3 font-display font-semibold text-ink disabled:opacity-60 sm:w-auto">
                   {busy ? <Loader2 size={16} className="animate-spin" /> : 'Submit Verification'}
                 </button>
               </div>

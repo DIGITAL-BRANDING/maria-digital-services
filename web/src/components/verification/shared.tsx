@@ -1,4 +1,4 @@
-import { Download, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
+import { Download, Layers, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../../lib/api';
 
@@ -873,3 +873,125 @@ export function SlipIcon({ variant }: { variant: SlipIconVariant }) {
     </svg>
   );
 }
+
+// ── Bulk submit (NIN Validation, IPE Clearance) ─────────────────────
+// The backend accepts up to BULK_MAX_ITEMS lines per request. Each line is
+// its own debit, ticket and refund on the server, so the UI only has to
+// collect lines, show the total, and list what happened to each one.
+export const BULK_MAX_ITEMS = 50;
+
+export type BulkSubmitItemResult = {
+  input: string;
+  status: 'submitted' | 'failed' | 'skipped';
+  ticket_id: string | null;
+  reference: string | null;
+  message: string;
+};
+
+export type BulkSubmitSummary = {
+  results: BulkSubmitItemResult[];
+  submitted_count: number;
+  failed_count: number;
+  skipped_count: number;
+  balance_after: number | null;
+  message: string;
+};
+
+/** Splits pasted text on newlines, commas, semicolons or spaces, then de-duplicates. */
+export function parseBulkLines(text: string, isValid: (line: string) => boolean) {
+  const tokens = text.split(/[\s,;]+/).map((t) => t.trim()).filter(Boolean);
+  const unique = [...new Set(tokens)];
+  return {
+    total: tokens.length,
+    duplicates: tokens.length - unique.length,
+    valid: unique.filter(isValid),
+    invalid: unique.filter((t) => !isValid(t)),
+  };
+}
+
+export function BulkModeToggle({ mode, onChange }: { mode: 'single' | 'bulk'; onChange: (m: 'single' | 'bulk') => void }) {
+  const options = [
+    { value: 'single', label: 'Single Submit' },
+    { value: 'bulk', label: 'Bulk Submit' },
+  ] as const;
+  return (
+    <div role="tablist" className="mt-5 grid grid-cols-2 gap-1 rounded-xl border border-blue-200 bg-blue-50 p-1">
+      {options.map((option) => {
+        const active = mode === option.value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(option.value)}
+            className={`flex items-center justify-center gap-2 rounded-lg py-2.5 font-body text-sm font-semibold transition ${
+              active ? 'bg-[#0b2f73] text-white shadow' : 'text-[#0b2f73]/70 hover:bg-white'
+            }`}
+          >
+            {option.value === 'bulk' && <Layers size={15} />}
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Shown in place of the single-request result after a bulk submit. */
+export function BulkSubmitResults({ summary, onDone }: { summary: BulkSubmitSummary; onDone: () => void }) {
+  const anySubmitted = summary.submitted_count > 0;
+  return (
+    <div className="mt-6">
+      <div
+        className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
+          anySubmitted ? 'border-success-500/30 bg-success-500/5' : 'border-ember-500/30 bg-ember-500/5'
+        }`}
+      >
+        {anySubmitted ? <CheckCircle2 size={20} className="shrink-0 text-success-500" /> : <XCircle size={20} className="shrink-0 text-ember-500" />}
+        <p className="font-body text-sm font-semibold text-[#0b2f73]">{summary.message}</p>
+      </div>
+
+      <div className="mt-3 max-h-80 overflow-auto rounded-xl border border-blue-100 bg-blue-50">
+        <table className="w-full text-left font-body text-xs">
+          <thead>
+            <tr className="border-b border-blue-100 text-[#0b2f73]/70">
+              {['Entry', 'Result', 'Ticket'].map((h) => (
+                <th key={h} className="whitespace-nowrap px-3 py-2 font-semibold">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {summary.results.map((row, index) => (
+              <tr key={`${row.input}-${index}`} className="border-b border-blue-100 last:border-0">
+                <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]">{row.input}</td>
+                <td className="px-3 py-2">
+                  <span
+                    className={`mr-2 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                      row.status === 'submitted' ? 'bg-success-500/15 text-success-600' : row.status === 'failed' ? 'bg-ember-500/15 text-ember-600' : 'bg-blue-100 text-[#0b2f73]/70'
+                    }`}
+                  >
+                    {row.status === 'submitted' ? 'Submitted' : row.status === 'failed' ? 'Failed' : 'Skipped'}
+                  </span>
+                  <span className="text-[#0b2f73]/70">{row.message}</span>
+                </td>
+                <td className="whitespace-nowrap px-3 py-2 font-mono text-[#0b2f73]/70">{row.ticket_id ?? '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-2 font-body text-xs text-[#0b2f73]/60">
+        Submitted lines appear in Recent requests below, where you can check their status. Failed lines were not charged.
+      </p>
+
+      <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
+        Done
+      </button>
+    </div>
+  );
+}
+

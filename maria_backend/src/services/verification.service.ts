@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { koboToNaira } from '../lib/money.js';
 import { mergeSealedPII, openPII, sealPII } from '../lib/pii.js';
@@ -970,7 +971,10 @@ async function settleAsyncTransaction(
 
   if (refundable) {
     await refundWallet({ transactionId: transaction.id, userId: transaction.userId });
+    await notifyAsyncResult(transaction, 'failed', result.response);
   } else {
+    // Non-refundable: one specific notice that explains why the charge stands.
+    // The generic "update" notice is deliberately NOT sent on top of it.
     await notifyUser({
       userId: transaction.userId,
       type: 'WALLET',
@@ -979,7 +983,6 @@ async function settleAsyncTransaction(
       data: { transactionId: transaction.id }
     });
   }
-  await notifyAsyncResult(transaction, 'failed', result.response);
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
 }
 
@@ -1127,18 +1130,156 @@ export function checkBvnRetrievalStatus(params: { userId: string; ticketId: stri
 // this flow was built against, and is the one actually being used in
 // production - it is not switched by the general NIN/BVN provider setting.
 export function submitIpeClearance(params: { userId: string; trackingId: string; idempotencyKey?: string }) {
-  return asyncProviderForService('IPE_CLEARANCE').then((provider) => submitAsyncService({
+  // Hard-pinned to K-Tech. Do NOT route this through asyncProviderForService:
+  // that reads the IPE_CLEARANCE pricing row's `provider` column, which
+  // defaults to 'techhub', so IPE requests were silently going to Techhub.
+  const provider = 'ktech' as const;
+  return submitAsyncService({
     userId: params.userId, service: 'IPE_CLEARANCE', provider,
     description: 'IPE clearance request', operational: { provider }, pii: { tracking_id: params.trackingId },
     idempotencyKey: params.idempotencyKey,
-    call: (reference) => provider === 'ktech'
-      ? ktechService.submitIpeClearance(params.trackingId, reference)
-      : techhubService.submitIpeClearance(params.trackingId)
-  }));
+    call: (reference) => ktechService.submitIpeClearance(params.trackingId, reference)
+  });
 }
 export async function checkIpeClearanceStatus(params: { userId: string; ticketId: string }) {
   return checkAsyncServiceStatus({ userId: params.userId, ticketId: params.ticketId, call: (id, provider) =>
     provider === 'ktech' ? ktechService.checkIpeClearance(id) : techhubService.checkIpeClearance(id) });
+}
+
+// ── Bulk submit (NIN Validation + IPE Clearance) ───────────────────
+// Each line is sent through the SAME single-item submit used by the
+// one-at-a-time form. That means every line gets its own wallet debit, its
+// own ticket, its own refund if the provider rejects it at submit time, and
+// the same provider routing (NIN Validation follows the admin's provider
+// setting, IPE stays pinned to K-Tech). Neither provider documents a batch
+// endpoint, so the fan-out happens here, on our side.
+export const BULK_SUBMIT_MAX = 50;
+const BULK_CONCURRENCY = 4;
+
+export type BulkSubmitItemResult = {
+  input: string;
+  status: 'submitted' | 'failed' | 'skipped';
+  ticket_id: string | null;
+  reference: string | null;
+  message: string;
+};
+
+export type BulkSubmitSummary = {
+  results: BulkSubmitItemResult[];
+  submitted_count: number;
+  failed_count: number;
+  skipped_count: number;
+  balance_after: number | null;
+  message: string;
+};
+
+/**
+ * Per-line idempotency key derived from the batch key. Re-sending the same
+ * batch (same Idempotency-Key header, e.g. after a dropped connection) replays
+ * each line's original request instead of debiting again. The hash keeps the
+ * value inside the provider's 8-128 character limit.
+ */
+function bulkItemIdempotencyKey(batchKey: string | undefined, index: number, input: string) {
+  return createHash('sha256').update(`${batchKey ?? randomUUID()}:${index}:${input}`).digest('hex');
+}
+
+async function runBulkSubmit(params: {
+  inputs: string[];
+  idempotencyKey?: string;
+  submitOne: (input: string, idempotencyKey: string) => Promise<AsyncSubmitResult>;
+}): Promise<BulkSubmitSummary> {
+  const results: BulkSubmitItemResult[] = new Array(params.inputs.length);
+  const queue: number[] = [];
+  const seen = new Set<string>();
+
+  params.inputs.forEach((input, index) => {
+    if (seen.has(input)) {
+      results[index] = {
+        input,
+        status: 'skipped',
+        ticket_id: null,
+        reference: null,
+        message: 'Duplicate line in this batch - skipped so it is not charged twice.'
+      };
+      return;
+    }
+    seen.add(input);
+    queue.push(index);
+  });
+
+  let stoppedMessage: string | null = null;
+  let balanceAfter: number | null = null;
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < queue.length) {
+      const index = queue[cursor++];
+      const input = params.inputs[index];
+
+      if (stoppedMessage) {
+        results[index] = { input, status: 'skipped', ticket_id: null, reference: null, message: stoppedMessage };
+        continue;
+      }
+
+      try {
+        const submitted = await params.submitOne(input, bulkItemIdempotencyKey(params.idempotencyKey, index, input));
+        balanceAfter = submitted.balanceAfter;
+        results[index] = {
+          input,
+          status: 'submitted',
+          ticket_id: submitted.ticketId,
+          reference: submitted.reference,
+          message: 'Submitted - track it in Recent requests below.'
+        };
+      } catch (error) {
+        // Out of money: every remaining line would fail the same way, so stop
+        // here rather than hammer the provider. The line that hit the limit
+        // was never debited (the debit is what raised the error).
+        if (error instanceof ApiError && error.code === 'INSUFFICIENT_BALANCE') {
+          stoppedMessage = 'Not submitted - wallet balance ran out. Top up and submit the remaining lines.';
+        }
+        results[index] = {
+          input,
+          status: 'failed',
+          ticket_id: null,
+          reference: null,
+          message: error instanceof Error ? error.message : 'Submission failed.'
+        };
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(BULK_CONCURRENCY, queue.length) }, () => worker()));
+
+  const submittedCount = results.filter((r) => r.status === 'submitted').length;
+  const failedCount = results.filter((r) => r.status === 'failed').length;
+  const skippedCount = results.filter((r) => r.status === 'skipped').length;
+
+  return {
+    results,
+    submitted_count: submittedCount,
+    failed_count: failedCount,
+    skipped_count: skippedCount,
+    balance_after: balanceAfter,
+    message: `${submittedCount} submitted, ${failedCount} failed, ${skippedCount} skipped.`
+  };
+}
+
+export function submitNinValidationBulk(params: { userId: string; nins: string[]; validationType?: string; idempotencyKey?: string }) {
+  return runBulkSubmit({
+    inputs: params.nins,
+    idempotencyKey: params.idempotencyKey,
+    submitOne: (nin, idempotencyKey) =>
+      submitNinValidation({ userId: params.userId, nin, validationType: params.validationType, idempotencyKey })
+  });
+}
+
+export function submitIpeClearanceBulk(params: { userId: string; trackingIds: string[]; idempotencyKey?: string }) {
+  return runBulkSubmit({
+    inputs: params.trackingIds,
+    idempotencyKey: params.idempotencyKey,
+    submitOne: (trackingId, idempotencyKey) => submitIpeClearance({ userId: params.userId, trackingId, idempotencyKey })
+  });
 }
 
 export type ServiceTicketEntry = {

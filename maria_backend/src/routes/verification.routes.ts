@@ -8,6 +8,7 @@ import { listTinCertificateHistory, listTinCertificatePrices, submitTinCertifica
 import { pinField, requirePinConfirmation } from '../lib/require-pin.js';
 import { prisma } from '../lib/prisma.js';
 import {
+  BULK_SUBMIT_MAX,
   checkBvnRetrievalStatus,
   checkDelinkingStatus,
   checkIpeClearanceStatus,
@@ -23,7 +24,9 @@ import {
   submitBvnRetrieval,
   submitDelinking,
   submitIpeClearance,
+  submitIpeClearanceBulk,
   submitNinValidation,
+  submitNinValidationBulk,
   submitPersonalization
 } from '../services/verification.service.js';
 
@@ -364,6 +367,26 @@ verificationRoutes.get('/nin-validation/:ticketId', async (req, res) => {
   res.json({ status: true, data: { ticket_id: result.ticketId, status: result.status, response: result.response } });
 });
 
+// Bulk: one PIN confirmation covers the whole batch; each NIN is debited and
+// submitted separately (see runBulkSubmit in verification.service.ts).
+verificationRoutes.post('/nin-validation/bulk', async (req, res) => {
+  const body = z
+    .object({
+      nins: z.array(z.string().trim().regex(/^\d{11}$/, 'Each NIN must be exactly 11 digits')).min(1).max(BULK_SUBMIT_MAX),
+      validation_type: ninValidationType.optional(),
+      ...pinField
+    })
+    .parse(req.body);
+  await requirePinConfirmation(req.user!.id, body.pin);
+  const summary = await submitNinValidationBulk({
+    userId: req.user!.id,
+    nins: body.nins,
+    validationType: body.validation_type,
+    idempotencyKey: idempotencyKeyFrom(req)
+  });
+  res.json({ status: true, message: summary.message, data: summary });
+});
+
 verificationRoutes.post('/personalization', async (req, res) => {
   const body = z.object({ tracking_id: z.string().trim().min(1).max(50), ...pinField }).parse(req.body);
   await requirePinConfirmation(req.user!.id, body.pin);
@@ -437,6 +460,22 @@ verificationRoutes.post('/ipe-clearance', async (req, res) => {
 verificationRoutes.get('/ipe-clearance/:ticketId', async (req, res) => {
   const result = await checkIpeClearanceStatus({ userId: req.user!.id, ticketId: req.params.ticketId });
   res.json({ status: true, data: { ticket_id: result.ticketId, status: result.status, response: result.response } });
+});
+
+verificationRoutes.post('/ipe-clearance/bulk', async (req, res) => {
+  const body = z
+    .object({
+      tracking_ids: z.array(z.string().trim().min(1).max(20)).min(1).max(BULK_SUBMIT_MAX),
+      ...pinField
+    })
+    .parse(req.body);
+  await requirePinConfirmation(req.user!.id, body.pin);
+  const summary = await submitIpeClearanceBulk({
+    userId: req.user!.id,
+    trackingIds: body.tracking_ids,
+    idempotencyKey: idempotencyKeyFrom(req)
+  });
+  res.json({ status: true, message: summary.message, data: summary });
 });
 
 // ── CAC Services (manual — no provider API) ────────────────────────
