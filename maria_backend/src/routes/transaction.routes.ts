@@ -127,20 +127,8 @@ transactionRoutes.get('/:id/document', async (req, res) => {
   });
   if (!tx) return res.status(404).json({ status: false, message: 'Transaction not found' });
   const metadata = tx.metadata as Record<string, unknown> | null;
-  const pii = decryptTransactionPII(tx.metadata) ?? {};
-  const hubbuToken = typeof (pii as Record<string, unknown>).hubbu_download_token === 'string'
-    ? (pii as Record<string, unknown>).hubbu_download_token as string
-    : undefined;
-  if (hubbuToken) {
-    try {
-      const pdf = await hubbuService.downloadSlip(hubbuToken);
-      res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
-      return res.send(pdf);
-    } catch (error) {
-      console.error('[hubbu] owner slip download failed:', { transactionId: tx.id, reference: tx.reference, error });
-      return res.status(502).json({ status: false, message: 'The slip could not be retrieved from the provider right now.' });
-    }
-  }
+  const pii = (decryptTransactionPII(tx.metadata) ?? {}) as Record<string, unknown>;
+  const hubbuSource = [pii.hubbu_download_url, pii.hubbu_download_token].find((v): v is string => typeof v === 'string' && v.trim().length > 0);
   const findArtifact = (keys: Set<string>) => {
     const visit = (value: unknown, seen = new Set<object>()): string | null => {
       if (!value || typeof value !== 'object' || Array.isArray(value) || seen.has(value)) return null;
@@ -162,6 +150,16 @@ transactionRoutes.get('/:id/document', async (req, res) => {
     const base64 = encoded.replace(/^data:application\/pdf;base64,/i, '');
     res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
     return res.send(Buffer.from(base64, 'base64'));
+  }
+  if (hubbuSource) {
+    try {
+      const pdf = await hubbuService.downloadSlip(hubbuSource);
+      res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
+      return res.send(pdf);
+    } catch (error) {
+      console.error('[hubbu] owner slip download failed:', { transactionId: tx.id, reference: tx.reference, error });
+      return res.status(502).json({ status: false, message: 'The slip could not be retrieved from the provider right now.' });
+    }
   }
   const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']));
   if (externalUrl && !/^https:\/\//i.test(externalUrl)) return res.status(404).json({ status: false, message: 'No document is available for this transaction' });

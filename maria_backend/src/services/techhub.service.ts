@@ -82,6 +82,8 @@ export type TechhubSlipResult = {
   pdfBase64?: string;
   pdfUrl?: string;
   downloadToken?: string;
+  /** Absolute URL of the provider's own slip download link, when it returned one. */
+  downloadUrl?: string;
   raw: unknown;
 };
 

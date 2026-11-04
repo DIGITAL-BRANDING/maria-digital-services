@@ -222,8 +222,19 @@ export type SlipPurchaseResult = {
   pdfBase64?: string;
   pdfUrl?: string;
   downloadToken?: string;
+  downloadUrl?: string;
   balanceAfter: number;
 };
+
+/** Best-effort fetch of a Hubbu slip PDF as base64. Never throws: a failure is logged and the link is kept for a retry. */
+async function prefetchHubbuSlip(url: string, transactionId: string): Promise<string | undefined> {
+  try {
+    return (await hubbuService.downloadSlip(url)).toString('base64');
+  } catch (error) {
+    console.error('[hubbu] slip prefetch failed; the document endpoint will retry', { transactionId, error });
+    return undefined;
+  }
+}
 
 /**
  * Shared by all four slip flows (NIN-by-NIN, NIN-by-Phone, NIN-by-Demographic,
@@ -327,6 +338,15 @@ async function purchaseSlip(params: {
     });
 
     if (provider.ok) {
+      // Hubbu may return the slip inline, or only a download link. Keep an inline
+      // copy whenever we have one. Otherwise fetch the PDF now, while the link is
+      // fresh, so the customer does not depend on a second Hubbu call later. If
+      // that prefetch fails, the link stays on file and the document endpoint retries it.
+      const inlinePdf = provider.pdfBase64
+        ?? (params.provider === 'hubbu' && provider.downloadUrl
+          ? await prefetchHubbuSlip(provider.downloadUrl, debit.transaction.id)
+          : undefined);
+
       const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
       await prisma.transaction.update({
         where: { id: debit.transaction.id },
@@ -340,9 +360,10 @@ async function purchaseSlip(params: {
             pii: mergeSealedPII(existingMetadata?.pii, {
               ...params.pii,
               user_data: provider.userData,
-              pdf_base64: provider.downloadToken ? undefined : provider.pdfBase64,
+              pdf_base64: inlinePdf,
               pdf_url: provider.pdfUrl,
-              hubbu_download_token: provider.downloadToken
+              hubbu_download_token: provider.downloadToken,
+              hubbu_download_url: provider.downloadUrl
             })
           } as Prisma.InputJsonValue
         }
@@ -366,7 +387,7 @@ async function purchaseSlip(params: {
         reference: debit.reference,
         transactionId: debit.transaction.id,
         userData: provider.userData,
-        pdfBase64: provider.pdfBase64,
+        pdfBase64: inlinePdf,
         pdfUrl: provider.pdfUrl,
         downloadToken: provider.downloadToken,
         balanceAfter: debit.balanceAfter

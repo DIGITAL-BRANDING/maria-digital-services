@@ -39,7 +39,7 @@ async function post(
   path: string,
   body: Record<string, unknown>,
   context: { reference?: string; method?: string } = {}
-): Promise<TechhubSlipResult & { downloadToken?: string }> {
+): Promise<TechhubSlipResult & { downloadToken?: string; downloadUrl?: string }> {
   configured();
   const requestFields = Object.keys(body).filter((key) => !['nin', 'phone', 'bvn', 'first_name', 'last_name', 'dob'].includes(key));
   console.info('[hubbu] request started', {
@@ -87,7 +87,8 @@ async function post(
   // "pending/processing", or when a gateway error hides the real outcome - the
   // slip may well be delivered a moment later. Those stay PENDING for reconciliation.
   const inProgress = !ok && !explicitlyRejected && (IN_PROGRESS_STATUSES.has(statusText) || isGatewayFailure(response.status));
-  const downloadUrl = typeof data.download_url === 'string' ? data.download_url : undefined;
+  const rawDownload = typeof data.download_url === 'string' && data.download_url.trim() ? data.download_url.trim() : undefined;
+  const downloadUrl = rawDownload ? resolveDownloadUrl(rawDownload) : undefined;
   console.info('[hubbu] response received', {
     path,
     method: context.method ?? (typeof body.method === 'string' ? body.method : undefined),
@@ -120,12 +121,22 @@ async function post(
     message: payload.message || (ok ? 'Verification successful' : 'The verification provider could not complete this request.'),
     userData: data.result,
     pdfBase64: typeof data.pdf_base64 === 'string' ? data.pdf_base64 : undefined,
-    downloadToken: typeof data.download_url === 'string' ? (() => {
-      try { return new URL(data.download_url!, env.HUBBU_BASE_URL).searchParams.get('file') ?? data.download_url!; }
-      catch { return data.download_url!; }
-    })() : undefined,
+    // Keep the link exactly as Hubbu sent it (relative path, full URL or opaque
+    // token). downloadSlip() works out how to fetch each form; stripping it down
+    // to a `file` query value here used to lose the path and 502 later.
+    downloadToken: rawDownload,
+    downloadUrl,
     raw: payload
   };
+}
+
+/** Resolves Hubbu's download link against its base URL; undefined if it cannot be parsed. */
+function resolveDownloadUrl(value: string): string | undefined {
+  try {
+    return new URL(value, `${env.HUBBU_BASE_URL.replace(/\/$/, '')}/`).toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function tier(value: TechhubSlipTier | TechhubBvnTier) {
@@ -134,26 +145,23 @@ function tier(value: TechhubSlipTier | TechhubBvnTier) {
 
 export const hubbuService = {
   assertConfigured: configured,
-  async downloadSlip(fileToken: string) {
+  /**
+   * Fetches a slip PDF from Hubbu. `source` is whatever Hubbu returned: a full
+   * URL, a path starting with "/", or an opaque `file` token. The API key is
+   * only ever sent to Hubbu's own origin.
+   */
+  async downloadSlip(source: string) {
     configured();
     const baseUrl = env.HUBBU_BASE_URL.replace(/\/$/, '');
+    const base = new URL(baseUrl);
     let downloadUrl: URL;
-    try {
-      const suppliedUrl = new URL(fileToken, `${baseUrl}/`);
-      const base = new URL(baseUrl);
-      // Hubbu sometimes returns a complete download URL, sometimes only the
-      // opaque `file` token. Preserve its query string when it's a same-host
-      // Hubbu download link; never send the API key to another host.
-      if (suppliedUrl.origin === base.origin && /\/slips\/download\/?$/.test(suppliedUrl.pathname)) {
-        downloadUrl = suppliedUrl;
-      } else if (/^https?:\/\//i.test(fileToken)) {
+    if (/^https?:\/\//i.test(source) || source.startsWith('/')) {
+      downloadUrl = new URL(source, `${baseUrl}/`);
+      if (downloadUrl.origin !== base.origin) {
         throw new Error('Hubbu returned an unsupported slip download URL');
-      } else {
-        downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(fileToken)}`);
       }
-    } catch (error) {
-      if (error instanceof Error && error.message.includes('unsupported')) throw error;
-      downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(fileToken)}`);
+    } else {
+      downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(source)}`);
     }
 
     const response = await fetch(downloadUrl, {
