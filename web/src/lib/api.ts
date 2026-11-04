@@ -139,7 +139,11 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/api${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {}, ...(timeout.signal ? { signal: timeout.signal } : {}) });
       if (!res.ok) {
-        let message = `Request failed (${res.status})`;
+        // A gateway 5xx (no JSON body) means the server or provider was slow or
+        // unreachable, not that the request was wrong - say so instead of a bare status code.
+        let message = res.status >= 500
+          ? 'The slip server is busy or the provider is slow right now. Please wait a minute and tap Retrieve PDF again.'
+          : `Request failed (${res.status})`;
         try { message = ((await res.json()) as { message?: string }).message ?? message; } catch { /* non-JSON error */ }
         throw new ApiError(message, res.status);
       }

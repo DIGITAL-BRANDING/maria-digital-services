@@ -120,6 +120,8 @@ transactionRoutes.get('/:id', async (req, res) => {
 // Document bytes are deliberately fetched only when the customer opens or
 // reprints a record. History/list responses contain transaction metadata and
 // a lightweight document URL, never an embedded PDF or uploaded file.
+const DOCUMENT_FETCH_TIMEOUT_MS = 20_000;
+
 transactionRoutes.get('/:id/document', async (req, res) => {
   const tx = await prisma.transaction.findFirst({
     where: { id: req.params.id, userId: req.user!.id },
@@ -153,12 +155,20 @@ transactionRoutes.get('/:id/document', async (req, res) => {
   }
   if (hubbuSource) {
     try {
-      const pdf = await hubbuService.downloadSlip(hubbuSource);
+      // Kept well under the reverse proxy's request timeout. A slow provider
+      // should get a JSON answer we control, not a gateway 502 with no message.
+      const pdf = await hubbuService.downloadSlip(hubbuSource, DOCUMENT_FETCH_TIMEOUT_MS);
       res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
       return res.send(pdf);
     } catch (error) {
       console.error('[hubbu] owner slip download failed:', { transactionId: tx.id, reference: tx.reference, error });
-      return res.status(502).json({ status: false, message: 'The slip could not be retrieved from the provider right now.' });
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      return res.status(timedOut ? 504 : 502).json({
+        status: false,
+        message: timedOut
+          ? 'The provider took too long to return the slip. Please try again in a minute.'
+          : 'The slip could not be retrieved from the provider right now. Please try again shortly.'
+      });
     }
   }
   const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']));

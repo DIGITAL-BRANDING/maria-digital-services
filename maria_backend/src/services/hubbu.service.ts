@@ -150,7 +150,7 @@ export const hubbuService = {
    * URL, a path starting with "/", or an opaque `file` token. The API key is
    * only ever sent to Hubbu's own origin.
    */
-  async downloadSlip(source: string) {
+  async downloadSlip(source: string, timeoutMs = 45_000) {
     configured();
     const baseUrl = env.HUBBU_BASE_URL.replace(/\/$/, '');
     const base = new URL(baseUrl);
@@ -165,7 +165,7 @@ export const hubbuService = {
     }
 
     const response = await fetch(downloadUrl, {
-      headers: { 'X-API-KEY': env.HUBBU_API_KEY! }, signal: AbortSignal.timeout(45_000)
+      headers: { 'X-API-KEY': env.HUBBU_API_KEY! }, signal: AbortSignal.timeout(timeoutMs)
     });
     if (!response.ok) {
       console.error('[hubbu] slip download rejected', { httpStatus: response.status, contentType: response.headers.get('content-type') });
