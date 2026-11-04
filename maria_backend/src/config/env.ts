@@ -15,6 +15,9 @@ const EnvSchema = z.object({
     (value) => value.startsWith('postgresql://') || value.startsWith('postgres://'),
     'DATABASE_URL must use the postgresql:// or postgres:// scheme'
   ),
+  // Optional PEM CA certificate for the database TLS connection used by the admin
+  // session store (see lib/pg-pool-config.ts). Newlines may be written as \n.
+  DATABASE_SSL_CA: z.string().optional(),
   FIREBASE_SERVICE_ACCOUNT_BASE64: z.string().optional(),
   ALRAHUZ_BASE_URL: z.string().url().default('https://alrahuzdata.com.ng/api'),
   ALRAHUZ_API_TOKEN: z.string().optional(),

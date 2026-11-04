@@ -3,6 +3,7 @@ import AdminJSExpress from '@adminjs/express';
 import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
 import { Pool } from 'pg';
+import { buildPgPoolConfig } from '../lib/pg-pool-config.js';
 import { Database, Resource } from '@adminjs/prisma';
 import { env } from '../config/env.js';
 import { authenticateAdmin } from './auth.js';
@@ -46,7 +47,10 @@ export const ADMIN_ROOT_PATH = '/admin';
 // AdminJS uses express-session directly, so keep a small PostgreSQL pool for
 // its session table rather than routing it through Prisma. The store creates
 // the table on first boot and periodically removes expired sessions.
-const sessionPool = new Pool({ connectionString: env.DATABASE_URL });
+if (!env.DATABASE_SSL_CA) {
+  console.warn('[admin] DATABASE_SSL_CA is not set: the admin session connection is encrypted but the database certificate is not verified');
+}
+const sessionPool = new Pool(buildPgPoolConfig(env.DATABASE_URL, env.DATABASE_SSL_CA));
 const PgSessionStore = connectPgSimple(session);
 const adminSessionStore = new PgSessionStore(
   {
