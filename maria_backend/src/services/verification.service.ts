@@ -858,16 +858,20 @@ function findResponseValue(value: unknown, names: string[]): string | undefined 
 async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Record<string, never>>, response: Record<string, unknown> | null) {
   if (!response) return null;
   const message = findResponseValue(response, ['message', 'description', 'note', 'remarks']);
-  const url = findResponseValue(response, ['pdf_url', 'file_url', 'download_url', 'document_url', 'slip_url', 'url']);
+  const url = findResponseValue(response, ['pdf_url', 'file_url', 'download_url', 'document_url', 'slip_url', 'certificate_url', 'certificate_pdf_url', 'result_url', 'report_url', 'url']);
   // Do not treat an arbitrary `base64` field as the delivered document: identity
   // responses can include a photo in base64 alongside the actual PDF. Accept
   // explicit file/document fields from K-Tech and the other async providers.
   const base64 = findResponseValue(response, [
     'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
     'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
-    'document_base64', 'base64_data', 'file_data'
+    'document_base64', 'base64_data', 'file_data', 'result_pdf_base64', 'report_base64'
   ]);
-  if (!url && !base64) return null;
+  if (!url && !base64) {
+    // Logs key names only, never values, so the next provider response shape is visible.
+    console.info('[async-delivery] provider returned no result file', { reference: transaction.reference, keys: Object.keys(response).join(',') });
+    return null;
+  }
 
   const previous = await prisma.userDelivery.findFirst({ where: { userId: transaction.userId, reference: transaction.reference } });
   if (previous) return { id: previous.id, created: false };
@@ -1407,7 +1411,7 @@ export async function listServiceTickets(userId: string, services: string | stri
           'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
           'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
           'document_base64', 'base64_data', 'file_data'
-        ]) || asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url'])),
+        ]) || asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url', 'certificate_url', 'certificate_pdf_url', 'result_url', 'report_url'])),
         created_at: transaction.createdAt.toISOString(),
         updated_at: transaction.updatedAt.toISOString()
       };

@@ -150,7 +150,7 @@ transactionRoutes.get('/:id/document', async (req, res) => {
   const fileBase64Keys = new Set([
     'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
     'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
-    'document_base64', 'base64_data', 'file_data'
+    'document_base64', 'base64_data', 'file_data', 'result_pdf_base64', 'report_base64'
   ]);
   const encoded = (typeof metadata?.pdf_base64 === 'string' && metadata.pdf_base64) || findArtifact(fileBase64Keys);
   if (encoded) {
@@ -181,7 +181,7 @@ transactionRoutes.get('/:id/document', async (req, res) => {
       });
     }
   }
-  const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url', 'url']));
+  const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url', 'certificate_url', 'certificate_pdf_url', 'result_url', 'report_url', 'url']));
   if (externalUrl && !/^https:\/\//i.test(externalUrl)) return res.status(404).json({ status: false, message: 'No document is available for this transaction' });
   if (externalUrl) return res.redirect(302, externalUrl);
   return res.status(404).json({ status: false, message: 'No document is available for this transaction' });

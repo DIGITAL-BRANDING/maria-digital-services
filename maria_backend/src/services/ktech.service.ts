@@ -106,6 +106,14 @@ function mockPdfBase64() {
   return Buffer.from('%PDF-1.4\n% MAJOR DATA-LINK mock slip - MOCK_KTECH is on\n').toString('base64');
 }
 
+const KTECH_SUCCESS_STATUSES = new Set([
+  'success', 'successful', 'completed', 'complete', 'done', 'approved',
+  'processed', 'resolved', 'verified', 'cleared', 'ready', 'available', 'finished'
+]);
+const KTECH_FAILED_STATUSES = new Set([
+  'failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'
+]);
+
 export class KtechService {
   private baseUrl() {
     return env.KTECH_BASE_URL.replace(/\/$/, '');
@@ -311,11 +319,17 @@ export class KtechService {
       throw new ApiError(response.status >= 400 ? response.status : 502, data.message ?? 'Could not check request status', 'KTECH_STATUS_FAILED');
     }
 
-    const status = ['success', 'successful', 'completed', 'complete', 'done', 'approved'].includes(rawStatus)
+    // Success words are matched on the exact string K-Tech sends. Anything not
+    // listed stays 'pending' (never treated as a failure), and is logged below so
+    // the real vocabulary can be added here from evidence rather than guesswork.
+    const status = KTECH_SUCCESS_STATUSES.has(rawStatus)
       ? 'success'
-      : ['failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'].includes(rawStatus)
+      : KTECH_FAILED_STATUSES.has(rawStatus)
         ? 'failed'
         : 'pending';
+    if (status === 'pending') {
+      console.info(`[ktech] ${path} still pending (ticket=${ticketId}, providerStatus=${rawStatus}, keys=${Object.keys(payload).join(',')})`);
+    }
     const nestedResponse = payload.response && typeof payload.response === 'object' && !Array.isArray(payload.response)
       ? payload.response
       : payload.result && typeof payload.result === 'object' && !Array.isArray(payload.result)
