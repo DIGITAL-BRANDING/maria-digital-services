@@ -147,11 +147,21 @@ transactionRoutes.get('/:id/document', async (req, res) => {
     };
     return visit(pii);
   };
-  const encoded = (typeof metadata?.pdf_base64 === 'string' && metadata.pdf_base64) || findArtifact(new Set(['pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64', 'publication_pdf_base64', 'submission_pdf_base64', 'file_base64']));
+  const fileBase64Keys = new Set([
+    'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
+    'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
+    'document_base64', 'base64_data', 'file_data'
+  ]);
+  const encoded = (typeof metadata?.pdf_base64 === 'string' && metadata.pdf_base64) || findArtifact(fileBase64Keys);
   if (encoded) {
-    const base64 = encoded.replace(/^data:application\/pdf;base64,/i, '');
-    res.set({ 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="${tx.reference}.pdf"`, 'Cache-Control': 'private, no-store' });
-    return res.send(Buffer.from(base64, 'base64'));
+    const dataUri = encoded.match(/^data:([^;]+);base64,/i);
+    const base64 = encoded.replace(/^data:[^;]+;base64,/i, '').replace(/\s/g, '');
+    const mimeType = dataUri?.[1] || findArtifact(new Set(['mime_type', 'content_type'])) || 'application/pdf';
+    const bytes = Buffer.from(base64, 'base64');
+    if (!bytes.length) return res.status(404).json({ status: false, message: 'No document is available for this transaction' });
+    const extension = mimeType === 'application/pdf' ? 'pdf' : mimeType.split('/')[1]?.replace(/[^a-z0-9.+-]/gi, '') || 'bin';
+    res.set({ 'Content-Type': mimeType, 'Content-Disposition': `inline; filename="${tx.reference}.${extension}"`, 'Cache-Control': 'private, no-store' });
+    return res.send(bytes);
   }
   if (hubbuSource) {
     try {
@@ -171,7 +181,7 @@ transactionRoutes.get('/:id/document', async (req, res) => {
       });
     }
   }
-  const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url']));
+  const externalUrl = (typeof metadata?.pdf_url === 'string' && metadata.pdf_url) || findArtifact(new Set(['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url', 'url']));
   if (externalUrl && !/^https:\/\//i.test(externalUrl)) return res.status(404).json({ status: false, message: 'No document is available for this transaction' });
   if (externalUrl) return res.redirect(302, externalUrl);
   return res.status(404).json({ status: false, message: 'No document is available for this transaction' });

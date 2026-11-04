@@ -859,7 +859,14 @@ async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Reco
   if (!response) return null;
   const message = findResponseValue(response, ['message', 'description', 'note', 'remarks']);
   const url = findResponseValue(response, ['pdf_url', 'file_url', 'download_url', 'document_url', 'slip_url', 'url']);
-  const base64 = findResponseValue(response, ['pdf_base64', 'file_base64', 'document_base64', 'base64']);
+  // Do not treat an arbitrary `base64` field as the delivered document: identity
+  // responses can include a photo in base64 alongside the actual PDF. Accept
+  // explicit file/document fields from K-Tech and the other async providers.
+  const base64 = findResponseValue(response, [
+    'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
+    'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
+    'document_base64', 'base64_data', 'file_data'
+  ]);
   if (!url && !base64) return null;
 
   const previous = await prisma.userDelivery.findFirst({ where: { userId: transaction.userId, reference: transaction.reference } });
@@ -1396,7 +1403,11 @@ export async function listServiceTickets(userId: string, services: string | stri
         tracking_id: typeof pii?.tracking_id === 'string' ? pii.tracking_id : null,
         nin: typeof pii?.nin === 'string' ? pii.nin : null,
         email: typeof pii?.email === 'string' ? pii.email : null,
-        has_document: Boolean(asyncArtifact(pii, ['pdf_base64', 'certificate_pdf_base64', 'file_base64']) || asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url'])),
+        has_document: Boolean(asyncArtifact(pii, [
+          'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
+          'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
+          'document_base64', 'base64_data', 'file_data'
+        ]) || asyncArtifact(pii, ['pdf_url', 'slip_url', 'download_url', 'file_url', 'document_url'])),
         created_at: transaction.createdAt.toISOString(),
         updated_at: transaction.updatedAt.toISOString()
       };
