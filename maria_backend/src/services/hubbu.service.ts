@@ -155,7 +155,9 @@ export const hubbuService = {
     const baseUrl = env.HUBBU_BASE_URL.replace(/\/$/, '');
     const base = new URL(baseUrl);
     let downloadUrl: URL;
-    if (/^https?:\/\//i.test(source) || source.startsWith('/')) {
+    // Which form Hubbu gave us. Logged so a failure says what was tried, never the key or token.
+    const sourceKind = /^https?:\/\//i.test(source) ? 'absolute-url' : source.startsWith('/') ? 'path' : 'token';
+    if (sourceKind !== 'token') {
       downloadUrl = new URL(source, `${baseUrl}/`);
       if (downloadUrl.origin !== base.origin) {
         throw new Error('Hubbu returned an unsupported slip download URL');
@@ -163,17 +165,28 @@ export const hubbuService = {
     } else {
       downloadUrl = new URL(`${baseUrl}/slips/download?file=${encodeURIComponent(source)}`);
     }
+    // Path only: query strings can carry the file token.
+    const requestedPath = downloadUrl.pathname;
 
     const response = await fetch(downloadUrl, {
       headers: { 'X-API-KEY': env.HUBBU_API_KEY! }, signal: AbortSignal.timeout(timeoutMs)
     });
     if (!response.ok) {
-      console.error('[hubbu] slip download rejected', { httpStatus: response.status, contentType: response.headers.get('content-type') });
+      // Hubbu's own message (e.g. "file not found") is the most useful clue; keep it short.
+      const providerBody = (await response.text().catch(() => '')).slice(0, 300);
+      console.error('[hubbu] slip download rejected', {
+        httpStatus: response.status,
+        contentType: response.headers.get('content-type'),
+        sourceKind,
+        requestedPath,
+        tokenLength: sourceKind === 'token' ? source.length : undefined,
+        providerBody
+      });
       throw new Error(`Hubbu slip download returned HTTP ${response.status}`);
     }
     const pdf = Buffer.from(await response.arrayBuffer());
     if (pdf.length < 5 || pdf.subarray(0, 5).toString('ascii') !== '%PDF-') {
-      console.error('[hubbu] slip download response was not a PDF', { contentType: response.headers.get('content-type'), bytes: pdf.length });
+      console.error('[hubbu] slip download response was not a PDF', { contentType: response.headers.get('content-type'), bytes: pdf.length, sourceKind, requestedPath });
       throw new Error('Hubbu returned a non-PDF response for the slip download');
     }
     return pdf;
