@@ -10,7 +10,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { ApiError } from '../middleware/error.js';
 import { verifyLoginPin } from '../services/login-pin.service.js';
 import { tryProvisionInstantVirtualAccount } from '../services/kyc.service.js';
-import { sendWelcomeEmail } from '../lib/email.js';
+import { addUserToResendAudience, sendWelcomeEmail } from '../lib/email.js';
 
 export const authRoutes = Router();
 
@@ -84,6 +84,9 @@ authRoutes.post('/register', async (req, res) => {
 
   // Welcome email delivery is best-effort and must not prevent account creation.
   void sendWelcomeEmail({ to: provisionedUser.email, name: provisionedUser.fullName });
+  // Audience membership is separate from email delivery. Keep it best-effort
+  // too, so a Resend outage can never interrupt registration.
+  void addUserToResendAudience({ email: provisionedUser.email, name: provisionedUser.fullName });
 
   const tokens = await issueAuthTokens({ id: provisionedUser.id, email: provisionedUser.email });
   res.status(201).json(await authResponse(provisionedUser, tokens));

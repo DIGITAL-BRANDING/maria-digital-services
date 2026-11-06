@@ -9,6 +9,63 @@ function getClient() {
   return client;
 }
 
+function splitContactName(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  return { firstName: parts[0] || undefined, lastName: parts.slice(1).join(' ') || undefined };
+}
+
+/** Add a newly registered account to the configured Resend Audience. */
+export async function addUserToResendAudience(params: { email: string; name: string }) {
+  if (!env.RESEND_API_KEY || !env.RESEND_AUDIENCE_ID) {
+    console.warn('[email] Audience sync skipped: RESEND_API_KEY or RESEND_AUDIENCE_ID is not configured');
+    return { added: false, skipped: true };
+  }
+
+  try {
+    const resend = getClient();
+    if (!resend) return { added: false, skipped: true };
+    const { firstName, lastName } = splitContactName(params.name);
+    const { error } = await resend.contacts.create({
+      audienceId: env.RESEND_AUDIENCE_ID,
+      email: params.email.trim().toLowerCase(),
+      firstName,
+      lastName,
+      unsubscribed: false
+    });
+    if (error) {
+      console.error('[email] Resend rejected Audience contact', { email: params.email, error });
+      return { added: false, error };
+    }
+    return { added: true };
+  } catch (error) {
+    console.error('[email] Failed to add user to Resend Audience', { email: params.email, error });
+    return { added: false, error };
+  }
+}
+
+/** List all contacts in the configured Audience, following Resend cursors. */
+export async function listResendAudienceContactEmails() {
+  const resend = getClient();
+  if (!resend || !env.RESEND_AUDIENCE_ID) {
+    throw new Error('RESEND_API_KEY and RESEND_AUDIENCE_ID must be configured');
+  }
+
+  const emails = new Set<string>();
+  let after: string | undefined;
+  do {
+    const { data, error } = await resend.contacts.list({ audienceId: env.RESEND_AUDIENCE_ID, limit: 100, after });
+    if (error) throw new Error(`Unable to list Resend Audience contacts: ${error.message}`);
+    for (const contact of data?.data ?? []) {
+      if (contact.email) emails.add(contact.email.toLowerCase());
+    }
+    const contacts = data?.data ?? [];
+    after = data?.has_more && contacts.length ? contacts[contacts.length - 1].id : undefined;
+    if (data?.has_more && !after) throw new Error('Resend reported more contacts but returned no pagination cursor');
+  } while (after);
+
+  return emails;
+}
+
 /**
  * The only email this app sends right now. Deliberately doesn't throw on
  * a Resend failure - the caller (POST /password/forgot) always returns a

@@ -19,6 +19,7 @@
         "seed:admin": "tsx src/admin/seed-super-admin.ts",
         "purge:pii": "tsx src/scripts/purge-expired-pii.ts",
         "sync:techhub-prices": "tsx src/scripts/sync-techhub-prices.ts",
+        "resend:sync-contacts": "node dist/scripts/sync-resend-contacts.js",
         "test": "vitest run",
         "test:watch": "vitest",
         "lint": "eslint src --ext .ts"
