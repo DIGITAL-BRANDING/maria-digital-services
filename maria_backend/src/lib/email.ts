@@ -146,17 +146,30 @@ async function sendPlatformEmail(params: { to: string; subject: string; text: st
     console.error('[email] RESEND_API_KEY is not set - cannot send platform email');
     return { sent: false };
   }
-  try {
-    const { error } = await resend.emails.send({ from: env.RESEND_FROM_EMAIL, ...params });
-    if (error) {
-      console.error('[email] Resend rejected a platform email', error);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const { error } = await resend.emails.send({ from: env.RESEND_FROM_EMAIL, ...params });
+      if (error) {
+        const status = (error as { statusCode?: number }).statusCode;
+        if (status === 429 && attempt < 4) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+          continue;
+        }
+        console.error('[email] Resend rejected a platform email', { status, message: error.message });
+        return { sent: false };
+      }
+      return { sent: true };
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'statusCode' in error ? Number((error as { statusCode: unknown }).statusCode) : undefined;
+      if (status === 429 && attempt < 4) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        continue;
+      }
+      console.error('[email] Failed to send platform email', error);
       return { sent: false };
     }
-    return { sent: true };
-  } catch (error) {
-    console.error('[email] Failed to send platform email', error);
-    return { sent: false };
   }
+  return { sent: false };
 }
 
 export function sendWelcomeEmail(params: { to: string; name: string }) {
@@ -224,4 +237,48 @@ export function sendAdminComposedEmail(params: { to: string; subject: string; me
     html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><div style="white-space:normal;line-height:1.6">${safeMessage}</div><p style="margin-top:24px;color:#64748b">MARIA Digital Solutions</p></div>`,
     ...(params.attachment ? { attachments: [{ filename: params.attachment.filename, content: params.attachment.content }] } : {})
   });
+}
+
+export async function sendAdminComposedEmailBatch(params: { recipients: string[]; subject: string; message: string }) {
+  const resend = getClient();
+  if (!resend) {
+    console.error('[email] RESEND_API_KEY is not set - cannot send admin email batch');
+    return { sent: 0, failed: params.recipients.length };
+  }
+  const safeMessage = escapeHtml(params.message).replace(/\r?\n/g, '<br>');
+  const emails = params.recipients.map((to) => ({
+    from: env.RESEND_FROM_EMAIL,
+    to: [to],
+    subject: params.subject,
+    text: params.message,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><div style="white-space:normal;line-height:1.6">${safeMessage}</div><p style="margin-top:24px;color:#64748b">MARIA Digital Solutions</p></div>`
+  }));
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const { data, error, errors } = await resend.batch.send(emails, { batchValidation: 'permissive' });
+      if (error) {
+        const status = (error as { statusCode?: number }).statusCode;
+        if (status === 429 && attempt < 4) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+          continue;
+        }
+        console.error('[email] Resend rejected an admin email batch', { status, message: error.message });
+        return { sent: 0, failed: params.recipients.length };
+      }
+      const sent = data?.length ?? 0;
+      const failed = errors?.length ?? Math.max(0, params.recipients.length - sent);
+      if (failed) console.error('[email] Some messages in an admin batch were rejected', { sent, failed });
+      return { sent, failed };
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'statusCode' in error ? Number((error as { statusCode: unknown }).statusCode) : undefined;
+      if (status === 429 && attempt < 4) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        continue;
+      }
+      console.error('[email] Failed to send admin email batch', { status, error });
+      return { sent: 0, failed: params.recipients.length };
+    }
+  }
+  return { sent: 0, failed: params.recipients.length };
 }

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { Request, Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
-import { sendAdminComposedEmail } from '../lib/email.js';
+import { sendAdminComposedEmail, sendAdminComposedEmailBatch } from '../lib/email.js';
 import { logAdminAction } from './audit.js';
 import type { AdminSessionUser } from './auth.js';
 
@@ -111,11 +111,23 @@ export function registerEmailUsersRoutes(router: Router) {
         select: { id: true, email: true }
       });
       if (!batch.length) break;
-      for (let i = 0; i < batch.length; i += 10) {
-        const outcomes = await Promise.all(batch.slice(i, i + 10).map((user) => sendAdminComposedEmail({
-          to: user.email, subject: parsed.data.subject, message: parsed.data.message, ...(attachment ? { attachment } : {})
-        })));
-        sent += outcomes.filter((outcome) => outcome.sent).length;
+      if (!attachment) {
+        // Resend accepts up to 100 distinct one-recipient emails in one batch
+        // API call, avoiding the 10 requests/second limit on /emails.
+        const outcome = await sendAdminComposedEmailBatch({
+          recipients: batch.map((user) => user.email), subject: parsed.data.subject, message: parsed.data.message
+        });
+        sent += outcome.sent;
+      } else {
+        // The Batch API does not support attachments. Send attached messages
+        // under the same 10 requests/second limit with headroom and retries.
+        for (let i = 0; i < batch.length; i += 5) {
+          const outcomes = await Promise.all(batch.slice(i, i + 5).map((user) => sendAdminComposedEmail({
+            to: user.email, subject: parsed.data.subject, message: parsed.data.message, attachment
+          })));
+          sent += outcomes.filter((outcome) => outcome.sent).length;
+          if (i + 5 < batch.length) await new Promise((resolve) => setTimeout(resolve, 650));
+        }
       }
       total += batch.length;
       cursor = batch[batch.length - 1]!.id;
