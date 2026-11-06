@@ -6,6 +6,7 @@ import { prisma } from '../lib/prisma.js';
 import { ApiError } from '../middleware/error.js';
 import { debitWallet, refundWallet } from './wallet.service.js';
 import { notifyUser } from './notification.service.js';
+import { emailTicketSubmitted } from './service-ticket-email.service.js';
 import { recordProviderDebit } from './provider-ledger.service.js';
 import { createUserDelivery, createUserDeliveryLink } from './user-delivery.service.js';
 import {
@@ -785,6 +786,10 @@ async function submitAsyncService(params: {
       // status intentionally left PENDING - see checkAsyncServiceStatus below.
     }
   });
+
+  // The provider has accepted the request and returned its ticket ID. Send
+  // the user and admin references only after this point, not on a failed submit.
+  void emailTicketSubmitted(debit.transaction.id);
 
   return { reference: debit.reference, ticketId: result.ticketId, balanceAfter: debit.balanceAfter };
 }

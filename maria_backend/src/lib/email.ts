@@ -78,3 +78,92 @@ export async function sendAlertEmail(subject: string, body: string) {
     return { sent: false };
   }
 }
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
+}
+
+async function sendPlatformEmail(params: { to: string; subject: string; text: string; html: string }) {
+  const resend = getClient();
+  if (!resend) {
+    console.error('[email] RESEND_API_KEY is not set - cannot send platform email');
+    return { sent: false };
+  }
+  try {
+    const { error } = await resend.emails.send({ from: env.RESEND_FROM_EMAIL, ...params });
+    if (error) {
+      console.error('[email] Resend rejected a platform email', error);
+      return { sent: false };
+    }
+    return { sent: true };
+  } catch (error) {
+    console.error('[email] Failed to send platform email', error);
+    return { sent: false };
+  }
+}
+
+export function sendWelcomeEmail(params: { to: string; name: string }) {
+  const name = escapeHtml(params.name);
+  const subject = 'Welcome to MARIA Digital Solutions';
+  const text = `Welcome, ${params.name}! You can use MARIA Digital Solutions to verify NIN and BVN, request NIN validation, personalization, IPE clearance and modifications, submit CAC and other service requests, buy data and airtime, and fund your wallet. Sign in to your dashboard to get started.`;
+  return sendPlatformEmail({
+    to: params.to,
+    subject,
+    text,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h1>Welcome, ${name}!</h1><p>Welcome to MARIA Digital Solutions. Your account is ready.</p><p>From your dashboard you can:</p><ul><li>Verify NIN and BVN, and request NIN validation</li><li>Submit personalization, IPE clearance, and modification requests</li><li>Submit CAC and other service requests</li><li>Buy data and airtime</li><li>Fund your wallet and track requests in your history</li></ul><p>Sign in to your dashboard to get started.</p></div>`
+  });
+}
+
+export function sendWalletFundedEmail(params: { to: string; name: string; amount: string; balance: string; reference: string }) {
+  const safe = { name: escapeHtml(params.name), amount: escapeHtml(params.amount), balance: escapeHtml(params.balance), reference: escapeHtml(params.reference) };
+  return sendPlatformEmail({
+    to: params.to,
+    subject: 'Your MARIA wallet has been funded',
+    text: `Hello ${params.name}, ${params.amount} has been credited to your wallet. Your current balance is ${params.balance}. Reference: ${params.reference}.`,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>Wallet funded</h2><p>Hello ${safe.name}, <b>${safe.amount}</b> has been credited to your wallet.</p><p>Current balance: <b>${safe.balance}</b><br>Reference: ${safe.reference}</p></div>`
+  });
+}
+
+export async function sendTicketSubmittedEmails(params: { to: string; name: string; service: string; reference: string; amount: string }) {
+  const safe = { name: escapeHtml(params.name), service: escapeHtml(params.service), reference: escapeHtml(params.reference), amount: escapeHtml(params.amount) };
+  const userMail = await sendPlatformEmail({
+    to: params.to,
+    subject: `New ${params.service} request received`,
+    text: `Hello ${params.name}, your ${params.service} request has been submitted. Reference: ${params.reference}. Amount: ${params.amount}. We will notify you when processing starts or when there is an update.`,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>Request submitted</h2><p>Hello ${safe.name}, your <b>${safe.service}</b> request has been received.</p><p>Reference: <b>${safe.reference}</b><br>Amount: <b>${safe.amount}</b></p><p>We will email you when processing starts and when the request is updated.</p></div>`
+  });
+
+  const adminTo = env.ADMIN_NOTIFICATION_EMAIL || env.ALERT_EMAIL;
+  let adminMail = { sent: false };
+  if (adminTo) {
+    adminMail = await sendPlatformEmail({
+      to: adminTo,
+      subject: `New service request needs attention: ${params.service}`,
+      text: `A new service request is waiting for attention. Service: ${params.service}. User: ${params.name} (${params.to}). Reference: ${params.reference}. Amount: ${params.amount}.`,
+      html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>New request needs attention</h2><p>Service: <b>${safe.service}</b><br>User: ${safe.name} (${escapeHtml(params.to)})<br>Reference: <b>${safe.reference}</b><br>Amount: ${safe.amount}</p></div>`
+    });
+  } else {
+    console.warn('[email] ADMIN_NOTIFICATION_EMAIL and ALERT_EMAIL are not set; no admin ticket alert was sent');
+  }
+  return { userSent: userMail.sent, adminSent: adminMail.sent };
+}
+
+export function sendTicketProcessingEmail(params: { to: string; name: string; service: string; reference: string }) {
+  const safe = { name: escapeHtml(params.name), service: escapeHtml(params.service), reference: escapeHtml(params.reference) };
+  return sendPlatformEmail({
+    to: params.to,
+    subject: `Your ${params.service} request is being processed`,
+    text: `Hello ${params.name}, your ${params.service} request (${params.reference}) is now being processed. We will email you when there is another update.`,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>Your request is being processed</h2><p>Hello ${safe.name}, your <b>${safe.service}</b> request is now being processed.</p><p>Reference: <b>${safe.reference}</b></p><p>We will email you when there is another update.</p></div>`
+  });
+}
+
+export function sendAdminComposedEmail(params: { to: string; subject: string; message: string }) {
+  const safeMessage = escapeHtml(params.message).replace(/\r?\n/g, '<br>');
+  return sendPlatformEmail({
+    to: params.to,
+    subject: params.subject,
+    text: params.message,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><div style="white-space:normal;line-height:1.6">${safeMessage}</div><p style="margin-top:24px;color:#64748b">MARIA Digital Solutions</p></div>`
+  });
+}

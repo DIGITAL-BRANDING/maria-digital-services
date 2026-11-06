@@ -5,11 +5,12 @@ import { decryptTransactionPII } from '../../services/verification.service.js';
 import { completeModification } from '../../services/nin-modification.service.js';
 import { completeBvnModification } from '../../services/bvn-modification.service.js';
 import { completeBvnCrm } from '../../services/bvn-crm.service.js';
-import { TransactionStatus } from '@prisma/client';
+import { TransactionStatus, TransactionType } from '@prisma/client';
 import { refundWallet } from '../../services/wallet.service.js';
 import { logAdminAction } from '../audit.js';
 import type { AdminSessionUser } from '../auth.js';
 import { Components } from '../component-loader.js';
+import { EMAIL_TICKET_TYPES, emailTicketProcessing } from '../../services/service-ticket-email.service.js';
 
 export const transactionResource: ResourceWithOptions = {
   resource: { model: getModelByName('Transaction'), client: prisma },
@@ -54,6 +55,39 @@ export const transactionResource: ResourceWithOptions = {
       new: { isAccessible: false },
       edit: { isAccessible: false },
       delete: { isAccessible: false },
+      markProcessing: {
+        actionType: 'record',
+        icon: 'Clock',
+        component: false,
+        isAccessible: ({ currentAdmin, record }) => {
+          const admin = currentAdmin as unknown as AdminSessionUser | undefined;
+          return !!admin && admin.role !== 'SUPPORT' &&
+            record?.params?.status === 'PENDING' &&
+            EMAIL_TICKET_TYPES.has(record.params.type as TransactionType);
+        },
+        handler: async (_request, _response, context) => {
+          const { record, currentAdmin } = context;
+          const admin = currentAdmin as unknown as AdminSessionUser | undefined;
+          if (!record || !admin) throw new Error('Missing record or admin context');
+          const result = await emailTicketProcessing(record.params.id as string);
+          if (!result.sent) {
+            return { record: record.toJSON(currentAdmin), notice: { message: result.reason ?? 'Could not notify customer.', type: 'error' } };
+          }
+          if (!result.alreadySent) {
+            await logAdminAction({
+              adminId: admin.id,
+              action: 'MARK_REQUEST_PROCESSING_EMAIL_SENT',
+              targetType: 'Transaction',
+              targetId: record.params.id as string,
+              metadata: { reference: record.params.reference }
+            });
+          }
+          return {
+            record: record.toJSON(currentAdmin),
+            notice: { message: result.alreadySent ? 'The processing email was already sent.' : 'Customer notified by email that processing has started.', type: 'success' }
+          };
+        }
+      },
       reverse: {
         actionType: 'record',
         icon: 'RotateCcw',

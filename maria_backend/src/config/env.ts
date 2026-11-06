@@ -120,6 +120,9 @@ const EnvSchema = z.object({
   // sending domain is verified in the Resend dashboard.
   RESEND_API_KEY: z.string().optional(),
   RESEND_FROM_EMAIL: z.string().default('MAJOR DATA-LINK <onboarding@resend.dev>'),
+  // Destination for new service-ticket attention emails. Falls back to
+  // ALERT_EMAIL so existing Railway setups continue to receive admin alerts.
+  ADMIN_NOTIFICATION_EMAIL: z.string().email().optional(),
   // Where lib/alerts.ts sends critical-error notifications (unhandled
   // exceptions, uncaught rejections, and 5xx responses from unexpected -
   // i.e. non-ApiError - errors). Optional: unset just means alerting is

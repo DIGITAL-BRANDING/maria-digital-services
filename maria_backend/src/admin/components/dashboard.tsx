@@ -96,6 +96,12 @@ const quickLinks: QuickLink[] = [
     icon: 'Upload'
   },
   {
+    label: 'Email Users',
+    description: 'Send a service update or announcement to one or more users',
+    href: `${ADMIN_ROOT_PATH}/email-users`,
+    icon: 'Mail'
+  },
+  {
     label: 'Company Wallet',
     description: 'Revenue, provider cost & net profit by service',
     href: `${ADMIN_ROOT_PATH}/company-wallet`,

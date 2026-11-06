@@ -8,9 +8,26 @@ import { prisma } from '../lib/prisma.js';
 import { clearLockout, isLocked, recordFailure } from '../lib/lockout.js';
 import { notifyUser } from './notification.service.js';
 import { isCreditType } from '../lib/transaction-direction.js';
+import { sendWalletFundedEmail } from '../lib/email.js';
+import { EMAIL_TICKET_TYPES, emailTicketSubmitted } from './service-ticket-email.service.js';
 
 function formatNaira(kobo: bigint) {
   return `NGN${koboToNaira(kobo).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function emailWalletFunding(params: { userId: string; amountKobo: bigint; balanceKobo: bigint; reference: string }) {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: params.userId }, select: { email: true, fullName: true } });
+    if (user) void sendWalletFundedEmail({
+      to: user.email,
+      name: user.fullName,
+      amount: formatNaira(params.amountKobo),
+      balance: formatNaira(params.balanceKobo),
+      reference: params.reference
+    });
+  } catch (error) {
+    console.error('[email] Could not prepare wallet funding email', { reference: params.reference, error });
+  }
 }
 
 // Store the configured percentage as basis points (1/100th of one percent),
@@ -176,7 +193,7 @@ export async function debitWallet(params: {
   const amountKobo = nairaToKobo(params.amount);
   const reference = `IDS-${Date.now()}-${nanoid(8).toUpperCase()}`;
 
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const before = await tx.user.findUnique({ where: { id: params.userId } });
     if (!before) throw new ApiError(404, 'User not found', 'USER_NOT_FOUND');
 
@@ -233,6 +250,12 @@ export async function debitWallet(params: {
       reused: false
     };
   });
+  // Async provider tickets are emailed only after the provider confirms the
+  // submission and returns a ticket ID (see submitAsyncService()).
+  if (EMAIL_TICKET_TYPES.has(params.type) && params.type !== TransactionType.IDENTITY_SERVICE_REQUEST && !result.reused) {
+    void emailTicketSubmitted(result.transaction.id);
+  }
+  return result;
 }
 
 /**
@@ -310,6 +333,7 @@ export async function creditWalletByReference(reference: string) {
     const feeNote = result.finalBalanceKobo !== result.transaction.balanceAfterKobo
       ? ` A ${env.WALLET_FUNDING_FEE_PERCENT}% (${formatNaira(fundingFeeKobo(result.transaction.amountKobo))}) transaction fee was applied.`
       : '';
+    void emailWalletFunding({ userId: result.transaction.userId, amountKobo: result.transaction.amountKobo, balanceKobo: result.finalBalanceKobo, reference: result.transaction.reference });
     await notifyUser({
       userId: result.transaction.userId,
       type: 'WALLET',
@@ -394,6 +418,7 @@ export async function creditDirectDeposit(params: {
     const feeNote = finalBalanceKobo !== transaction.balanceAfterKobo
       ? ` A ${env.WALLET_FUNDING_FEE_PERCENT}% (${formatNaira(fundingFeeKobo(transaction.amountKobo))}) transaction fee was applied.`
       : '';
+    void emailWalletFunding({ userId: transaction.userId, amountKobo: transaction.amountKobo, balanceKobo: finalBalanceKobo, reference: transaction.reference });
     await notifyUser({
       userId: transaction.userId,
       type: 'WALLET',
@@ -500,6 +525,7 @@ export async function creditDirectDepositByAccountNumber(params: {
     const feeNote = finalBalanceKobo !== transaction.balanceAfterKobo
       ? ` A ${env.WALLET_FUNDING_FEE_PERCENT}% (${formatNaira(fundingFeeKobo(transaction.amountKobo))}) transaction fee was applied.`
       : '';
+    void emailWalletFunding({ userId: transaction.userId, amountKobo: transaction.amountKobo, balanceKobo: finalBalanceKobo, reference: transaction.reference });
     await notifyUser({
       userId: transaction.userId,
       type: 'WALLET',
