@@ -22,6 +22,12 @@ type QuickLink = {
 // the sidebar rather than a separate, unrelated list.
 const quickLinks: QuickLink[] = [
   { label: 'Customers', description: 'Users, KYC status & profiles', resourceId: 'User', icon: 'Users' },
+  {
+    label: 'Manual Provider Dispatch',
+    description: 'Send eligible unassigned async requests to K-Tech',
+    href: `${ADMIN_ROOT_PATH}/manual-provider-dispatch`,
+    icon: 'Send'
+  },
   { label: 'Ledger', description: 'Transactions, reversals & history', resourceId: 'Transaction', icon: 'List' },
   {
     label: 'CAC Registration Requests',
@@ -124,12 +130,6 @@ const quickLinks: QuickLink[] = [
     description: 'Transactions stuck "processing" at any provider - confirm success/failure by hand',
     href: `${ADMIN_ROOT_PATH}/provider-reconciliation`,
     icon: 'AlertTriangle'
-  },
-  {
-    label: 'Manual Provider Dispatch',
-    description: 'Send eligible unassigned async requests to K-Tech',
-    href: `${ADMIN_ROOT_PATH}/manual-provider-dispatch`,
-    icon: 'Send'
   },
   {
     label: 'Data Plan Pricing',
