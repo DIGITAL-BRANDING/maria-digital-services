@@ -175,6 +175,39 @@ export class KtechService {
     return this.postAsync('/verification/nin/ipe-clearance', { tracking_id: trackingId }, idempotencyKey);
   }
 
+  async submitTinGeneration(body: Record<string, unknown>, idempotencyKey: string) {
+    if (env.MOCK_KTECH) {
+      return { ok: true, reference: `MOCK-TIN-${Date.now()}`, message: 'TIN generation request queued (mock)', raw: { mock: true } };
+    }
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl()}/identity/tin-generation`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': this.apiKey(),
+          'Idempotency-Key': idempotencyKey
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45_000)
+      });
+    } catch (error) {
+      console.error('[ktech] network error calling /identity/tin-generation:', error);
+      return { ok: false, message: 'Could not reach K-Tech. The request may still have been accepted; check its status before retrying.', raw: null };
+    }
+    const payload = await response.json().catch(() => ({})) as KtechResponse;
+    const data = (payload.data ?? {}) as Record<string, unknown>;
+    if (typeof data.balance_after === 'number') {
+      void recordKtechBalance(data.balance_after).catch((error) => console.error('[ktech-balance] failed to record post-TIN balance:', error));
+    }
+    const reference = typeof data.reference === 'string' ? data.reference : undefined;
+    if (!response.ok || payload.status !== true || !reference) {
+      console.error(`[ktech] TIN generation submit failed (http=${response.status}):`, JSON.stringify(payload));
+      return { ok: false, message: userSafeProviderMessage(payload.message, `K-Tech rejected the TIN request (HTTP ${response.status}).`), raw: payload };
+    }
+    return { ok: true, reference, message: payload.message ?? 'TIN generation request queued', raw: payload };
+  }
+
   async checkIpeClearance(ticketId: string) {
     return this.getAsync('/verification/nin/ipe-clearance', ticketId);
   }

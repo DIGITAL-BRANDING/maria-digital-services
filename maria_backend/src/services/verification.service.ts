@@ -1547,3 +1547,75 @@ export async function manuallyDispatchPendingTicketToKtech(transactionId: string
   void emailTicketSubmitted(transaction.id);
   return { ok: true as const, ticketId: result.ticketId, reference: transaction.reference };
 }
+
+/** Dispatch an already-paid TIN request to K-Tech's documented async TIN endpoint. */
+export async function manuallyDispatchPendingTinToKtech(transactionId: string) {
+  const transaction = await prisma.transaction.findUnique({ where: { id: transactionId } });
+  if (!transaction || transaction.type !== TransactionType.TIN_CERTIFICATE_REQUEST) {
+    return { ok: false as const, message: 'This is not a TIN request.' };
+  }
+  if (transaction.status !== TransactionStatus.PENDING || transaction.provider !== null || transaction.providerRef !== null) {
+    return { ok: false as const, message: 'This request is no longer available for manual dispatch.' };
+  }
+  const metadata = transaction.metadata as Record<string, unknown> | null;
+  const pii = decryptTransactionPII(metadata);
+  if (!pii) return { ok: false as const, message: 'The encrypted TIN request details could not be read.' };
+
+  const requestType = metadata?.tin_type;
+  let body: Record<string, unknown>;
+  if (requestType === 'individual') {
+    const nin = typeof pii.nin_number === 'string' ? pii.nin_number : '';
+    const firstName = typeof pii.first_name === 'string' ? pii.first_name : '';
+    const surname = typeof pii.surname === 'string' ? pii.surname : '';
+    const dateOfBirth = typeof pii.date_of_birth === 'string' ? pii.date_of_birth : '';
+    if (!/^\d{11}$/.test(nin) || !firstName || !surname || !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) {
+      return { ok: false as const, message: 'The individual TIN request is missing required details.' };
+    }
+    body = { tin_type: 'individual', nin, first_name: firstName, last_name: surname, date_of_birth: dateOfBirth };
+  } else if (requestType === 'corporate') {
+    const rcNumber = typeof pii.rc_number === 'string' ? pii.rc_number : '';
+    const organizationType = typeof pii.organization_type === 'string' ? pii.organization_type : '';
+    if (!rcNumber || organizationType.length < 2) {
+      return { ok: false as const, message: 'The company TIN request is missing required details.' };
+    }
+    body = { tin_type: 'company', business_type: organizationType, business_reg_no: rcNumber };
+  } else {
+    return { ok: false as const, message: 'The TIN request type is not supported by K-Tech.' };
+  }
+
+  try { ktechService.assertConfigured(); }
+  catch { return { ok: false as const, message: 'K-Tech is not configured. Check the KTECH_API_KEY setting.' }; }
+
+  const claimed = await prisma.transaction.updateMany({
+    where: { id: transaction.id, status: TransactionStatus.PENDING, provider: null, providerRef: null },
+    data: { provider: 'ktech_dispatching' }
+  });
+  if (claimed.count !== 1) return { ok: false as const, message: 'Another admin has already picked up this request.' };
+
+  let result: Awaited<ReturnType<typeof ktechService.submitTinGeneration>>;
+  try { result = await ktechService.submitTinGeneration(body, transaction.reference); }
+  catch (error) { result = { ok: false, message: error instanceof Error ? error.message : 'K-Tech TIN dispatch failed.', raw: null }; }
+
+  if (!result.ok || !result.reference) {
+    const attempt = { provider: 'ktech', attempted_at: new Date().toISOString(), error: result.message || 'K-Tech did not return a TIN reference.' };
+    await prisma.transaction.updateMany({
+      where: { id: transaction.id, provider: 'ktech_dispatching', status: TransactionStatus.PENDING },
+      data: { provider: null, metadata: { ...metadata, manual_provider_dispatch: attempt } as Prisma.InputJsonValue }
+    });
+    return { ok: false as const, message: attempt.error };
+  }
+
+  const dispatchedAt = new Date().toISOString();
+  await prisma.transaction.updateMany({
+    where: { id: transaction.id, provider: 'ktech_dispatching', status: TransactionStatus.PENDING },
+    data: {
+      provider: 'ktech', providerRef: result.reference,
+      metadata: {
+        ...metadata, provider: 'ktech', provider_ref: result.reference,
+        manual_provider_dispatch: { provider: 'ktech', attempted_at: dispatchedAt, dispatched_at: dispatchedAt },
+        pii: mergeSealedPII(metadata?.pii, { submit_raw: result.raw })
+      } as Prisma.InputJsonValue
+    }
+  });
+  return { ok: true as const, providerReference: result.reference, reference: transaction.reference };
+}

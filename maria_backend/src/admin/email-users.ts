@@ -12,7 +12,13 @@ const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 const ALLOWED_MIME_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg']);
 
 type UserOption = { id: string; fullName: string; email: string };
-type UploadedFile = { filepath?: string; originalFilename?: string | null; mimetype?: string | null; size?: number };
+// AdminJS mounts express-formidable with Formidable 1.x, whose File fields are
+// `path/name/type`. Accept newer Formidable aliases too, so uploads work across
+// either parser shape and never silently fall through as an email without a file.
+type UploadedFile = {
+  path?: string | null; name?: string | null; type?: string | null;
+  filepath?: string; originalFilename?: string | null; mimetype?: string | null; size?: number;
+};
 
 function escape(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
@@ -71,13 +77,15 @@ export function registerEmailUsersRoutes(router: Router) {
 
     let attachment: { filename: string; content: string } | undefined;
     const file = uploadedFile(req);
-    if (file?.filepath) {
-      const name = file.originalFilename || 'attachment';
-      const mime = file.mimetype || '';
+    if (file) {
+      const filePath = file.filepath || file.path;
+      const name = file.originalFilename || file.name || 'attachment';
+      const mime = file.mimetype || file.type || '';
+      if (!filePath) return res.status(400).type('html').send(page(await listRecipientOptions(), 'The attachment could not be read. Please upload it again.', mode, selectedUser));
       if (!ALLOWED_MIME_TYPES.has(mime) || !file.size || file.size > MAX_ATTACHMENT_BYTES) {
         return res.status(400).type('html').send(page(await listRecipientOptions(), 'Attachment must be a PDF, PNG, or JPG no larger than 5 MB.', mode, selectedUser));
       }
-      const bytes = await readFile(file.filepath);
+      const bytes = await readFile(filePath);
       const validSignature = mime === 'application/pdf'
         ? bytes.subarray(0, 5).toString('ascii') === '%PDF-'
         : mime === 'image/png'
