@@ -134,7 +134,7 @@ export class KtechService {
     return this.postSlip('/verification/nin/by-nin', { nin, tier }, idempotencyKey);
   }
 
-  async ninByPhone(phone: string, tier: Exclude<TechhubSlipTier, 'vnin'>, idempotencyKey: string) {
+  async ninByPhone(phone: string, tier: TechhubSlipTier, idempotencyKey: string) {
     return this.postSlip('/verification/nin/by-phone', { phone, tier }, idempotencyKey);
   }
 

@@ -48,9 +48,9 @@ const VERIFICATION_PROVIDER_GROUPS: Array<{
   fixedProvider?: IdentityProvider;
 }> = [
   { key: 'nin_by_nin', label: 'NIN slips by NIN', services: ['NIN_SLIP_PREMIUM', 'NIN_SLIP_STANDARD', 'NIN_SLIP_REGULAR', 'NIN_SLIP_VNIN'], providers: ['techhub', 'ktech', 'hubbu'] },
-  { key: 'nin_by_phone', label: 'NIN slips by phone', services: ['NIN_PHONE_SLIP_PREMIUM', 'NIN_PHONE_SLIP_STANDARD', 'NIN_PHONE_SLIP_REGULAR'], providers: ['techhub', 'ktech', 'hubbu'] },
-  { key: 'nin_phone_vnin', label: 'NIN V-NIN slip by phone', services: ['NIN_PHONE_SLIP_VNIN'], providers: ['hubbu'], fixedProvider: 'hubbu' },
-  { key: 'nin_personal_info', label: 'NIN Personal Information slips', services: ['NIN_SLIP_INFORMATION', 'NIN_PHONE_SLIP_INFORMATION'], providers: ['ktech'], fixedProvider: 'ktech' },
+  { key: 'nin_by_phone', label: 'NIN slips by phone (Regular / Standard / Premium)', services: ['NIN_PHONE_SLIP_PREMIUM', 'NIN_PHONE_SLIP_STANDARD', 'NIN_PHONE_SLIP_REGULAR'], providers: ['hubbu', 'ktech'] },
+  { key: 'nin_phone_vnin', label: 'NIN V-NIN slip by phone', services: ['NIN_PHONE_SLIP_VNIN'], providers: ['hubbu', 'ktech'] },
+  { key: 'nin_personal_info', label: 'NIN Personal Information slips', services: ['NIN_SLIP_INFORMATION', 'NIN_PHONE_SLIP_INFORMATION'], providers: ['ktech'] },
   { key: 'nin_demographic', label: 'NIN by demography', services: ['NIN_DEMOGRAPHIC'], providers: ['techhub', 'hubbu'] },
   { key: 'bvn_slips', label: 'BVN slips', services: ['BVN_SLIP_PREMIUM', 'BVN_SLIP_STANDARD'], providers: ['techhub', 'ktech', 'hubbu'] },
   { key: 'nin_async', label: 'NIN validation and async services', services: [
@@ -397,14 +397,13 @@ function renderPage(params: {
       label = `BVN Modification — ${enrollment} — ${modificationType}`;
     }
     const sellingPrice = row.sellingPriceKobo === null ? '' : (Number(row.sellingPriceKobo) / 100).toFixed(2);
-    const infoOnly = row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION';
-    const currentProvider = infoOnly ? 'ktech' : row.service === 'NIN_PHONE_SLIP_VNIN' ? 'hubbu' : row.provider as IdentityProvider;
+    const currentProvider = row.provider as IdentityProvider;
     return `<tr><td><input type="checkbox" name="serviceIds" value="${escape(row.id)}" aria-label="Select ${escape(label)}"></td><td>${escape(label)}<br><small>${escape(row.service)}</small></td><td>${escape(PROVIDER_LABEL[currentProvider] ?? currentProvider)}<br><small>Current provider cost ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}</small></td><td><input class="price-input" type="number" name="price_${escape(row.id)}" min="0" step="0.01" value="${sellingPrice}" placeholder="Use cost: ₦${(Number(row.providerCostKobo) / 100).toFixed(2)}"></td><td>${row.isActive ? 'Active' : 'Inactive'}</td></tr>`;
   }).join('');
 
   const verificationProviderRows = VERIFICATION_PROVIDER_GROUPS.map((group) => {
     const groupRows = servicePrices.filter((row) => group.services.includes(row.service));
-    const currentProviders = [...new Set(groupRows.map((row) => row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : row.service === 'NIN_PHONE_SLIP_VNIN' ? 'hubbu' : row.provider))];
+    const currentProviders = [...new Set(groupRows.map((row) => row.provider))];
     const current = group.fixedProvider ?? (currentProviders.length === 1 ? currentProviders[0] : 'mixed');
     const serviceList = group.services.map((service) => groupRows.find((row) => row.service === service)?.label ?? service).join(', ');
     const providerControl = group.fixedProvider

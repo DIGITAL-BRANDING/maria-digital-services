@@ -22,7 +22,6 @@ import { flagPendingReconciliation } from './provider-reconciliation.service.js'
 
 type IdentityProvider = 'techhub' | 'ktech' | 'hubbu';
 async function providerForService(service: VerificationServiceKey): Promise<IdentityProvider> {
-  if (service === 'NIN_SLIP_INFORMATION' || service === 'NIN_PHONE_SLIP_INFORMATION') return 'ktech';
   const row = await getOrCreateVerificationPricingRow(service);
   const value = row.provider.toLowerCase();
   return value === 'hubbu' || value === 'ktech' ? value : 'techhub';
@@ -193,7 +192,7 @@ export async function listVerificationPrices() {
     service: row.service,
     label: row.label,
     unitPrice: koboToNaira(row.sellingPriceKobo ?? row.providerCostKobo),
-    provider: row.service === 'NIN_SLIP_INFORMATION' || row.service === 'NIN_PHONE_SLIP_INFORMATION' ? 'ktech' : row.provider,
+    provider: row.provider,
     isActive: row.isActive
   }));
 }
@@ -581,10 +580,10 @@ const BVN_SLIP_SERVICE_BY_TIER: Record<TechhubBvnTier, VerificationServiceKey> =
 };
 
 export async function purchaseNinByNin(params: { userId: string; nin: string; tier: KtechNinSlipTier; idempotencyKey?: string; background?: boolean }) {
-  // K-Tech supports the information tier on its NIN-by-NIN endpoint. Keep
-  // this slip separate from demographic lookup, which has its own form/API.
-  if (params.tier === 'information') ktechService.assertConfigured();
-  const provider: IdentityProvider = params.tier === 'information' ? 'ktech' : await providerForService(NIN_SLIP_SERVICE_BY_TIER[params.tier]);
+  // Personal Information uses its dedicated K-Tech endpoint; its provider is
+  // selected in the same admin routing table as the other NIN-by-NIN slips.
+  const provider: IdentityProvider = await providerForService(NIN_SLIP_SERVICE_BY_TIER[params.tier]);
+  if (provider === 'ktech') ktechService.assertConfigured();
   if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
@@ -615,11 +614,8 @@ export async function purchaseNinByPhone(params: {
 }) {
   const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
-  if (params.tier === 'information') ktechService.assertConfigured();
+  if (provider === 'ktech') ktechService.assertConfigured();
   else if (provider === 'hubbu') hubbuService.assertConfigured();
-  if (params.tier === 'vnin' && provider !== 'hubbu') {
-    throw new ApiError(422, 'VNIN slip by phone is only available through Hubbu.', 'PROVIDER_SERVICE_UNSUPPORTED');
-  }
   return purchaseSlip({
     userId: params.userId,
     service,
@@ -633,13 +629,13 @@ export async function purchaseNinByPhone(params: {
     call: (reference) =>
       params.tier === 'information'
         ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
-        : params.tier === 'vnin'
-        ? hubbuService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'ktech'
         ? ktechService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'hubbu'
         ? hubbuService.ninByPhone(params.phone, params.tier, reference)
-          : techhubService.ninByPhone(params.phone, params.tier)
+          : params.tier === 'vnin'
+            ? Promise.resolve({ ok: false, ambiguous: false, message: 'Techhub does not support VNIN by phone.', raw: null })
+            : techhubService.ninByPhone(params.phone, params.tier)
   });
 }
 
