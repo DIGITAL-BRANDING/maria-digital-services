@@ -256,18 +256,18 @@ export async function sendAdminComposedEmailBatch(params: { recipients: string[]
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
-      const { data, error, errors } = await resend.batch.send(emails, { batchValidation: 'permissive' });
-      if (error) {
-        const status = (error as { statusCode?: number }).statusCode;
+      const response = await resend.batch.send(emails, { batchValidation: 'permissive' });
+      if (response.error) {
+        const status = response.error.statusCode ?? undefined;
         if (status === 429 && attempt < 4) {
           await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
           continue;
         }
-        console.error('[email] Resend rejected an admin email batch', { status, message: error.message });
+        console.error('[email] Resend rejected an admin email batch', { status, message: response.error.message });
         return { sent: 0, failed: params.recipients.length };
       }
-      const sent = data?.length ?? 0;
-      const failed = errors?.length ?? Math.max(0, params.recipients.length - sent);
+      const sent = response.data.data.length;
+      const failed = response.data.errors?.length ?? Math.max(0, params.recipients.length - sent);
       if (failed) console.error('[email] Some messages in an admin batch were rejected', { sent, failed });
       return { sent, failed };
     } catch (error) {
