@@ -215,12 +215,13 @@ export function sendTicketProcessingEmail(params: { to: string; name: string; se
   });
 }
 
-export function sendAdminComposedEmail(params: { to: string; subject: string; message: string }) {
+export function sendAdminComposedEmail(params: { to: string; subject: string; message: string; attachment?: { filename: string; content: string } }) {
   const safeMessage = escapeHtml(params.message).replace(/\r?\n/g, '<br>');
   return sendPlatformEmail({
     to: params.to,
     subject: params.subject,
     text: params.message,
-    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><div style="white-space:normal;line-height:1.6">${safeMessage}</div><p style="margin-top:24px;color:#64748b">MARIA Digital Solutions</p></div>`
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><div style="white-space:normal;line-height:1.6">${safeMessage}</div><p style="margin-top:24px;color:#64748b">MARIA Digital Solutions</p></div>`,
+    ...(params.attachment ? { attachments: [{ filename: params.attachment.filename, content: params.attachment.content }] } : {})
   });
 }
