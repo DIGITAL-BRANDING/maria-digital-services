@@ -39,6 +39,7 @@ import { registerUserDeliveryRoutes } from './user-deliveries.js';
 import { registerSupportInboxRoutes } from './support-inbox.js';
 import { registerPendingSummaryRoutes } from './pending-summary.js';
 import { registerEmailUsersRoutes } from './email-users.js';
+import { registerManualProviderDispatchRoutes } from './manual-provider-dispatch.js';
 import { majorDataLinkWebhookEventResource } from './resources/major-data-link-webhook-event.resource.js';
 
 AdminJS.registerAdapter({ Database, Resource });
@@ -182,6 +183,7 @@ export async function buildAdminRouter() {
   registerSupportInboxRoutes(router);
   registerPendingSummaryRoutes(router);
   registerEmailUsersRoutes(router);
+  registerManualProviderDispatchRoutes(router);
 
   return { admin, router };
 }

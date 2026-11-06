@@ -11,6 +11,7 @@ import { recordProviderDebit } from './provider-ledger.service.js';
 import { createUserDelivery, createUserDeliveryLink } from './user-delivery.service.js';
 import {
   techhubService,
+  type TechhubAsyncSubmitResult,
   type TechhubBvnTier,
   type TechhubSlipTier,
   type TechhubSlipResult
@@ -830,7 +831,7 @@ async function checkAsyncServiceStatus(params: {
     };
   }
 
-  const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+  const provider = transaction.provider === 'ktech' || transaction.provider === 'ktech_dispatching' ? 'ktech' : 'techhub';
   // Manual requests at K-Tech receive a MANUAL-* tracking ticket; there is no
   // upstream provider ticket to poll. Their terminal result arrives by webhook.
   if (provider === 'ktech' && params.ticketId.startsWith('MANUAL-')) {
@@ -925,7 +926,7 @@ async function settleAsyncTransaction(
   transaction: Prisma.TransactionGetPayload<Record<string, never>>,
   result: AsyncOutcome
 ): Promise<AsyncStatusResult> {
-  const provider = transaction.provider === 'ktech' ? 'ktech' : 'techhub';
+  const provider = transaction.provider === 'ktech' || transaction.provider === 'ktech_dispatching' ? 'ktech' : 'techhub';
   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
 
   if (transaction.status !== TransactionStatus.PENDING) {
@@ -952,8 +953,10 @@ async function settleAsyncTransaction(
       where: { id: transaction.id },
       data: {
         status: TransactionStatus.SUCCESS,
+        ...(transaction.provider === 'ktech_dispatching' ? { provider: 'ktech', providerRef: result.ticketId } : {}),
         metadata: {
           ...existingMetadata,
+          ...(transaction.provider === 'ktech_dispatching' ? { ticket_id: result.ticketId } : {}),
           pii: mergeSealedPII(existingMetadata.pii, { response: result.response, check_raw: result.raw })
         } as Prisma.InputJsonValue
       }
@@ -999,8 +1002,10 @@ async function settleAsyncTransaction(
     where: { id: transaction.id },
     data: {
       status: TransactionStatus.FAILED,
+        ...(transaction.provider === 'ktech_dispatching' ? { provider: 'ktech', providerRef: result.ticketId } : {}),
       metadata: {
         ...existingMetadata,
+          ...(transaction.provider === 'ktech_dispatching' ? { ticket_id: result.ticketId } : {}),
         pii: mergeSealedPII(existingMetadata.pii, { response: result.response, check_raw: result.raw })
       } as Prisma.InputJsonValue
     }
@@ -1057,7 +1062,7 @@ export async function settleKtechTicket(params: {
       // was labelled Techhub; MDL callbacks identify the same stored ticket.
       // Accept both provider labels, while still requiring an identity request
       // and an exact ticket/reference match.
-      provider: { in: ['ktech', 'techhub'] },
+      provider: { in: ['ktech', 'techhub', 'ktech_dispatching'] },
       type: TransactionType.IDENTITY_SERVICE_REQUEST,
       OR: identifiers
     }
@@ -1433,4 +1438,112 @@ export async function listServiceTickets(userId: string, services: string | stri
 export function decryptTransactionPII(metadata: unknown): Record<string, unknown> | null {
   const parsed = metadata as Record<string, unknown> | null;
   return openPII(parsed?.pii);
+}
+
+const MANUALLY_DISPATCHABLE_KTECH_SERVICES = new Set<string>([
+  'NIN_VALIDATION_GENERAL',
+  'NIN_VALIDATION_NO_RECORD',
+  'NIN_VALIDATION_SIM',
+  'NIN_VALIDATION_BANK',
+  'NIN_VALIDATION_UPDATE_RECORDS',
+  'NIN_VALIDATION_MODIFICATION',
+  'NIN_VALIDATION_PHOTO_ERROR',
+  'NIN_VALIDATION_VNIN',
+  'NIN_PERSONALIZATION',
+  'IPE_CLEARANCE'
+]);
+
+/**
+ * Manually route an existing, already-debited async ticket to K-Tech when no
+ * provider/ticket was recorded at initial submission. Reuses the transaction
+ * reference as K-Tech's idempotency key so retries cannot create duplicate
+ * provider jobs or charge the user again.
+ */
+export async function manuallyDispatchPendingTicketToKtech(transactionId: string) {
+  const transaction = await prisma.transaction.findUnique({ where: { id: transactionId } });
+  if (!transaction || transaction.type !== TransactionType.IDENTITY_SERVICE_REQUEST) {
+    return { ok: false as const, message: 'This is not a supported identity ticket.' };
+  }
+  if (transaction.status !== TransactionStatus.PENDING || transaction.provider !== null || transaction.providerRef !== null) {
+    return { ok: false as const, message: 'This request is no longer available for manual dispatch.' };
+  }
+
+  const metadata = transaction.metadata as Record<string, unknown> | null;
+  const service = typeof metadata?.service === 'string' ? metadata.service : '';
+  if (!MANUALLY_DISPATCHABLE_KTECH_SERVICES.has(service)) {
+    return { ok: false as const, message: 'K-Tech dispatch is not supported for this service.' };
+  }
+  const pii = decryptTransactionPII(metadata);
+  if (!pii) return { ok: false as const, message: 'The encrypted request details could not be read.' };
+
+  const validationType = typeof metadata?.validation_type === 'string' ? metadata.validation_type : undefined;
+  const nin = typeof pii.nin === 'string' ? pii.nin : undefined;
+  const trackingId = typeof pii.tracking_id === 'string' ? pii.tracking_id : undefined;
+  if (service.startsWith('NIN_VALIDATION_') && !nin) {
+    return { ok: false as const, message: 'The NIN is missing from this request.' };
+  }
+  if ((service === 'NIN_PERSONALIZATION' || service === 'IPE_CLEARANCE') && !trackingId) {
+    return { ok: false as const, message: 'The tracking ID is missing from this request.' };
+  }
+
+  try {
+    ktechService.assertConfigured();
+  } catch {
+    return { ok: false as const, message: 'K-Tech is not configured. Check the KTECH_API_KEY setting.' };
+  }
+
+  const claimed = await prisma.transaction.updateMany({
+    where: { id: transaction.id, status: TransactionStatus.PENDING, provider: null, providerRef: null },
+    data: { provider: 'ktech_dispatching' }
+  });
+  if (claimed.count !== 1) return { ok: false as const, message: 'Another admin has already picked up this request.' };
+
+  let result: TechhubAsyncSubmitResult;
+  try {
+    result = service.startsWith('NIN_VALIDATION_')
+      ? await ktechService.submitNinValidation(nin!, validationType, transaction.reference)
+      : service === 'NIN_PERSONALIZATION'
+        ? await ktechService.submitPersonalization(trackingId!, transaction.reference)
+        : await ktechService.submitIpeClearance(trackingId!, transaction.reference);
+  } catch (error) {
+    result = { ok: false, message: error instanceof Error ? error.message : 'K-Tech dispatch failed.', raw: null };
+  }
+
+  if (!result.ok || !result.ticketId) {
+    const attempt = {
+      provider: 'ktech',
+      attempted_at: new Date().toISOString(),
+      error: result.message || 'K-Tech did not return a ticket ID.'
+    };
+    await prisma.transaction.updateMany({
+      where: { id: transaction.id, provider: 'ktech_dispatching', status: TransactionStatus.PENDING },
+      data: {
+        provider: null,
+        metadata: { ...metadata, manual_provider_dispatch: attempt } as Prisma.InputJsonValue
+      }
+    });
+    const completedByWebhook = await prisma.transaction.findUnique({ where: { id: transaction.id } });
+    if (completedByWebhook?.provider === 'ktech' && completedByWebhook.providerRef) {
+      return { ok: true as const, ticketId: completedByWebhook.providerRef, reference: transaction.reference };
+    }
+    return { ok: false as const, message: attempt.error };
+  }
+
+  const dispatchedAt = new Date().toISOString();
+  await prisma.transaction.updateMany({
+    where: { id: transaction.id, provider: 'ktech_dispatching', status: TransactionStatus.PENDING },
+    data: {
+      provider: 'ktech',
+      providerRef: result.ticketId,
+      metadata: {
+        ...metadata,
+        provider: 'ktech',
+        ticket_id: result.ticketId,
+        manual_provider_dispatch: { provider: 'ktech', attempted_at: dispatchedAt, dispatched_at: dispatchedAt },
+        pii: mergeSealedPII(metadata?.pii, { submit_raw: result.raw })
+      } as Prisma.InputJsonValue
+    }
+  });
+  void emailTicketSubmitted(transaction.id);
+  return { ok: true as const, ticketId: result.ticketId, reference: transaction.reference };
 }

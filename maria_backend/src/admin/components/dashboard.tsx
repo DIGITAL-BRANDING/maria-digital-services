@@ -126,6 +126,12 @@ const quickLinks: QuickLink[] = [
     icon: 'AlertTriangle'
   },
   {
+    label: 'Manual Provider Dispatch',
+    description: 'Send eligible unassigned async requests to K-Tech',
+    href: `${ADMIN_ROOT_PATH}/manual-provider-dispatch`,
+    icon: 'Send'
+  },
+  {
     label: 'Data Plan Pricing',
     description: 'Set prices for data plans',
     resourceId: 'DataPlanPricing',
