@@ -1,7 +1,7 @@
 import { Prisma, TransactionStatus, TransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { koboToNaira } from '../lib/money.js';
-import { sendTicketSubmittedEmails, sendTicketProcessingEmail } from '../lib/email.js';
+import { sendTicketSubmittedEmails, sendTicketProcessingEmail, sendTicketCompletedEmails } from '../lib/email.js';
 
 export const EMAIL_TICKET_TYPES = new Set<TransactionType>([
   TransactionType.IDENTITY_SERVICE_REQUEST,
@@ -66,5 +66,32 @@ export async function emailTicketProcessing(transactionId: string) {
   } catch (error) {
     console.error('[email] Could not send ticket-processing email', { transactionId, error });
     return { sent: false, reason: 'Email could not be sent' };
+  }
+}
+
+export async function emailTicketCompleted(transactionId: string, deliveryReady: boolean) {
+  try {
+    const transaction = await prisma.transaction.findUnique({
+      where: { id: transactionId },
+      include: { user: { select: { email: true, fullName: true } } }
+    });
+    if (!transaction || transaction.status !== TransactionStatus.SUCCESS || !EMAIL_TICKET_TYPES.has(transaction.type)) return;
+    const metadata = transaction.metadata as Record<string, unknown> | null;
+    if (metadata?.completion_email_sent_at) return;
+    const result = await sendTicketCompletedEmails({
+      to: transaction.user.email,
+      name: transaction.user.fullName,
+      service: serviceLabel(metadata?.service, transaction.description),
+      reference: transaction.reference,
+      provider: transaction.provider === 'ktech' || transaction.provider === 'ktech_dispatching' ? 'K-Tech' : 'Techhub',
+      deliveryReady
+    });
+    if (!result.userSent && !result.adminSent) return;
+    await prisma.transaction.update({
+      where: { id: transaction.id },
+      data: { metadata: { ...metadata, completion_email_sent_at: new Date().toISOString(), completion_email_user_sent: result.userSent, completion_email_admin_sent: result.adminSent } as Prisma.InputJsonValue }
+    });
+  } catch (error) {
+    console.error('[email] Could not send async completion emails', { transactionId, error });
   }
 }

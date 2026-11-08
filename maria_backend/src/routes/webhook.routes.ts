@@ -333,12 +333,21 @@ webhookRoutes.post('/ktech', async (req, res) => {
   }
 
   try {
-    const nestedResponse = data.response && typeof data.response === 'object' && !Array.isArray(data.response)
-      ? data.response
-      : data.result && typeof data.result === 'object' && !Array.isArray(data.result)
-        ? data.result
-        : {};
-    const response = { ...data, ...(nestedResponse as Record<string, unknown>) };
+    const nestedCandidate = data.response ?? data.result ?? data.output ?? data.file ?? data.document;
+    let nestedResponse: Record<string, unknown> = {};
+    if (nestedCandidate && typeof nestedCandidate === 'object' && !Array.isArray(nestedCandidate)) {
+      nestedResponse = nestedCandidate as Record<string, unknown>;
+    } else if (typeof nestedCandidate === 'string') {
+      try {
+        const parsed: unknown = JSON.parse(nestedCandidate);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) nestedResponse = parsed as Record<string, unknown>;
+        else nestedResponse = { result: nestedCandidate };
+      } catch {
+        // Some completion callbacks carry a single URL or base64 data URI.
+        nestedResponse = /^https?:\/\//i.test(nestedCandidate) ? { download_url: nestedCandidate } : { file: nestedCandidate };
+      }
+    }
+    const response = { ...data, ...nestedResponse };
     const result = await settleKtechTicket({
       ...(typeof ticketId === 'string' ? { ticketId } : {}),
       ...(typeof reference === 'string' ? { reference } : {}),

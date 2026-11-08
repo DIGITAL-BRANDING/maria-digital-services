@@ -7,6 +7,7 @@ import { ApiError } from '../middleware/error.js';
 import { debitWallet, refundWallet } from './wallet.service.js';
 import { notifyUser } from './notification.service.js';
 import { emailTicketSubmitted } from './service-ticket-email.service.js';
+import { emailTicketCompleted } from './service-ticket-email.service.js';
 import { recordProviderDebit } from './provider-ledger.service.js';
 import { createUserDelivery, createUserDeliveryLink } from './user-delivery.service.js';
 import {
@@ -857,6 +858,38 @@ function findResponseValue(value: unknown, names: string[]): string | undefined 
   return undefined;
 }
 
+function findFilePayload(value: unknown): { base64?: string; fileName?: string; mimeType?: string } | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const fileKeys = Object.keys(obj).filter((key) => /^(file|document|pdf|result_file|output_file|attachment)$/i.test(key));
+  for (const key of fileKeys) {
+    const candidate = obj[key];
+    if (typeof candidate === 'string' && candidate.trim()) {
+      const raw = candidate.trim();
+      if (/^data:[^;]+;base64,/i.test(raw) || /^[A-Za-z0-9+/\s]+=*$/.test(raw)) {
+        return { base64: raw, fileName: findResponseValue(obj, ['file_name', 'filename', 'name']), mimeType: findResponseValue(obj, ['mime_type', 'content_type', 'mimetype']) };
+      }
+    }
+    if (candidate && typeof candidate === 'object') {
+      const section = candidate as Record<string, unknown>;
+      const encoded = [section.pdf_base64, section.file_base64, section.document_base64, section.base64, section.content, section.data]
+        .find((item): item is string => typeof item === 'string' && item.trim().length > 0);
+      if (encoded) return {
+        base64: encoded,
+        fileName: findResponseValue(section, ['file_name', 'filename', 'name']),
+        mimeType: findResponseValue(section, ['mime_type', 'content_type', 'mimetype'])
+      };
+      const nested = findFilePayload(candidate);
+      if (nested) return nested;
+    }
+  }
+  for (const item of Object.values(obj)) {
+    const nested = findFilePayload(item);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
 async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Record<string, never>>, response: Record<string, unknown> | null) {
   if (!response) return null;
   const message = findResponseValue(response, ['message', 'description', 'note', 'remarks']);
@@ -864,11 +897,13 @@ async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Reco
   // Do not treat an arbitrary `base64` field as the delivered document: identity
   // responses can include a photo in base64 alongside the actual PDF. Accept
   // explicit file/document fields from K-Tech and the other async providers.
-  const base64 = findResponseValue(response, [
+  let base64 = findResponseValue(response, [
     'pdf_base64', 'certificate_pdf_base64', 'attestation_pdf_base64',
     'publication_pdf_base64', 'submission_pdf_base64', 'file_base64',
     'document_base64', 'base64_data', 'file_data', 'result_pdf_base64', 'report_base64'
   ]);
+  const filePayload = findFilePayload(response);
+  base64 ??= filePayload?.base64;
   if (!url && !base64) {
     // Logs key names only, never values, so the next provider response shape is visible.
     console.info('[async-delivery] provider returned no result file', { reference: transaction.reference, keys: Object.keys(response).join(',') });
@@ -884,14 +919,15 @@ async function deliverAsyncResult(transaction: Prisma.TransactionGetPayload<Reco
   const service = String(metadata?.service ?? 'Identity service').replaceAll('_', ' ');
   const title = `${service} result`;
   const description = message?.slice(0, 2000) || 'Your completed result is ready to download.';
-  const fileName = findResponseValue(response, ['file_name', 'filename', 'name']) || `${transaction.reference}.pdf`;
+  const fileName = filePayload?.fileName || findResponseValue(response, ['file_name', 'filename']) || `${transaction.reference}.pdf`;
   if (url) {
     const delivery = await createUserDeliveryLink({ userId: transaction.userId, adminId: admin.id, title, description, fileName, mimeType: findResponseValue(response, ['mime_type', 'content_type']) || 'application/pdf', url, reference: transaction.reference });
     return { id: delivery.id, created: true };
   }
   const dataUriMime = base64?.match(/^data:([^;]+);base64,/)?.[1];
-  const mimeType = dataUriMime || findResponseValue(response, ['mime_type', 'content_type']) || 'application/pdf';
-  const delivery = await createUserDelivery({ userId: transaction.userId, adminId: admin.id, title, description, fileName, mimeType, base64: base64!, reference: transaction.reference });
+  const mimeType = dataUriMime || filePayload?.mimeType || findResponseValue(response, ['mime_type', 'content_type', 'mimetype']) || 'application/pdf';
+  const encoded = base64!.replace(/^data:[^;]+;base64,/i, '').replace(/\s+/g, '');
+  const delivery = await createUserDelivery({ userId: transaction.userId, adminId: admin.id, title, description, fileName, mimeType, base64: encoded, reference: transaction.reference });
   return { id: delivery.id, created: true };
 }
 
@@ -933,6 +969,7 @@ async function settleAsyncTransaction(
       const saved = openPII<{ response?: Record<string, unknown> | null }>(sealed)?.response ?? result.response;
       const delivery = await deliverAsyncResult(transaction, saved);
       if (delivery?.created) await notifyAsyncResult(transaction, 'success', saved, delivery.id);
+      await emailTicketCompleted(transaction.id, Boolean(delivery));
     }
     return {
       ticketId: result.ticketId,
@@ -975,6 +1012,7 @@ async function settleAsyncTransaction(
 
     const delivery = await deliverAsyncResult(transaction, result.response);
     await notifyAsyncResult(transaction, 'success', result.response, delivery?.id);
+    await emailTicketCompleted(transaction.id, Boolean(delivery));
 
     return { ticketId: result.ticketId, status: 'success', response: result.response };
   }

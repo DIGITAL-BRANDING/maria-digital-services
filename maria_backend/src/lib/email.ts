@@ -228,6 +228,26 @@ export function sendTicketProcessingEmail(params: { to: string; name: string; se
   });
 }
 
+export async function sendTicketCompletedEmails(params: { to: string; name: string; service: string; reference: string; provider: string; deliveryReady: boolean }) {
+  const safe = { name: escapeHtml(params.name), service: escapeHtml(params.service), reference: escapeHtml(params.reference) };
+  const deliveryText = params.deliveryReady ? 'Your result file is ready in My Deliveries.' : 'The request is complete. If a file is part of the result, it will appear in My Deliveries once available.';
+  const userMail = await sendPlatformEmail({
+    to: params.to,
+    subject: `Your ${params.service} request is complete`,
+    text: `Hello ${params.name}, your ${params.service} request (${params.reference}) is complete. ${deliveryText}`,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>Request completed</h2><p>Hello ${safe.name}, your <b>${safe.service}</b> request is complete.</p><p>Reference: <b>${safe.reference}</b></p><p>${escapeHtml(deliveryText)}</p></div>`
+  });
+  const adminTo = env.ADMIN_NOTIFICATION_EMAIL || env.ALERT_EMAIL;
+  const adminMail = adminTo ? await sendPlatformEmail({
+    to: adminTo,
+    subject: `${params.provider} result received: ${params.service}`,
+    text: `${params.provider} sent a completion result for a user request. Service: ${params.service}. User: ${params.name} (${params.to}). Reference: ${params.reference}. File attached to user delivery: ${params.deliveryReady ? 'yes' : 'no'}.`,
+    html: `<div style="font:16px Arial,sans-serif;max-width:600px;margin:auto;color:#172554"><h2>${escapeHtml(params.provider)} result received</h2><p>Service: <b>${safe.service}</b><br>User: ${safe.name} (${escapeHtml(params.to)})<br>Reference: <b>${safe.reference}</b><br>User delivery file: <b>${params.deliveryReady ? 'ready' : 'not included'}</b></p></div>`
+  }) : { sent: false };
+  if (!adminTo) console.warn('[email] ADMIN_NOTIFICATION_EMAIL and ALERT_EMAIL are not set; no async completion alert was sent');
+  return { userSent: userMail.sent, adminSent: adminMail.sent };
+}
+
 export function sendAdminComposedEmail(params: { to: string; subject: string; message: string; attachment?: { filename: string; content: string } }) {
   const safeMessage = escapeHtml(params.message).replace(/\r?\n/g, '<br>');
   return sendPlatformEmail({
