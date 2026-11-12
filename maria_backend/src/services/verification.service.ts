@@ -8,7 +8,8 @@ import { debitWallet, refundWallet } from './wallet.service.js';
 import { notifyUser } from './notification.service.js';
 import { emailTicketSubmitted } from './service-ticket-email.service.js';
 import { emailTicketCompleted } from './service-ticket-email.service.js';
-import { recordProviderDebit } from './provider-ledger.service.js';
+import { recordProviderDebit, recordProviderRefundCredit } from './provider-ledger.service.js';
+import { providerSignalsRefund } from '../lib/provider-refund.js';
 import { createUserDelivery, createUserDeliveryLink } from './user-delivery.service.js';
 import {
   techhubService,
@@ -814,11 +815,22 @@ async function checkAsyncServiceStatus(params: {
   // moment refundWallet() has credited the customer. Leaving it out meant the next
   // poll called the provider again, wrote `FAILED` back over `REVERSED`, and tried
   // to refund a second time.
-  if (
+  //
+  // One exception: an IPE ticket that failed is closed as FAILED *without* a refund
+  // (non-refundable). If the provider later refunds it anyway, the only way we find
+  // out by polling is to ask the provider again, so that one state is re-checked.
+  // It stays cheap and quiet: unless the provider reports an actual refund,
+  // settleAsyncTransaction() changes nothing and sends no notification.
+  const closedService = (transaction.metadata as { service?: VerificationServiceKey } | null)?.service;
+  const awaitingPossibleProviderRefund =
+    transaction.status === TransactionStatus.FAILED && closedService === 'IPE_CLEARANCE';
+  const isClosed =
     transaction.status === TransactionStatus.SUCCESS ||
     transaction.status === TransactionStatus.FAILED ||
-    transaction.status === TransactionStatus.REVERSED
-  ) {
+    transaction.status === TransactionStatus.REVERSED;
+
+  // What we already have stored for a ticket that is closed on our side.
+  const storedResult = (): AsyncStatusResult => {
     const metadata = transaction.metadata as Record<string, unknown> | null;
     const pii = openPII<{ response?: Record<string, unknown> | null }>(metadata?.pii);
     return {
@@ -826,15 +838,31 @@ async function checkAsyncServiceStatus(params: {
       status: transaction.status === TransactionStatus.SUCCESS ? 'success' : 'failed',
       response: pii?.response ?? null
     };
-  }
+  };
+
+  if (isClosed && !awaitingPossibleProviderRefund) return storedResult();
 
   const provider = transaction.provider === 'ktech' || transaction.provider === 'ktech_dispatching' ? 'ktech' : 'techhub';
   // Manual requests at K-Tech receive a MANUAL-* tracking ticket; there is no
   // upstream provider ticket to poll. Their terminal result arrives by webhook.
   if (provider === 'ktech' && params.ticketId.startsWith('MANUAL-')) {
-    return { ticketId: params.ticketId, status: 'pending', response: null };
+    return isClosed ? storedResult() : { ticketId: params.ticketId, status: 'pending', response: null };
   }
-  const result = await params.call(params.ticketId, provider);
+
+  let result: Awaited<ReturnType<typeof params.call>>;
+  try {
+    result = await params.call(params.ticketId, provider);
+  } catch (error) {
+    // The extra re-check of a failed IPE ticket is best-effort: it must never turn
+    // a ticket we can already answer from our own DB into an error just because the
+    // provider is unreachable right now. (For a genuinely pending ticket the error
+    // still propagates exactly as before.)
+    if (awaitingPossibleProviderRefund) {
+      console.warn('[async-status] could not re-check failed IPE ticket for a provider refund', params.ticketId, error);
+      return storedResult();
+    }
+    throw error;
+  }
   return settleAsyncTransaction(transaction, result);
 }
 
@@ -956,10 +984,24 @@ async function notifyAsyncResult(transaction: Prisma.TransactionGetPayload<Recor
  */
 async function settleAsyncTransaction(
   transaction: Prisma.TransactionGetPayload<Record<string, never>>,
-  result: AsyncOutcome
+  incoming: AsyncOutcome
 ): Promise<AsyncStatusResult> {
   const provider = transaction.provider === 'ktech' || transaction.provider === 'ktech_dispatching' ? 'ktech' : 'techhub';
   const existingMetadata = (transaction.metadata as Record<string, unknown> | null) ?? {};
+
+  // The provider itself handed the money back (status "refunded"/"reversed", or a
+  // *.refunded event). That is different from a plain "failed": it overrides the
+  // IPE no-refund rule below and applies even if we had already closed the ticket
+  // (as FAILED without a refund, or as SUCCESS). A refund always means failed.
+  const refundedByProvider = providerSignalsRefund(incoming.raw, incoming.response);
+  const result: AsyncOutcome = refundedByProvider ? { ...incoming, status: 'failed' } : incoming;
+
+  if (refundedByProvider && transaction.status !== TransactionStatus.PENDING) {
+    if (transaction.status !== TransactionStatus.REVERSED) {
+      await refundAfterProviderRefund(transaction, provider);
+    }
+    return { ticketId: result.ticketId, status: 'failed', response: null };
+  }
 
   if (transaction.status !== TransactionStatus.PENDING) {
     // Recover a delivery if persistence failed after the transaction settled but
@@ -1029,8 +1071,12 @@ async function settleAsyncTransaction(
   // and later resolves to 'failed'; a request that never got a ticket_id in
   // the first place is still refunded in submitAsyncService above, since
   // nothing was actually processed in that case.
+  //
+  // The one thing that lifts the IPE exception is the provider REALLY refunding
+  // (refundedByProvider): then there is no cost left for us to absorb, and
+  // withholding the refund would just keep the customer's money for nothing.
   const service = (existingMetadata as { service?: VerificationServiceKey }).service;
-  const refundable = service !== 'IPE_CLEARANCE';
+  const refundable = service !== 'IPE_CLEARANCE' || refundedByProvider;
 
   await prisma.transaction.update({
     where: { id: transaction.id },
@@ -1060,6 +1106,43 @@ async function settleAsyncTransaction(
     });
   }
   return { ticketId: result.ticketId, status: 'failed', response: result.response };
+}
+
+/**
+ * Refunds the customer for a ticket that was ALREADY closed on our side (FAILED
+ * with no refund - the IPE case - or SUCCESS) when the provider later refunds it.
+ *
+ * refundWallet() is itself idempotent (it atomically claims the REVERSED state),
+ * so a redelivered webhook or a webhook racing a poll cannot pay the customer
+ * twice. The provider-ledger credit is only recorded for a ticket that had been
+ * SUCCESS, because that is the only state in which we had recorded a
+ * PURCHASE_DEBIT to offset - a ticket that failed never produced one.
+ */
+async function refundAfterProviderRefund(
+  transaction: Prisma.TransactionGetPayload<Record<string, never>>,
+  provider: 'techhub' | 'ktech'
+) {
+  const wasSuccess = transaction.status === TransactionStatus.SUCCESS;
+
+  // No intermediate status write: refundWallet() moves the row straight to
+  // REVERSED from any non-REVERSED state, and if it threw after a pre-write the
+  // ticket would be left marked FAILED with the customer still unrefunded.
+  await refundWallet({
+    transactionId: transaction.id,
+    userId: transaction.userId,
+    reason: 'provider refunded this request'
+  });
+
+  if (wasSuccess && transaction.costKobo) {
+    await recordProviderRefundCredit({
+      provider,
+      amountKobo: transaction.costKobo,
+      relatedTransactionId: transaction.id,
+      description: `Provider refund: ${transaction.description}`
+    }).catch((error) => {
+      console.error('[provider-ledger] failed to record provider refund credit for', transaction.id, error);
+    });
+  }
 }
 
 /**

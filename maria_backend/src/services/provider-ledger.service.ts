@@ -88,6 +88,35 @@ export async function recordProviderDebit(params: {
 }
 
 /**
+ * The provider handed back money for a purchase we had ALREADY recorded as a
+ * PURCHASE_DEBIT (a ticket that was SUCCESS and was refunded afterwards). Without
+ * this entry our computed balance would stay lower than the provider's own,
+ * showing up as a permanent variance on the admin Provider Ledger page.
+ *
+ * Uses the existing ADJUSTMENT type (no admin attached - it is system-generated)
+ * rather than a new enum value, so it needs no database migration. Idempotent per
+ * transaction: a redelivered webhook or a repeat poll records it only once.
+ */
+export async function recordProviderRefundCredit(params: {
+  provider: string;
+  amountKobo: bigint;
+  relatedTransactionId: string;
+  description: string;
+}) {
+  if (params.amountKobo <= 0n) return null;
+  const reference = `PROVREFUND-${params.relatedTransactionId}`;
+  const existing = await prisma.providerLedgerEntry.findFirst({
+    where: { provider: params.provider, reference, type: ProviderLedgerEntryType.ADJUSTMENT }
+  });
+  if (existing) return existing;
+  return applyMovement(params.provider, ProviderLedgerEntryType.ADJUSTMENT, params.amountKobo, {
+    relatedTransactionId: params.relatedTransactionId,
+    reference,
+    description: params.description
+  });
+}
+
+/**
  * "Settlement" - an admin recording that we paid the provider to top up our
  * balance with them. Called from the Provider Ledger admin page's "Record
  * Settlement" form (see admin/provider-ledger.ts).

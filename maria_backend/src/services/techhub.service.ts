@@ -113,6 +113,12 @@ export type TechhubAsyncSubmitResult = {
 
 export type TechhubAsyncStatus = 'pending' | 'success' | 'failed';
 
+// Statuses (besides the literal 'failed') that mean Techhub is done with the
+// ticket and did NOT deliver - see the comment in TechhubService.getAsync.
+const TECHHUB_FAILED_STATUSES = new Set([
+  'refunded', 'reversed', 'rejected', 'declined', 'cancelled', 'canceled'
+]);
+
 export type TechhubAsyncStatusResult = {
   ticketId: string;
   status: TechhubAsyncStatus;
@@ -424,7 +430,26 @@ export class TechhubService {
       throw new ApiError(502, data.message ?? `Verification provider returned HTTP ${response.status}`, 'TECHHUB_STATUS_FAILED');
     }
 
-    const status: TechhubAsyncStatus = data.status === 'success' || data.status === 'failed' ? data.status : 'pending';
+    // Previously ANY status other than exactly 'success'/'failed' was 'pending'.
+    // That meant a ticket Techhub marked 'refunded', 'reversed', 'rejected' etc.
+    // stayed "Processing" in our app forever and the customer was never
+    // refunded, even though Techhub had already returned the money. These words
+    // are the same failure vocabulary K-Tech's mapping already uses
+    // (KTECH_FAILED_STATUSES in ktech.service.ts). A status that is still
+    // unrecognised stays pending - never treated as a failure - and is logged so
+    // the real vocabulary can be added from evidence.
+    const rawStatus = typeof data.status === 'string' ? data.status.trim().toLowerCase() : '';
+    let status: TechhubAsyncStatus;
+    if (rawStatus === 'success') {
+      status = 'success';
+    } else if (rawStatus === 'failed' || TECHHUB_FAILED_STATUSES.has(rawStatus)) {
+      status = 'failed';
+    } else {
+      status = 'pending';
+      if (rawStatus && rawStatus !== 'pending') {
+        console.info(`[techhub] ${path} unrecognised status kept pending (ticket=${ticketId}, providerStatus=${rawStatus})`);
+      }
+    }
     return { ticketId: data.ticket_id ?? ticketId, status, response: data.response ?? null, raw: data };
   }
 }
