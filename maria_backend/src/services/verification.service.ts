@@ -18,7 +18,7 @@ import {
   type TechhubSlipTier,
   type TechhubSlipResult
 } from './techhub.service.js';
-import { ktechService, type KtechNinSlipTier } from './ktech.service.js';
+import { ktechService, ktechNinService, ktechBvnService, type KtechNinSlipTier } from './ktech.service.js';
 import { hubbuService } from './hubbu.service.js';
 import { flagPendingReconciliation } from './provider-reconciliation.service.js';
 
@@ -585,7 +585,7 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
   // Personal Information uses its dedicated K-Tech endpoint; its provider is
   // selected in the same admin routing table as the other NIN-by-NIN slips.
   const provider: IdentityProvider = await providerForService(NIN_SLIP_SERVICE_BY_TIER[params.tier]);
-  if (provider === 'ktech') ktechService.assertConfigured();
+  if (provider === 'ktech') ktechNinService.assertConfigured();
   if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
@@ -598,9 +598,9 @@ export async function purchaseNinByNin(params: { userId: string; nin: string; ti
     idempotencyKey: params.idempotencyKey,
     background: params.background,
     call: (reference) => params.tier === 'information'
-      ? ktechService.ninPersonalInformation({ nin: params.nin }, reference)
+      ? ktechNinService.ninPersonalInformation({ nin: params.nin }, reference)
       : provider === 'ktech'
-        ? ktechService.ninByNin(params.nin, params.tier, reference)
+        ? ktechNinService.ninByNin(params.nin, params.tier, reference)
         : provider === 'hubbu'
           ? hubbuService.ninByNin(params.nin, params.tier)
           : techhubService.ninByNin(params.nin, params.tier)
@@ -616,7 +616,7 @@ export async function purchaseNinByPhone(params: {
 }) {
   const service = NIN_PHONE_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
-  if (provider === 'ktech') ktechService.assertConfigured();
+  if (provider === 'ktech') ktechNinService.assertConfigured();
   else if (provider === 'hubbu') hubbuService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
@@ -630,9 +630,9 @@ export async function purchaseNinByPhone(params: {
     background: params.background,
     call: (reference) =>
       params.tier === 'information'
-        ? ktechService.ninPersonalInformation({ phone: params.phone }, reference)
+        ? ktechNinService.ninPersonalInformation({ phone: params.phone }, reference)
         : provider === 'ktech'
-        ? ktechService.ninByPhone(params.phone, params.tier, reference)
+        ? ktechNinService.ninByPhone(params.phone, params.tier, reference)
         : provider === 'hubbu'
         ? hubbuService.ninByPhone(params.phone, params.tier, reference)
           : params.tier === 'vnin'
@@ -683,6 +683,7 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
   const service = BVN_SLIP_SERVICE_BY_TIER[params.tier];
   const provider: IdentityProvider = await providerForService(service);
   if (provider === 'hubbu') hubbuService.assertConfigured();
+  else if (provider === 'ktech') ktechBvnService.assertConfigured();
   return purchaseSlip({
     userId: params.userId,
     service,
@@ -695,7 +696,7 @@ export async function purchaseBvnSlip(params: { userId: string; bvn: string; tie
     background: params.background,
     call: (reference) =>
       provider === 'ktech'
-        ? ktechService.bvnSlip(params.bvn, params.tier, reference)
+        ? ktechBvnService.bvnSlip(params.bvn, params.tier, reference)
         : provider === 'hubbu'
           ? hubbuService.bvnSlip(params.bvn, params.tier)
           : techhubService.bvnSlip(params.bvn, params.tier)

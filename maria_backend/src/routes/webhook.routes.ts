@@ -249,13 +249,14 @@ export function normalizeKtechTicketStatus(value: unknown): 'pending' | 'success
 // (same idea as GET /katpay above): open this URL in a browser to confirm the
 // route exists on the deployed backend and that KTECH_WEBHOOK_SECRET is loaded.
 webhookRoutes.get('/ktech', (_req, res) => {
+  const webhookSecret = env.KTECH_ASYNC_WEBHOOK_SECRET || env.KTECH_WEBHOOK_SECRET;
   res.json({
     status: true,
     webhook: 'ktech',
-    ready: Boolean(env.KTECH_WEBHOOK_SECRET),
-    message: env.KTECH_WEBHOOK_SECRET
+    ready: Boolean(webhookSecret),
+    message: webhookSecret
       ? 'POST signed K-Tech events to this path'
-      : 'KTECH_WEBHOOK_SECRET is not set on the server - deliveries will be rejected with 503'
+      : 'KTECH_ASYNC_WEBHOOK_SECRET or KTECH_WEBHOOK_SECRET is not set on the server - deliveries will be rejected with 503'
   });
 });
 
@@ -276,7 +277,7 @@ webhookRoutes.get('/ktech', (_req, res) => {
  *   - 500: we failed while processing a valid event -> K-Tech should retry
  */
 webhookRoutes.post('/ktech', async (req, res) => {
-  const secret = env.KTECH_WEBHOOK_SECRET;
+  const secret = env.KTECH_ASYNC_WEBHOOK_SECRET || env.KTECH_WEBHOOK_SECRET;
   if (!secret) {
     console.error('[ktech-webhook] rejected - KTECH_WEBHOOK_SECRET is not configured on this server');
     return res.status(503).json({ error: 'Webhook secret not configured' });

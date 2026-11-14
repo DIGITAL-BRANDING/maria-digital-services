@@ -87,7 +87,13 @@ const EnvSchema = z.object({
   // read fresh on every request - see ktech.service.ts). The base URL below
   // points to K-Tech's current production API.
   KTECH_BASE_URL: z.string().url().default('https://k-tech.com.ng/api/v1'),
+  // Optional dedicated partner accounts. Each service family falls back to
+  // KTECH_API_KEY so existing deployments continue to work during migration.
   KTECH_API_KEY: z.string().optional(),
+  KTECH_NIN_API_KEY: z.string().optional(),
+  KTECH_BVN_API_KEY: z.string().optional(),
+  KTECH_ASYNC_API_KEY: z.string().optional(),
+  KTECH_VTU_API_KEY: z.string().optional(),
   HUBBU_BASE_URL: z.string().url().default('https://hubbu.com.ng/api/v1'),
   HUBBU_API_KEY: z.string().optional(),
   // The "webhook secret" shown next to the callback URL on the K-Tech partner
@@ -95,6 +101,7 @@ const EnvSchema = z.object({
   // webhook.routes.ts) - which is exactly what the dashboard reports as
   // "Webhook test was not delivered yet (status: pending)".
   KTECH_WEBHOOK_SECRET: z.string().optional(),
+  KTECH_ASYNC_WEBHOOK_SECRET: z.string().optional(),
   // Shared secret returned once by Major Data Link when this partner registers
   // its callback URL. It is only used to verify MDL's signed outbound events.
   MDL_WEBHOOK_SECRET: z.string().min(16).optional(),

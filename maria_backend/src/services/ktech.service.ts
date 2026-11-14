@@ -114,16 +114,24 @@ const KTECH_FAILED_STATUSES = new Set([
   'failed', 'failure', 'rejected', 'declined', 'error', 'cancelled', 'canceled', 'reversed', 'refunded'
 ]);
 
+export type KtechAccount = 'legacy' | 'nin' | 'bvn' | 'async' | 'vtu';
+
 export class KtechService {
+  constructor(private readonly account: KtechAccount = 'async') {}
+
   private baseUrl() {
     return env.KTECH_BASE_URL.replace(/\/$/, '');
   }
 
   private apiKey() {
-    if (!env.KTECH_API_KEY) {
-      throw new ApiError(500, 'K-Tech API key is not configured', 'KTECH_NOT_CONFIGURED');
-    }
-    return env.KTECH_API_KEY;
+    const accountKey = this.account === 'nin' ? env.KTECH_NIN_API_KEY
+      : this.account === 'bvn' ? env.KTECH_BVN_API_KEY
+        : this.account === 'async' ? env.KTECH_ASYNC_API_KEY
+          : this.account === 'vtu' ? env.KTECH_VTU_API_KEY
+            : undefined;
+  const key = accountKey || (this.account === 'vtu' ? env.KTECH_ASYNC_API_KEY : undefined) || env.KTECH_API_KEY;
+    if (!key) throw new ApiError(500, `K-Tech ${this.account} account is not configured`, 'KTECH_NOT_CONFIGURED');
+    return key;
   }
 
   assertConfigured() {
@@ -378,7 +386,10 @@ export class KtechService {
   }
 }
 
-export const ktechService = new KtechService();
+export const ktechService = new KtechService('async');
+export const ktechNinService = new KtechService('nin');
+export const ktechBvnService = new KtechService('bvn');
+export const ktechAsyncService = ktechService;
 
 // ---- Data & Airtime ----
 //
@@ -414,10 +425,9 @@ async function ktechRequest(
   path: string,
   options: { body?: Record<string, unknown>; idempotencyKey?: string } = {}
 ): Promise<KtechListResponse> {
-  if (!env.KTECH_API_KEY) {
-    throw new ApiError(500, 'K-Tech API key is not configured', 'KTECH_NOT_CONFIGURED');
-  }
-  const headers: Record<string, string> = { 'X-API-Key': env.KTECH_API_KEY };
+  const key = env.KTECH_VTU_API_KEY || env.KTECH_ASYNC_API_KEY || env.KTECH_API_KEY;
+  if (!key) throw new ApiError(500, 'K-Tech VTU account is not configured', 'KTECH_NOT_CONFIGURED');
+  const headers: Record<string, string> = { 'X-API-Key': key };
   if (options.body) {
     headers['Content-Type'] = 'application/json';
     if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
