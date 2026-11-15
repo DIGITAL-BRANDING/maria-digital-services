@@ -1,4 +1,4 @@
-import { Download, Layers, Loader2, RefreshCw, CheckCircle2, XCircle, Clock } from 'lucide-react';
+import { Download, Layers, Loader2, RefreshCw, CheckCircle2, XCircle, Clock, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../../lib/api';
 
@@ -422,11 +422,10 @@ export function DigitalSlipPreview({ data }: { data: Record<string, unknown> }) 
 
   if (!idValue && !firstName && !lastName && !fullNameField) return null;
   return (
-    <article className="mt-4 overflow-hidden rounded-2xl border border-blue-200 bg-white shadow-sm">
-      <div className="flex items-center justify-between bg-[#0b2f73] px-5 py-3 text-white"><span className="font-display font-bold">{idLabel} Verification Slip</span><span className="rounded bg-gold-500 px-2 py-1 text-xs font-bold text-ink">VERIFIED</span></div>
-      <div className="flex flex-col gap-5 p-5 sm:flex-row sm:items-center">
-        {photoSrc ? <img src={photoSrc} alt={name} className="h-24 w-24 rounded-xl border-2 border-gold-400 object-cover" /> : <div className="flex h-24 w-24 items-center justify-center rounded-xl bg-blue-100 font-display text-2xl font-bold text-[#0b2f73]">{initials}</div>}
-        <div className="min-w-0 flex-1"><h3 className="font-display text-xl font-bold text-[#0b2f73]">{name}</h3><p className="mt-1 font-mono text-sm font-semibold text-[#0b2f73]">{idLabel}: {idValue || '—'}</p><div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-sm text-[#0b2f73]/80"><span>Gender: <b>{valueFor(source, 'gender') || '—'}</b></span><span>DOB: <b>{dob || '—'}</b></span><span>Phone: <b>{phone || '—'}</b></span><span className="truncate">Address: <b>{address || '—'}</b></span></div></div>
+    <article className="overflow-hidden rounded-xl border border-[#ff5a1f] bg-[#eef3ff] p-4 sm:p-5">
+      <div className="flex justify-center pb-4">{photoSrc ? <img src={photoSrc} alt={name} className="h-24 w-24 rounded-full border-[3px] border-[#ff5a1f] object-cover shadow-md" /> : <div className="flex h-24 w-24 items-center justify-center rounded-full border-[3px] border-[#ff5a1f] bg-blue-100 font-display text-2xl font-bold text-[#0b2f73] shadow-md">{initials}</div>}</div>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {[[idLabel, idValue], ['First name', firstName], ['Middle name', middleName], ['Surname', lastName], ['Gender', valueFor(source, 'gender')], ['Date of birth', dob], ...(phone ? [['Phone', phone]] : []), ...(address ? [['Address', address]] : [])].map(([label, value]) => <div key={label} className="rounded-lg border border-slate-200 bg-white px-3 py-2.5"><div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</div><div className="mt-0.5 break-words text-sm font-medium text-slate-800">{value || '—'}</div></div>)}
       </div>
     </article>
   );
@@ -451,25 +450,12 @@ export function SlipResultView({ result, message, onDone }: { result: SlipResult
   const { pdfBase64, pdfUrl } = extractPdfFields({ ...result.user_data, pdf_base64: result.pdf_base64, pdf_url: result.pdf_url });
 
   return (
-    <div className="mt-6">
-      <div className="flex items-center gap-2 rounded-lg border border-success-500/30 bg-success-500/5 px-4 py-3">
-        <CheckCircle2 size={18} className="shrink-0 text-success-500" />
-        <p className="font-body text-sm text-[#0b2f73]">{message}</p>
-      </div>
-
-      {/* DigitalSlipPreview card is the whole preview now - it already shows
-          everything a user needs before downloading (name, NIN/BVN, gender,
-          DOB, phone, address, photo). The raw field-by-field dump that used
-          to follow it (DetailsOverviewGrid over every user_data key) was
-          both redundant with the card and, for providers whose photo field
-          is a raw base64 string rather than a nested object, rendered that
-          entire base64 blob as one unreadable "Photo: /9j/4AAQ..." row. */}
-      {result.user_data && <DigitalSlipPreview data={result.user_data} />}
-      <SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} documentUrl={result.document_url} />
-
-      <button onClick={onDone} className="mt-3 w-full rounded-xl border border-blue-200 py-2.5 font-body text-sm text-[#0b2f73]">
-        Done
-      </button>
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/65 p-3 backdrop-blur-sm sm:p-6" onClick={onDone}>
+      <section role="dialog" aria-modal="true" aria-label="Verification result" className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+        <header className="flex shrink-0 items-center justify-between border-b border-slate-200 px-5 py-4"><h2 className="flex items-center gap-2 font-display text-lg font-bold text-slate-800"><CheckCircle2 size={20} className="text-emerald-500" />{message}</h2><button onClick={onDone} aria-label="Close preview" className="rounded-full p-1.5 text-slate-500 hover:bg-slate-100"><X size={21}/></button></header>
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">{result.user_data && <DigitalSlipPreview data={result.user_data} />}</div>
+        <footer className="flex shrink-0 flex-col justify-end gap-2 border-t border-slate-200 bg-slate-50 px-5 py-3 sm:flex-row"><SlipDownloadAction pdfBase64={pdfBase64} pdfUrl={pdfUrl} reference={result.reference} documentUrl={result.document_url} /><button onClick={onDone} className="rounded-xl border border-slate-200 bg-white px-5 py-3 text-sm font-medium text-slate-700">Close</button></footer>
+      </section>
     </div>
   );
 }

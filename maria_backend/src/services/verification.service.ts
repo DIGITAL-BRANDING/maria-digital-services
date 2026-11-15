@@ -229,16 +229,6 @@ export type SlipPurchaseResult = {
   balanceAfter: number;
 };
 
-/** Best-effort fetch of a Hubbu slip PDF as base64. Never throws: a failure is logged and the link is kept for a retry. */
-async function prefetchHubbuSlip(url: string, transactionId: string): Promise<string | undefined> {
-  try {
-    return (await hubbuService.downloadSlip(url)).toString('base64');
-  } catch (error) {
-    console.error('[hubbu] slip prefetch failed; the document endpoint will retry', { transactionId, error });
-    return undefined;
-  }
-}
-
 /**
  * Shared by all four slip flows (NIN-by-NIN, NIN-by-Phone, NIN-by-Demographic,
  * BVN Slip): debit first, call the selected identity provider, refund on
@@ -341,14 +331,10 @@ async function purchaseSlip(params: {
     });
 
     if (provider.ok) {
-      // Hubbu may return the slip inline, or only a download link. Keep an inline
-      // copy whenever we have one. Otherwise fetch the PDF now, while the link is
-      // fresh, so the customer does not depend on a second Hubbu call later. If
-      // that prefetch fails, the link stays on file and the document endpoint retries it.
-      const inlinePdf = provider.pdfBase64
-        ?? (params.provider === 'hubbu' && provider.downloadUrl
-          ? await prefetchHubbuSlip(provider.downloadUrl, debit.transaction.id)
-          : undefined);
+      // Hubbu can return a download token/URL instead of an inline PDF. Do not
+      // make another upstream request before responding to verification; the
+      // authenticated document endpoint retrieves the PDF on demand.
+      const inlinePdf = provider.pdfBase64;
 
       const existingMetadata = debit.transaction.metadata as Record<string, unknown> | null;
       await prisma.transaction.update({
